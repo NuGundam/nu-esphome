@@ -1,0 +1,836 @@
+substitutions:
+  # --- AC Infinity Controller 69 Pro (device "A836B", type 11, multi-port) ---
+  aci_mac: !secret aci_mac
+  # Physical UIS port the T8 is plugged into. The reference implementation
+  # hardcodes 0, but that appears to be its "currently selected port" case.
+  aci_port: "1"
+  aci_service: "70D51000-2C7F-4E75-AE8A-D758951CE4E0"
+  aci_write_char: "70D51001-2C7F-4E75-AE8A-D758951CE4E0"
+  aci_notify_char: "70D51002-2C7F-4E75-AE8A-D758951CE4E0"
+
+esphome:
+  name: fresh-air-aqi
+  friendly_name: fresh-air-aqi
+  includes: [aci.h]
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "10"
+      CONFIG_SPIRAM: "n"
+      # Was 4096. The BLE stack plus the advertisement lambda runs close to
+      # the edge at that size; revert if you're tight on RAM and see no crashes.
+      CONFIG_ESP_MAIN_TASK_STACK_SIZE: "8192"
+
+logger:
+  baud_rate: 115200
+  level: INFO
+  logs:
+    # Shows write results and notify traffic. Back to INFO once it works.
+    esp32_ble_client: INFO
+    ble_client.automation: INFO
+    sensor: INFO
+    text_sensor: INFO
+    sen5x: INFO
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+  # failsafe: HA gone 30 min -> duct fan off (otherwise the T8 holds its last speed and
+  # keeps pulling outdoor air with nothing watching humidity or AQI)
+  on_client_connected:
+    - script.stop: fan_failsafe
+  on_client_disconnected:
+    - script.execute: fan_failsafe
+ota:
+  - platform: esphome
+    password: !secret ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 20.0dB
+  fast_connect: true
+  # reboot if WiFi stays down 15 min (a wedged stack otherwise never recovers)
+  reboot_timeout: 15min
+  power_save_mode: NONE
+  ap:
+    ssid: "fresh-air-aqi Fallback Hotspot"
+    password: !secret ap_password
+captive_portal:
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      # Nightly clock resync. The controller's RTC drifts, and its schedule,
+      # timer and cycle modes depend on it being right.
+      - seconds: 0
+        minutes: 7
+        hours: 3
+        then:
+          - if:
+              condition:
+                lambda: "return id(ha_time).now().is_valid();"
+              then:
+                - ble_client.ble_write:
+                    id: aci_client
+                    service_uuid: ${aci_service}
+                    characteristic_uuid: ${aci_write_char}
+                    value: !lambda |-
+                      auto t = id(ha_time).now();
+                      auto f = aci::set_time(t.year, t.month, t.day_of_month,
+                                             t.day_of_week, t.hour, t.minute,
+                                             t.second);
+                      ESP_LOGI("aci", "tx settime %04d-%02d-%02d dow%d %02d:%02d:%02d : %s",
+                               t.year, t.month, t.day_of_month, t.day_of_week,
+                               t.hour, t.minute, t.second,
+                               format_hex_pretty(f).c_str());
+                      return f;
+globals:
+  - id: cpu_speed
+    type: int
+    restore_value: no
+    initial_value: "0"
+  # Held high while pushing the controller's reported state into the fan
+  # entity, so the resulting on_state doesn't echo a write straight back out.
+  - id: aci_syncing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # millis() of the last advertisement we parsed, so we can tell "no packets
+  # arriving" apart from "packets arriving but values not changing".
+  - id: aci_last_adv
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+# Status LED (optional)
+status_led:
+  pin:
+    number: GPIO48
+    inverted: true
+i2c:
+    sda: GPIO11
+    scl: GPIO12
+    scan: True
+
+# ===========================================================================
+# AC Infinity CLOUDLINE PRO T8 via Controller 69 Pro (BLE)
+# ===========================================================================
+esp32_ble_tracker:
+  scan_parameters:
+    active: false          # passive scan is enough, state is in the advert
+    interval: 320ms
+    window: 30ms
+  on_ble_manufacturer_data_advertise:
+    - manufacturer_id: "0902"
+      then:
+        - lambda: |-
+            if (!aci::adv_valid(x)) return;
+            id(aci_last_adv) = millis();
+
+            static std::vector<uint8_t> last_adv;
+            if (x != last_adv) {
+              last_adv = x;
+              ESP_LOGD("aci", "adv %s", format_hex_pretty(x).c_str());
+            }
+
+            // Fallback only. The controller stops advertising once it accepts
+            // a connection, so this path is live for a few seconds at boot and
+            // any time the link is down. The notify handler is the real one.
+            if (aci::adv_temp_ok(x)) id(aci_temp).publish_state(aci::adv_temp(x));
+            if (aci::adv_hum_ok(x))  id(aci_hum).publish_state(aci::adv_hum(x));
+            if (aci::adv_has_vpd(x)) id(aci_vpd).publish_state(aci::adv_vpd(x));
+            id(aci_fan_level).publish_state(aci::adv_level(x));
+
+script:
+  - id: fan_failsafe
+    mode: restart
+    then:
+      - delay: 30min
+      - if:
+          condition:
+            not:
+              api.connected:
+          then:
+            - logger.log:
+                format: "Failsafe: no Home Assistant for 30 min - turning the duct fan off"
+                level: WARN
+            - fan.turn_off: cloudline
+
+ble_client:
+  - id: aci_client
+    mac_address: ${aci_mac}
+    on_connect:
+      - logger.log: "AC Infinity: connected"
+      - delay: 2s
+      - ble_client.ble_write:
+          id: aci_client
+          service_uuid: ${aci_service}
+          characteristic_uuid: ${aci_write_char}
+          value: !lambda "return aci::query(${aci_port});"
+      - delay: 1s
+      - if:
+          condition:
+            lambda: "return id(ha_time).now().is_valid();"
+          then:
+            - ble_client.ble_write:
+                id: aci_client
+                service_uuid: ${aci_service}
+                characteristic_uuid: ${aci_write_char}
+                value: !lambda |-
+                  auto t = id(ha_time).now();
+                  auto f = aci::set_time(t.year, t.month, t.day_of_month,
+                                         t.day_of_week, t.hour, t.minute,
+                                         t.second);
+                  ESP_LOGI("aci", "tx settime : %s", format_hex_pretty(f).c_str());
+                  return f;
+    on_disconnect:
+      - logger.log: "AC Infinity: disconnected"
+
+interval:
+  # 2026-10-10: coil-probe staleness. No status frame / advert for 60 s (BLE link down, controller
+  # busy) -> publish NAN once, so Home Assistant shows the probe unavailable instead of trusting a
+  # frozen reading (the 85 F damper pause and the heat purge both act on it). Fresh frames resume
+  # publishing on their own.
+  - interval: 15s
+    then:
+      - lambda: |-
+          static bool stale = false;
+          bool now_stale = (millis() - id(aci_last_adv)) > 60000;
+          if (now_stale && !stale) {
+            ESP_LOGW("aci", "no probe frame for 60 s - publishing temperature/humidity/VPD as unavailable");
+            id(aci_temp).publish_state(NAN);
+            id(aci_hum).publish_state(NAN);
+            id(aci_vpd).publish_state(NAN);
+          }
+          stale = now_stale;
+  # The 1 Hz status frame carries the probe but not the commanded level, so
+  # poll the full register set periodically to keep Fan Level honest.
+  - interval: 30s
+    then:
+      - ble_client.ble_write:
+          id: aci_client
+          service_uuid: ${aci_service}
+          characteristic_uuid: ${aci_write_char}
+          value: !lambda "return aci::query(${aci_port});"
+
+fan:
+  - platform: template
+    id: cloudline
+    name: "Fresh Air Duct Fan"
+    icon: "mdi:fan"
+    speed_count: 10
+    on_state:
+      - if:
+          condition:
+            lambda: "return !id(aci_syncing);"
+          then:
+            - ble_client.ble_write:
+                id: aci_client
+                service_uuid: ${aci_service}
+                characteristic_uuid: ${aci_write_char}
+                value: !lambda |-
+                  bool on = id(cloudline).state;
+                  uint8_t mode = on ? 2 : 1;
+                  uint8_t lvl = on ? (uint8_t) id(cloudline).speed : 0;
+                  auto f = aci::set_level(mode, lvl, ${aci_port});
+                  ESP_LOGI("aci", "tx mode=%d level=%d : %s",
+                           mode, lvl, format_hex_pretty(f).c_str());
+                  return f;
+
+sensor:
+  - platform: sen5x
+    id: sen55
+    pm_1_0:
+      name: " PM <1µm"
+      id: pm_1_0
+      icon: "mdi:dots-circle"
+      filters:
+        - delta: 1.0
+    pm_2_5:
+      name: " PM <2.5µm"
+      id: pm_2_5
+      icon: "mdi:circle-medium"
+      filters:
+        - delta: 0.5     # 2026-10-10: was 1.0 (= 5.6 AQI steps in the Good band)
+    pm_4_0:
+      name: " PM <4µm"
+      id: pm_4_0
+      icon: "mdi:circle"
+      filters:
+        - delta: 1.0
+    pm_10_0:
+      name: " PM <10µm"
+      id: pm_10_0
+      icon: "mdi:circle-outline"
+      filters:
+        - delta: 1.0
+    temperature:
+      name: "Temperature"
+      id: sen55_temp
+      icon: "mdi:thermometer"
+      filters:
+        - delta: 0.3
+    humidity:
+      name: "Humidity"
+      id: sen55_humid
+      icon: "mdi:water-percent"
+      filters:
+        - delta: 1.0
+    voc_index:
+      name: "VOC"
+      id: voc
+      icon: "mdi:flask-outline"
+      algorithm_tuning:
+        index_offset: 100
+        learning_time_offset_hours: 240
+        learning_time_gain_hours: 240
+        gating_max_duration_minutes: 360
+        std_initial: 150
+        gain_factor: 120
+      filters:
+        - exponential_moving_average:
+            alpha: 0.05
+            send_every: 10
+        - delta: 3.0
+    nox_index:
+      name: "NOX"
+      id: nox
+      icon: "mdi:smog"
+      filters:
+      algorithm_tuning:
+        learning_time_offset_hours: 72      # 2026-10-10: was 12 - baseline = clean daytime air over ~3 days, not last night
+        gating_max_duration_minutes: 1440  # 2026-10-10: was 240 - an overnight plume (6-8 h) must stay high, not be learned as normal (SEN55 default 720)
+        std_initial: 50                     # no effect on NOx; Sensirion: must be 50
+        gain_factor: 230
+    update_interval: 5s
+    temperature_compensation:
+      # was -1: lowering T by 1 °C near 4 °C rescales RH by ~7 %, pinning any true
+      # reading >= ~93 % at 100 %. Calibrate against a duct thermometer before re-adding.
+      offset: 0
+      normalized_offset_slope: 0
+      time_constant: 0
+    acceleration_mode: high
+    store_baseline: true
+    address: 0x69
+  - platform: absolute_humidity
+    name: "*Absolute Humidity*"
+    id: a_h
+    temperature: sen55_temp
+    humidity: sen55_humid
+    icon: "mdi:water-opacity"
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 2
+  - platform: template
+    name: "*Dew Point*"
+    id: dew_point
+    icon: "mdi:water-thermometer"
+    unit_of_measurement: "°F"
+    device_class: "temperature"
+    state_class: "measurement"
+    accuracy_decimals: 1
+    update_interval: 5.1s
+    lambda: |-
+      float Tc = id(sen55_temp).state;
+      float RH = id(sen55_humid).state;
+      if (isnan(Tc) || isnan(RH) || RH <= 0.0f) return NAN;
+      // Magnus formula
+      float gamma = logf(RH / 100.0f) + (17.62f * Tc) / (243.12f + Tc);
+      float td_c = (243.12f * gamma) / (17.62f - gamma);
+      return (td_c * 9.0f / 5.0f) + 32.0f;
+    filters:
+      - delta: 0.3
+  - platform: template
+    name: "*AQI Feels Like Temp*"
+    id: aqi_feels_like_temperature
+    icon: "mdi:thermometer-lines"
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    update_interval: 5.2s
+    lambda: |-
+      float Tc = id(sen55_temp).state;
+      float T = (Tc * 9.0f / 5.0f) + 32.0f;
+      float RH = id(sen55_humid).state;
+      float feels = T + (0.1f * (RH - 50.0f));
+      return feels;
+  - platform: template
+    name: "*Average PM AQI*"
+    filters:
+        - delta: 1
+    icon: "mdi:chart-bar"
+    unit_of_measurement: "AQI"
+    accuracy_decimals: 0
+    id: avg_pm_aqi
+    update_interval: 5.3s
+    lambda: |-
+      // US EPA PM AQI (AQI Technical Assistance Document, 2024 PM2.5 breakpoints) - 2026-10-10:
+      //  - one sub-index per pollutant: PM2.5 truncated to 0.1 ug/m3, PM10 truncated to 1 ug/m3
+      //  - reported AQI = the HIGHER sub-index. EPA never averages them, and PM1 / PM4 have no AQI
+      //    breakpoints (the SEN55 mass bins are cumulative, so they also double-counted PM2.5)
+      //  - concentrations are a 2-min rolling mean (23 x 5.3 s) so a 5-s dust puff cannot move it.
+      //    The official AQI uses 24-h / NowCast means; this is the real-time version used for control.
+      // Name kept as "Average PM AQI" so automations, statistics and the dashboard keep working.
+      float pm25 = id(pm_2_5).state;
+      float pm10 = id(pm_10_0).state;
+      // no reading yet / read failed: publish nothing (was 500 = "Hazardous")
+      if (isnan(pm25) || isnan(pm10)) return {};
+      static const int N = 23;
+      static float b25[N], b10[N];
+      static int n = 0, k = 0;
+      b25[k] = pm25; b10[k] = pm10; k = (k + 1) % N; if (n < N) n++;
+      float s25 = 0, s10 = 0;
+      for (int i = 0; i < n; i++) { s25 += b25[i]; s10 += b10[i]; }
+      float c25 = floorf(s25 / n * 10.0f) / 10.0f;   // EPA: truncate PM2.5 to 0.1
+      float c10 = floorf(s10 / n);                   // EPA: truncate PM10 to an integer
+      struct Bp { float c_lo; float c_hi; float i_lo; float i_hi; };
+      static const Bp T25[] = {
+        {0.0f, 9.0f, 0, 50}, {9.1f, 35.4f, 51, 100}, {35.5f, 55.4f, 101, 150},
+        {55.5f, 125.4f, 151, 200}, {125.5f, 225.4f, 201, 300}, {225.5f, 325.4f, 301, 500}};
+      static const Bp T10[] = {
+        {0, 54, 0, 50}, {55, 154, 51, 100}, {155, 254, 101, 150},
+        {255, 354, 151, 200}, {355, 424, 201, 300}, {425, 604, 301, 500}};
+      auto sub = [](float c, const Bp *t, int m) -> float {
+        if (c < 0) c = 0;
+        for (int i = 0; i < m; i++)
+          if (c <= t[i].c_hi)
+            return roundf((t[i].i_hi - t[i].i_lo) / (t[i].c_hi - t[i].c_lo) * (c - t[i].c_lo) + t[i].i_lo);
+        return 500;   // beyond the top breakpoint
+      };
+      float a25 = sub(c25, T25, 6), a10 = sub(c10, T10, 6);
+      return a25 > a10 ? a25 : a10;
+  - platform: wifi_signal
+    update_interval: 60s
+    id: wifi_signal_raw
+    filters:
+      - delta: 1
+  - platform: template
+    name: "WiFi Signal Quality"
+    id: wifi_quality
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:wifi"
+    update_interval: 60s
+    lambda: |-
+      if (isnan(id(wifi_signal_raw).state)) return {};
+      int quality = 2 * (100 + (int) id(wifi_signal_raw).state);
+      if (quality > 100) {
+      return 100;
+      } else if (quality < 0) {
+      return 0;
+      } else {
+      return quality;
+      }
+    filters:
+    - delta: 1
+    entity_category: "diagnostic"
+  - platform: internal_temperature
+    name: "ESP32 Internal Temperature (F)"
+    id: esp_temp
+    icon: "mdi:chip"
+    update_interval: 60s
+    filters:
+      - delta: 1
+      - lambda: return (x * 1.8) + 32;
+    unit_of_measurement: "°F"
+    entity_category: "diagnostic"
+  - platform: uptime
+    name: Uptime
+    id: sys_uptime
+    icon: "mdi:clock-outline"
+    update_interval: 60s
+    entity_category: "diagnostic"
+  # Subscribing to the notify characteristic is not optional. The reference
+  # client calls start_notify() on 70D51002 before it sends any command, and
+  # the controller appears to ignore writes until the CCCD is enabled.
+  # The lambda also logs every response frame, so we can see whether our
+  # writes are being acknowledged at all.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: aci_client
+    id: aci_notify
+    internal: true
+    service_uuid: ${aci_service}
+    characteristic_uuid: ${aci_notify_char}
+    notify: true
+    lambda: |-
+      ESP_LOGD("aci", "rx %s", format_hex_pretty(x).c_str());
+
+      // Unsolicited status, ~1 Hz. This is the primary data path.
+      if (aci::nfy_is_status(x)) {
+        id(aci_last_adv) = millis();
+        if (aci::nfy_temp_ok(x)) id(aci_temp).publish_state(aci::nfy_temp(x));
+        if (aci::nfy_hum_ok(x))  id(aci_hum).publish_state(aci::nfy_hum(x));
+        if (aci::nfy_vpd_ok(x))  id(aci_vpd).publish_state(aci::nfy_vpd(x));
+        // Catch an off that happened at the controller between polls.
+        if (aci::nfy_port_mode(x, ${aci_port}) == 1 &&
+            id(aci_fan_level).has_state() && id(aci_fan_level).state != 0) {
+          id(aci_fan_level).publish_state(0);
+        }
+        return NAN;
+      }
+
+      // Response to a command. The periodic query returns the full register
+      // set, which is where the authoritative level lives.
+      if (aci::rsp_is_frame(x)) {
+        int mode = aci::rsp_reg(x, 0x10);
+        int on_level = aci::rsp_reg(x, 0x12);
+        if (mode >= 0 && on_level >= 0) {
+          int lvl = (mode == 2) ? on_level : 0;
+          ESP_LOGD("aci", "state: mode=%d on_level=%d -> %d", mode, on_level, lvl);
+          id(aci_fan_level).publish_state(lvl);
+
+          bool want_on = lvl > 0;
+          bool differs = (id(cloudline).state != want_on) ||
+                         (want_on && (int) id(cloudline).speed != lvl);
+          if (differs) {
+            id(aci_syncing) = true;
+            auto call = id(cloudline).make_call();
+            call.set_state(want_on);
+            if (want_on) call.set_speed(lvl);
+            call.perform();
+            id(aci_syncing) = false;
+          }
+        }
+      }
+      return NAN;
+    # --- Return duct, populated from the BLE advertisement ---
+  - platform: template
+    id: aci_fan_level
+    name: "Return Duct Fan Level"
+    icon: "mdi:fan"
+    accuracy_decimals: 0
+    update_interval: never
+  # Probe on the 69 Pro, physically mounted next to the AC coil, so these
+  # describe supply air rather than anything in the fresh air duct.
+  - platform: template
+    id: aci_temp
+    name: "Supply Duct Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+    update_interval: never
+    filters:
+      # 2026-10-10: average the ~1 Hz frames instead of keeping 1 in 3; NAN (stale) passes through
+      - throttle_average: 5s
+      - delta: 0.05
+  - platform: template
+    id: aci_hum
+    name: "Supply Duct Humidity"
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:water-percent"
+    update_interval: never
+    filters:
+      # 2026-10-10: average the ~1 Hz frames instead of keeping 1 in 3; NAN (stale) passes through
+      - throttle_average: 5s
+      - delta: 0.1
+  - platform: template
+    id: aci_vpd
+    name: "Supply Duct VPD"
+    unit_of_measurement: "kPa"
+    # Deliberately no device_class. With device_class: pressure and an
+    # imperial HA install, kPa gets converted to psi -- 0.29 kPa displayed
+    # as 0.04 psi, which is useless for VPD.
+    state_class: measurement
+    accuracy_decimals: 2
+    icon: "mdi:gauge"
+    update_interval: never
+    filters:
+      # 2026-10-10: average the ~1 Hz frames instead of keeping 1 in 3; NAN (stale) passes through
+      - throttle_average: 5s
+      - delta: 0.01
+  # Seconds since the last status frame. Should sit at 0-1 while connected,
+  # since the controller pushes one per second. Anything climbing means the
+  # notify subscription has dropped.
+  - platform: template
+    id: aci_adv_age
+    name: "Return Duct Packet Age"
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    icon: "mdi:radar"
+    entity_category: "diagnostic"
+    update_interval: 10s
+    lambda: |-
+      if (id(aci_last_adv) == 0) return NAN;
+      return (millis() - id(aci_last_adv)) / 1000.0f;
+  # Supply dew point sets the moisture floor the house can reach, and warns
+  # about condensation on any surface colder than it.
+  - platform: template
+    name: "Supply Duct Dew Point"
+    id: aci_dew_point
+    icon: "mdi:water-thermometer"
+    unit_of_measurement: "°F"
+    device_class: "temperature"
+    state_class: "measurement"
+    accuracy_decimals: 1
+    update_interval: 3s
+    lambda: |-
+      float Tc = id(aci_temp).state;
+      float RH = id(aci_hum).state;
+      if (isnan(Tc) || isnan(RH) || RH <= 0.0f) return NAN;
+      // Magnus formula
+      float gamma = logf(RH / 100.0f) + (17.62f * Tc) / (243.12f + Tc);
+      float td_c = (243.12f * gamma) / (17.62f - gamma);
+      return (td_c * 9.0f / 5.0f) + 32.0f;
+    filters:
+      - delta: 0.2
+  # Derived, so the probe speaks the same language as the rest of your system.
+  - platform: absolute_humidity
+    name: "Supply Duct Absolute Humidity"
+    id: aci_abs_hum
+    temperature: aci_temp
+    humidity: aci_hum
+    icon: "mdi:water-opacity"
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 2
+  # RSSI of the live BLE connection (2026-10-11). Was platform ble_rssi, which reads the controller's
+  # advertisements - but the Controller 69 Pro stops advertising once it accepts our connection, so the
+  # sensor (and BLE Signal Quality) stayed Unknown whenever the link was up. Swings with multipath, so it
+  # is polled every 10 s and averaged over the last 6 readings.
+  - platform: ble_client
+    type: rssi
+    ble_client_id: aci_client
+    name: "BLE Signal"
+    id: aci_rssi
+    icon: "mdi:bluetooth-audio"
+    entity_category: "diagnostic"
+    update_interval: 10s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 3
+      - delta: 1
+  - platform: template
+    name: "BLE Signal Quality"
+    id: aci_ble_quality
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:bluetooth"
+    entity_category: "diagnostic"
+    update_interval: 30s
+    lambda: |-
+      float rssi = id(aci_rssi).state;
+      if (isnan(rssi)) return NAN;
+      // -50 dBm or better = 100%, -90 dBm = 0%. BLE links get unreliable
+      // somewhere around -85 to -90, so 0% here means "about to drop".
+      float quality = (rssi + 90.0f) * 2.5f;
+      if (quality > 100.0f) return 100.0f;
+      if (quality < 0.0f) return 0.0f;
+      return quality;
+    filters:
+      - delta: 1
+button:
+  - platform: restart
+    name: "ESP32-S3 Reboot"
+    icon: "mdi:restart"
+  # --- Fresh Air duct diagnostics ---
+  - platform: template
+    name: "Fresh Air Duct Test Level 5"
+    entity_category: diagnostic
+    on_press:
+      - ble_client.ble_write:
+          id: aci_client
+          service_uuid: ${aci_service}
+          characteristic_uuid: ${aci_write_char}
+          value: !lambda |-
+            auto f = aci::set_level(2, 5, ${aci_port});
+            ESP_LOGI("aci", "tx test5: %s", format_hex_pretty(f).c_str());
+            return f;
+  - platform: template
+    name: "Fresh Air Duct Test Off"
+    entity_category: diagnostic
+    on_press:
+      - ble_client.ble_write:
+          id: aci_client
+          service_uuid: ${aci_service}
+          characteristic_uuid: ${aci_write_char}
+          value: !lambda |-
+            auto f = aci::set_level(1, 0, ${aci_port});
+            ESP_LOGI("aci", "tx testoff: %s", format_hex_pretty(f).c_str());
+            return f;
+  - platform: template
+    name: "Fresh Air Duct Sync Clock"
+    entity_category: diagnostic
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(ha_time).now().is_valid();"
+          then:
+            - ble_client.ble_write:
+                id: aci_client
+                service_uuid: ${aci_service}
+                characteristic_uuid: ${aci_write_char}
+                value: !lambda |-
+                  auto t = id(ha_time).now();
+                  auto f = aci::set_time(t.year, t.month, t.day_of_month,
+                                         t.day_of_week, t.hour, t.minute,
+                                         t.second);
+                  ESP_LOGI("aci", "tx settime %04d-%02d-%02d dow%d %02d:%02d:%02d : %s",
+                           t.year, t.month, t.day_of_month, t.day_of_week,
+                           t.hour, t.minute, t.second,
+                           format_hex_pretty(f).c_str());
+                  return f;
+  # Forces a fresh connect, useful for re-dumping the GATT table.
+  - platform: template
+    name: "Fresh Air Duct Reconnect"
+    entity_category: diagnostic
+    on_press:
+      - ble_client.disconnect: aci_client
+      - delay: 3s
+      - ble_client.connect: aci_client
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP32 IP Address"
+      icon: "mdi:ip-network"
+    ssid:
+      name: "SSID"
+      icon: "mdi:router-wireless"
+  # Reads supply-air VPD as a coil-condition indicator. Air leaving a coil
+  # that is actively condensing sits within a hair of saturation, so a very
+  # low deficit means wet coil and a high one means no latent removal at all.
+  - platform: template
+    name: "Supply Duct VPD Status"
+    id: supply_vpd_text
+    icon: "mdi:air-humidifier"
+    update_interval: 3s
+    lambda: |-
+      float v = id(aci_vpd).state;
+      if (isnan(v)) return {"Warming up"};
+      char buf[32];
+      if      (v < 0.10f) snprintf(buf, sizeof(buf), "Saturated (%.2f kPa)", v);
+      else if (v < 0.30f) snprintf(buf, sizeof(buf), "Wet coil (%.2f kPa)", v);
+      else if (v < 0.70f) snprintf(buf, sizeof(buf), "Drying (%.2f kPa)", v);
+      else if (v < 1.50f) snprintf(buf, sizeof(buf), "Dry (%.2f kPa)", v);
+      else                snprintf(buf, sizeof(buf), "Very dry (%.2f kPa)", v);
+      return {buf};
+  # Read as dehumidification performance rather than comfort -- this is air
+  # leaving the coil, not air anyone is standing in.
+  - platform: template
+    name: "Supply Duct Dew Point Status"
+    id: supply_dew_text
+    icon: "mdi:water-thermometer"
+    update_interval: 3s
+    lambda: |-
+      float d = id(aci_dew_point).state;
+      if (isnan(d)) return {"Warming up"};
+      char buf[32];
+      if      (d < 45.0f) snprintf(buf, sizeof(buf), "Very dry (%.1f °F)", d);
+      else if (d < 50.0f) snprintf(buf, sizeof(buf), "Dry (%.1f °F)", d);
+      else if (d < 55.0f) snprintf(buf, sizeof(buf), "Good (%.1f °F)", d);
+      else if (d < 60.0f) snprintf(buf, sizeof(buf), "Marginal (%.1f °F)", d);
+      else if (d < 65.0f) snprintf(buf, sizeof(buf), "Humid (%.1f °F)", d);
+      else                snprintf(buf, sizeof(buf), "Wet (%.1f °F)", d);
+      return {buf};
+  - platform: template
+    name: "Unit Temperature Status"
+    id: esp_temp_status
+    icon: "mdi:chip"
+    lambda: |-
+      if (id(esp_temp).state >= 185) {
+        return {"Overheating"};
+      } else if (id(esp_temp).state >= 140) {
+        return {"Warm"};
+      } else {
+        return {"Normal"};
+      }
+    entity_category: "diagnostic"
+    update_interval: 60s
+  - platform: template
+    name: "AQI AH"
+    icon: "mdi:water-opacity"
+    lambda: |-
+      float ah = id(a_h).state;
+      if (isnan(ah)) return {"Warming up"};
+      char buf[48];
+      if      (ah <= 6.0f)  snprintf(buf, sizeof(buf), "Very Dry (%.1f g/m³)", ah);
+      else if (ah <= 8.0f)  snprintf(buf, sizeof(buf), "Dry (%.1f g/m³)", ah);
+      else if (ah <= 10.5f) snprintf(buf, sizeof(buf), "Comfortable (%.1f g/m³)", ah);
+      else if (ah <= 12.0f) snprintf(buf, sizeof(buf), "Humid (%.1f g/m³)", ah);
+      else if (ah <= 15.0f) snprintf(buf, sizeof(buf), "Very Humid (%.1f g/m³)", ah);
+      else                  snprintf(buf, sizeof(buf), "Excessive (%.1f g/m³)", ah);
+      return {buf};
+    update_interval: 5.3s
+  - platform: template
+    name: "AQI Dew Point"
+    icon: "mdi:water-thermometer"
+    id: aqi_dew_point_text
+    lambda: |-
+      float dp = id(dew_point).state;
+      if (isnan(dp)) return {"Warming up"};
+      char buf[48];
+      if      (dp < 40.0f)  snprintf(buf, sizeof(buf), "Very Dry (%.1f °F)", dp);
+      else if (dp < 50.0f)  snprintf(buf, sizeof(buf), "Dry (%.1f °F)", dp);
+      else if (dp < 55.0f)  snprintf(buf, sizeof(buf), "Pleasant (%.1f °F)", dp);
+      else if (dp < 60.0f)  snprintf(buf, sizeof(buf), "Comfortable (%.1f °F)", dp);
+      else if (dp < 65.0f)  snprintf(buf, sizeof(buf), "Muggy (%.1f °F)", dp);
+      else if (dp < 70.0f)  snprintf(buf, sizeof(buf), "Uncomfortable (%.1f °F)", dp);
+      else                  snprintf(buf, sizeof(buf), "Oppressive (%.1f °F)", dp);
+      return {buf};
+    update_interval: 5.2s
+  - platform: template
+    name: "AQI TVOC"
+    icon: "mdi:flask-outline"
+    id: aqi_tvoc_text
+    lambda: |-
+      float v = id(voc).state;
+      if (isnan(v) || v <= 0) return {"Warming up"};
+      char buf[64];
+      if      (v <= 150) snprintf(buf, sizeof(buf), "Excellent (%.0f index)", v);
+      else if (v <= 250) snprintf(buf, sizeof(buf), "Good (%.0f index)", v);
+      else if (v <= 350) snprintf(buf, sizeof(buf), "Moderate (%.0f index)", v);
+      else if (v <= 450) snprintf(buf, sizeof(buf), "Unhealthy for Sensitive Groups (%.0f index)", v);
+      else if (v <= 500) snprintf(buf, sizeof(buf), "Unhealthy (%.0f index)", v);
+      else               snprintf(buf, sizeof(buf), "Warming up");
+      return {buf};
+    update_interval: 5.4s
+  - platform: template
+    name: "AQI NOx"
+    icon: "mdi:smog"
+    id: aqi_nox_text
+    lambda: |-
+      float n = id(nox).state;
+      if (isnan(n) || n <= 0) return {"Warming up"};
+      char buf[64];
+      if      (n <= 50)  snprintf(buf, sizeof(buf), "Excellent (%.0f index)", n);
+      else if (n <= 100) snprintf(buf, sizeof(buf), "Good (%.0f index)", n);
+      else if (n <= 200) snprintf(buf, sizeof(buf), "Moderate (%.0f index)", n);
+      else if (n <= 300) snprintf(buf, sizeof(buf), "Poor (%.0f index)", n);
+      else if (n <= 400) snprintf(buf, sizeof(buf), "Very Poor (%.0f index)", n);
+      else if (n <= 500) snprintf(buf, sizeof(buf), "Hazardous (%.0f index)", n);
+      else               snprintf(buf, sizeof(buf), "Warming up");
+      return {buf};
+    update_interval: 5.5s
+  - platform: template
+    name: "*PM AQI*"
+    update_interval: 5.6s
+    id: pm_aqi_text
+    icon: "mdi:air-filter"
+    lambda: |-
+      // same value as "*Average PM AQI*" (one calculation, so the two always agree)
+      float a = id(avg_pm_aqi).state;
+      if (isnan(a)) return std::string("Warming up");
+      int avg_aqi = (int) lroundf(a);
+      char buffer[64];
+      if (avg_aqi <= 10) {
+        snprintf(buffer, sizeof(buffer), "Excellent (%d index)", avg_aqi);
+      } else if (avg_aqi <= 50) {
+        snprintf(buffer, sizeof(buffer), "Good (%d index)", avg_aqi);
+      } else if (avg_aqi <= 100) {
+        snprintf(buffer, sizeof(buffer), "Moderate (%d index)", avg_aqi);
+      } else if (avg_aqi <= 150) {
+        snprintf(buffer, sizeof(buffer), "Unhealthy for Sensitive Groups (%d index)", avg_aqi);
+      } else if (avg_aqi <= 200) {
+        snprintf(buffer, sizeof(buffer), "Unhealthy (%d index)", avg_aqi);
+      } else if (avg_aqi <= 300) {
+        snprintf(buffer, sizeof(buffer), "Very Unhealthy (%d index)", avg_aqi);
+      } else {
+        snprintf(buffer, sizeof(buffer), "Hazardous (%d index)", avg_aqi);
+      }
+      return std::string(buffer);

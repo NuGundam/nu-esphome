@@ -1,0 +1,778 @@
+# =======================================================
+# MR60-PRESENCE-COMMON v1.15 - shared package for the Seeed MR60BHA2 mmWave kits
+# (XIAO ESP32-C6 + MR60BHA2 60 GHz radar + BH1750 lux + 1x WS2812)
+#
+# Each device's yaml sets substitutions and includes this file:
+#   substitutions:
+#     device_name: nu-presence-1
+#     friendly_name: NU-Presence-1
+#     api_key / ap_ssid / ap_password
+#   packages:
+#     mr60_common: !include common/mr60-presence-common.yaml
+#
+# What this adds over Seeed's stock firmware (project seeedstudio.mr60bha2_kit 3.5):
+#   * "Occupied": on the instant the radar sees a target.  Off depends on what
+#     the target was doing when it vanished (v1.5): moving in the last 5 s
+#     (walking out) -> off after "Clear delay" (default 5 s); still (a radar
+#     blink on a sitting person) -> off after "Still hold" (default 60 s).
+#   * "Max range" (HA number, m): targets farther than this are ignored, so a
+#     radar that looks through a wall can be fenced to its own room.
+#   * "Breathing detected": the radar is reading a breath rate, i.e. someone is
+#     within ~1.5 m and still - the strongest "still person" confirmation.
+#   * Breath / heart rate publish unknown instead of 0 when nobody is in the
+#     core zone (no flat-line zeros in HA graphs); 15 s throttled average.
+#   * "Radar offline": no frame from the radar module for 60 s.
+#   * Lux every 5 s with a 2 lx dead band, and a "Dark" binary sensor with its
+#     own threshold number and hysteresis for the light automations.
+#   * "Presence LED" switch: the WS2812 glows dim blue after movement, dim
+#     green while occupied and still, off when clear (v1.14, same colours as
+#     nu-presence-24ghz-1; off by default - the stock firmware leaves the LED as
+#     a plain light entity). Blue needs Occupied too: a target past Max range
+#     can still set Target moving.
+#   * Diagnostics: Wi-Fi RSSI, uptime, MCU temperature, restart button.
+#   * v1.2 recorder diet: the raw radar blinks off ~every 5 s for <1 s with a
+#     person 1 ft away (173 blinks / 16 min on 2026-10-30), so distance /
+#     targets ignore the 0 drops while Occupied, distance is a 5-s mean with a
+#     3 cm dead band, Radar target gets a 2 s delayed-off, Last target reports
+#     0 while occupied.  Presence logic still runs on the raw frames.
+#   * v1.3: no timer filters on the radar stream (debounce never published and
+#     delayed_off fired stale timers at ~3 frames/s): Radar target is a
+#     template with a 2 s hold from timestamps, Targets is a 5 s rounded mean,
+#     the Occupied clear is a 1 s interval check instead of a delay script.
+#   * v1.6: radar reset line. The kit schematic (mmWave_Sensor_SCH_V1.0) wires
+#     the radar's IOPAD_RST_N to XIAO D3 = GPIO21 via 1 k, 10 k pull-up, and
+#     the on-board "Rest" button on the same net.  "Radar reset" button, a
+#     reset at every ESP boot, and "Radar stuck": a target reported while every
+#     raw value stays bit-identical for 3 min (2026-10-30 21:38-21:56 the
+#     module froze repeating breath 22.33 / 65.5 cm on an empty loft) -> Occupied
+#     cleared, radar reset automatically, retried every 5 min while stuck.
+#   * v1.15: LED stays blue for "LED blue hold" (default 10 s) after the last
+#     movement. LED only: Target moving stays 3 s, Occupied logic untouched.
+#   * v1.14: LED blue while moving, green while still (was green while occupied).
+#   * v1.13: "Radar hung" needs phase frames still ARRIVING and bit-identical.
+#     The module pauses the 0x0A13 frames while it reads breathing up close
+#     (2026-11-01 01:07 / 01:30: phase rate 0, breathing detected, person on
+#     the couch per Meross) and v1.11 took the pause as a freeze: Occupied
+#     cleared + reset, then the radar missed the person for 20 min.
+#   * v1.12: frame / phase rate sensors publish only on a change of 1/s or more
+#     (the 9.8 <-> 10.0 rounding jitter was ~13k recorder rows a day).
+#   * v1.11: real hang detection from the phase frames. The module sends a
+#     0x0A13 frame (total / breath / heart phase floats) ~10x/s - the raw
+#     micro-motion signal, which changes every frame for a live target and
+#     only repeats bit-for-bit if the DSP is dead. Parsed from the UART debug
+#     tap (the seeed component ignores that frame). "Radar hung" = target
+#     reported + frames arriving + phase unchanged 2 min -> Occupied off, auto
+#     reset, retry every 5 min; disabled until a phase frame has been seen.
+#   * v1.10: the "stuck" diagnosis was wrong. A still person beyond the 1.5 m
+#     vitals zone makes the radar repeat bit-identical frames (stale vitals +
+#     a fixed range bin) - 2026-10-31 00:38 and 00:58 the watchdog reset the
+#     radar on a real person (Meross saw them) and the radar then saw nobody
+#     for 17 min (after a reset it needs movement to re-acquire). Watchdog is
+#     now informational only ("Target static"), no auto reset, Occupied never
+#     cleared by it; manual Radar reset button and the boot reset stay.
+#     Radar status: integer fps, no live "changed N s ago" counter (7.5k
+#     recorder rows in 10 h).
+#   * v1.9: movement threshold 40 -> 25 cm over 1 s (v1.8 was slow to react).
+#   * v1.8: movement = distance differs > 40 cm from a reference taken 2 s
+#     earlier (v1.5 compared consecutive frames at ~3/s, so a normal walk never
+#     tripped it); HA distance is a 2 s mean.
+#   * v1.7: "Radar status" text (streaming / no target / silent / stuck /
+#     restarting with warm-up countdown) + "Radar frame rate" (report cycles/s,
+#     one per distance frame); Occupied and Last target no longer start as
+#     unknown after a reboot.
+#   * v1.4: "Vitals" text sensor explains an unknown heart / breath rate
+#     (no target, too far, settling, breathing only, breathing + heart).
+#   * Wi-Fi: fast_connect, no power save (mains-powered, lowest latency),
+#     15 min reboot_timeout like the NU-AQI units; XIAO RF switch enabled at
+#     boot (v1.1) so the onboard antenna is actually connected.
+# The radar module's own firmware is not touched (Seeed: it cannot be
+# customised; update it only over USB inside the case).
+# =======================================================
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    board_upload.maximum_size: 4194304
+  on_boot:
+    # XIAO ESP32-C6: the antenna sits behind an RF switch that Seeed's Arduino
+    # core drives at boot but ESP-IDF leaves floating. GPIO3 LOW powers the
+    # switch, GPIO14 LOW selects the onboard ceramic antenna (HIGH = U.FL).
+    # Without this the link ran at about -83 dBm (2026-10-30).
+    - priority: 700            # after GPIO setup (800), before Wi-Fi (250)
+      then:
+        - output.turn_off: rf_switch_power
+        - output.turn_off: antenna_select
+    - priority: 600            # outputs are ready; radar reset before Wi-Fi comes up
+      then:
+        - lambda: id(occupied).publish_state(false);   # v1.7 known state from boot
+        - script.execute: radar_reset
+    - priority: -100
+      then:
+        - script.execute: led_update
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: INFO
+
+api:
+  encryption:
+    key: ${api_key}
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:        # reuses the API key (ESPHome 2026: a password next to an API key is discouraged)
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 15min
+  ap:
+    ssid: ${ap_ssid}
+    password: ${ap_password}
+
+captive_portal:
+
+debug:
+  update_interval: 60s
+
+output:
+  - platform: gpio
+    id: radar_rst            # v1.6: radar IOPAD_RST_N via XIAO D3; on = held in reset
+    pin:
+      number: GPIO21
+      inverted: true
+      mode:
+        output: true
+        open_drain: true
+  - platform: gpio
+    pin: GPIO3
+    id: rf_switch_power
+  - platform: gpio
+    pin: GPIO14
+    id: antenna_select
+
+# -------------------------------------------------------
+# RADAR + I2C
+# -------------------------------------------------------
+uart:
+  id: uart_bus
+  baud_rate: 115200
+  rx_pin: 17
+  tx_pin: 16
+  parity: NONE
+  stop_bits: 1
+  # v1.11: tap the RX bytes for the 0x0A13 phase frame (SOF 01, ID 2, LEN 00 0C, TYPE 0A 13, HEAD_CKSUM, 12 data bytes, DATA_CKSUM)
+  debug:
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 20ms
+    sequence:
+      - lambda: |-
+          static std::vector<uint8_t> buf;
+          buf.insert(buf.end(), bytes.begin(), bytes.end());
+          size_t i = 0;
+          while (i + 21 <= buf.size()) {
+            if (buf[i] == 0x01 && buf[i + 3] == 0x00 && buf[i + 4] == 0x0C && buf[i + 5] == 0x0A && buf[i + 6] == 0x13) {
+              bool same = true;
+              for (int k = 0; k < 12; k++) { if (buf[i + 8 + k] != id(phase_prev)[k]) { same = false; id(phase_prev)[k] = buf[i + 8 + k]; } }
+              id(phase_count) += 1;
+              id(phase_seen) = true;
+              id(phase_last_ms) = millis();
+              if (!same) id(phase_change_ms) = millis();
+              i += 21;
+            } else {
+              i++;
+            }
+          }
+          buf.erase(buf.begin(), buf.begin() + i);
+          if (buf.size() > 256) buf.erase(buf.begin(), buf.end() - 32);
+
+seeed_mr60bha2:
+  id: radar
+
+i2c:
+  sda: GPIO22
+  scl: GPIO23
+  id: bus_a
+
+# -------------------------------------------------------
+# GLOBALS
+# -------------------------------------------------------
+globals:
+  - id: last_seen_ms          # last moment a valid (in-range) target was seen
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_frame_ms         # last moment any radar frame arrived
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: raw_off_ms            # last moment the raw radar output went off
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_move_ms          # last moment the target distance differed > 25 cm from the 1 s reference
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ref_d                 # v1.8: reference distance (cm) refreshed every 1 s (v1.9)
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: ref_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: prev_raw_d            # v1.6 stuck detection: last raw values seen
+    type: float
+    restore_value: no
+    initial_value: '-1'
+  - id: prev_raw_br
+    type: float
+    restore_value: no
+    initial_value: '-1'
+  - id: prev_raw_hr
+    type: float
+    restore_value: no
+    initial_value: '-1'
+  - id: last_change_ms        # last moment any raw radar value differed from the previous one
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: stuck
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: last_reset_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: reset_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: frame_count           # v1.7: distance frames since the last rate sample
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: phase_count           # v1.11: 0x0A13 phase frames since the last rate sample
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: phase_prev            # last 12 phase data bytes (3 floats)
+    type: std::array<uint8_t, 12>
+    restore_value: no
+  - id: phase_change_ms       # last moment the phase bytes differed from the previous frame
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: phase_last_ms         # v1.13: last moment any phase frame arrived (they pause during close-range vitals)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: phase_seen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: hung
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# -------------------------------------------------------
+# TUNING (numbers survive reboots; set them from HA)
+# -------------------------------------------------------
+number:
+  - platform: template
+    id: led_blue_hold
+    name: "LED blue hold"
+    icon: mdi:led-on
+    unit_of_measurement: s
+    min_value: 3
+    max_value: 120
+    step: 1
+    initial_value: 10
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: clear_delay
+    name: "Clear delay"
+    icon: mdi:timer-sand
+    unit_of_measurement: s
+    min_value: 5
+    max_value: 900
+    step: 5
+    initial_value: 5
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: still_hold
+    name: "Still hold"
+    icon: mdi:sofa
+    unit_of_measurement: s
+    min_value: 10
+    max_value: 900
+    step: 10
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: max_range
+    name: "Max range"
+    icon: mdi:ruler
+    unit_of_measurement: m
+    min_value: 0.5
+    max_value: 6
+    step: 0.25
+    initial_value: 6
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    on_value:
+      - script.execute: presence_eval
+  - platform: template
+    id: dark_threshold
+    name: "Dark threshold"
+    icon: mdi:brightness-4
+    unit_of_measurement: lx
+    min_value: 1
+    max_value: 200
+    step: 1
+    initial_value: 20
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+switch:
+  - platform: template
+    id: presence_led
+    name: "Presence LED"
+    icon: mdi:led-on
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - script.execute: led_update
+    on_turn_off:
+      - script.execute: led_update
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+  - platform: template
+    name: "Radar reset"
+    icon: mdi:radar
+    entity_category: diagnostic
+    on_press:
+      - script.execute: radar_reset
+
+# -------------------------------------------------------
+# PRESENCE LOGIC
+# -------------------------------------------------------
+script:
+  # Re-evaluated on every radar frame and whenever a tuning number changes.
+  - id: radar_reset
+    mode: single
+    then:
+      - lambda: |-
+          id(last_reset_ms) = millis();
+          id(reset_count) += 1;
+          ESP_LOGW("radar", "resetting the radar module (reset #%d)", id(reset_count));
+      - output.turn_on: radar_rst
+      - delay: 200ms
+      - output.turn_off: radar_rst
+      - lambda: |-
+          id(last_change_ms) = millis();     // fresh 3-min window for the stuck check
+          id(phase_change_ms) = millis();    // v1.11: fresh 2-min window for the hang check
+          id(prev_raw_d) = -1; id(prev_raw_br) = -1; id(prev_raw_hr) = -1;
+  - id: presence_eval
+    mode: queued
+    then:
+      - lambda: |-
+          if (id(hung)) return;                        // v1.11: a dead DSP reports a stale target
+          bool tgt = id(radar_raw).state;
+          float d = id(radar_distance).get_raw_state(); // cm; 0 = no target
+          float max_cm = id(max_range).state * 100.0f;
+          // distance 0 / NaN = radar has a target but no range yet: trust it
+          bool valid = tgt && (std::isnan(d) || d <= 0.0f || d <= max_cm);
+          if (valid) {
+            id(last_seen_ms) = millis();
+            if (!id(occupied).state) id(occupied).publish_state(true);
+          }
+  - id: led_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: presence_led
+              - binary_sensor.is_on: occupied
+              - binary_sensor.is_on: led_moving
+          then:
+            - light.turn_on:          # moved in the last "LED blue hold" seconds -> blue
+                id: led
+                brightness: 15%
+                red: 0
+                green: 0.1
+                blue: 1
+                transition_length: 300ms
+          else:
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: presence_led
+                    - binary_sensor.is_on: occupied
+                then:
+                  - light.turn_on:    # occupied, still only -> green
+                      id: led
+                      brightness: 15%
+                      red: 0
+                      green: 1
+                      blue: 0
+                      transition_length: 300ms
+                else:
+                  - light.turn_off:
+                      id: led
+                      transition_length: 300ms
+
+interval:
+  # v1.3: Occupied clears here, not from a timer - no stale timeouts to cancel
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (!id(occupied).state || id(last_seen_ms) == 0) return;
+          // v1.5: was the target moving when it was last seen? then it probably left
+          int32_t gap = (int32_t) (id(last_seen_ms) - id(last_move_ms));
+          bool was_moving = id(last_move_ms) != 0 && gap >= 0 && gap < 5000;
+          float hold_s = was_moving ? id(clear_delay).state : id(still_hold).state;
+          if ((millis() - id(last_seen_ms)) > (uint32_t) (hold_s * 1000.0f))
+            id(occupied).publish_state(false);
+  # v1.7: frame rate + status text (publish on change only)
+  - interval: 5s
+    then:
+      - lambda: |-
+          float fps = id(frame_count) / 5.0f; id(frame_count) = 0;
+          float pps = id(phase_count) / 5.0f; id(phase_count) = 0;
+          id(radar_fps).publish_state(fps);
+          id(phase_fps).publish_state(pps);
+          uint32_t now = millis();
+          uint32_t since_frame = now - id(last_frame_ms), since_change = now - id(last_change_ms), since_reset = now - id(last_reset_ms);
+          char buf[80]; std::string st;
+          if (id(hung)) {
+            snprintf(buf, sizeof(buf), "Hung - phase frozen, resetting (reset #%d)", id(reset_count)); st = buf;
+          } else if (id(last_reset_ms) != 0 && since_reset < 60000) {
+            snprintf(buf, sizeof(buf), "Restarting - vitals warm-up %lu s", (unsigned long) ((60000 - since_reset) / 1000)); st = buf;
+          } else if (id(last_frame_ms) == 0) {
+            st = "Waiting for first frame";
+          } else if (since_frame > 10000) {
+            snprintf(buf, sizeof(buf), "Silent %lu s", (unsigned long) (since_frame / 1000)); st = buf;
+          } else if (id(radar_raw).state && since_change > 180000) {
+            snprintf(buf, sizeof(buf), "Streaming %d/s - target static %lu min, DSP live", (int) (fps + 0.5f), (unsigned long) (since_change / 60000)); st = buf;
+          } else if (id(radar_raw).state) {
+            snprintf(buf, sizeof(buf), "Streaming %d/s - target", (int) (fps + 0.5f)); st = buf;
+          } else {
+            snprintf(buf, sizeof(buf), "Streaming %d/s - no target", (int) (fps + 0.5f)); st = buf;
+          }
+          if (st != id(radar_status).state) id(radar_status).publish_state(st);
+  # v1.10: static-target flag only (a still person beyond 1.5 m looks exactly like this) - no reset, no clearing
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (id(last_change_ms) == 0) return;
+          uint32_t since = millis() - id(last_change_ms);
+          bool now_static = id(radar_raw).state && since > 180000;
+          if (now_static != id(stuck)) { id(stuck) = now_static; ESP_LOGI("radar", now_static ? "target static for 3 min (still person or held track)" : "target values changing again"); }
+          // v1.11: a dead DSP - frames keep coming but the phase signal never changes while a target is claimed
+          // v1.13: phase frames must still be arriving - the module pauses them during close-range vitals, which is not a hang
+          uint32_t now = millis(), since_phase = now - id(phase_change_ms), since_frame = now - id(last_frame_ms);
+          bool phase_flowing = (now - id(phase_last_ms)) < 10000;
+          if (!phase_flowing) id(phase_change_ms) = now;   // a pause restarts the 2-min window
+          bool now_hung = id(phase_seen) && id(radar_raw).state && since_frame < 10000 && phase_flowing && since_phase > 120000;
+          if (now_hung && !id(hung)) {
+            id(hung) = true;
+            ESP_LOGW("radar", "phase frames unchanged for 2 min with a target - DSP hung, resetting");
+            if (id(occupied).state) id(occupied).publish_state(false);
+            if (!id(radar_reset).is_running()) id(radar_reset).execute();
+          } else if (id(hung) && since_phase < 10000) {
+            id(hung) = false; ESP_LOGI("radar", "phase signal alive again - recovered");
+          } else if (id(hung) && (now - id(last_reset_ms)) > 300000 && !id(radar_reset).is_running()) {
+            id(radar_reset).execute();
+          }
+  # v1.4: why the vitals read what they read (publishes only on change)
+  - interval: 5s
+    then:
+      - lambda: |-
+          float br = id(breath_rate_raw).get_raw_state(), hr = id(heart_rate_raw).get_raw_state();
+          float d_ft = id(radar_distance).get_raw_state() / 30.48f;
+          char buf[64]; std::string st;
+          if (!id(occupied).state) {
+            st = "No target";
+          } else if (br > 0.0f && hr > 0.0f) {
+            st = "Breathing + heart";
+          } else if (br > 0.0f) {
+            st = "Breathing only (heart needs <= 5 ft)";
+          } else if (d_ft > 5.0f) {
+            snprintf(buf, sizeof(buf), "Too far - %.1f ft (vitals need <= 5 ft)", d_ft);
+            st = buf;
+          } else {
+            st = "Settling - hold still ~60 s";
+          }
+          if (st != id(vitals).state) id(vitals).publish_state(st);
+
+text_sensor:
+  - platform: template
+    id: vitals
+    name: "Vitals"
+    icon: mdi:heart-pulse
+    update_interval: never
+  - platform: template
+    id: radar_status
+    name: "Radar status"
+    icon: mdi:radar
+    entity_category: diagnostic
+    update_interval: never
+
+binary_sensor:
+  - platform: seeed_mr60bha2
+    has_target:
+      id: radar_raw
+      internal: true
+      on_state:
+        - lambda: |-
+            id(last_frame_ms) = millis();
+            if (!x) id(raw_off_ms) = millis();
+        - script.execute: presence_eval
+
+  # the raw output blinks off for <1 s every few seconds on a still person; this
+  # holds it 2 s so only real gaps show (tuning aid - automations use Occupied)
+  - platform: template
+    id: radar_target
+    name: "Radar target"
+    device_class: motion
+    lambda: |-
+      if (id(radar_raw).state) return true;
+      return id(raw_off_ms) != 0 && (millis() - id(raw_off_ms)) < 2000;
+
+  - platform: template
+    id: occupied
+    name: "Occupied"
+    device_class: occupancy
+    on_state:
+      - script.execute: led_update
+
+  - platform: template
+    id: target_moving
+    name: "Target moving"
+    device_class: motion
+    icon: mdi:walk
+    lambda: |-
+      return id(last_move_ms) != 0 && (millis() - id(last_move_ms)) < 3000;
+
+  # v1.15: LED-only copy of Target moving with its own hold time
+  - platform: template
+    id: led_moving
+    internal: true
+    lambda: |-
+      return id(last_move_ms) != 0 && (float) (millis() - id(last_move_ms)) < id(led_blue_hold).state * 1000.0f;
+    on_state:
+      - script.execute: led_update
+
+  - platform: template
+    id: breathing
+    name: "Breathing detected"
+    icon: mdi:lungs
+    lambda: |-
+      float b = id(breath_rate_raw).state;
+      return !std::isnan(b) && b > 0.0f;
+
+  - platform: template
+    id: radar_hung
+    name: "Radar hung"
+    device_class: problem
+    entity_category: diagnostic
+    lambda: return id(hung);
+
+  - platform: template
+    id: radar_stuck
+    name: "Target static"
+    icon: mdi:motion-pause
+    entity_category: diagnostic
+    lambda: return id(stuck);
+
+  - platform: template
+    id: radar_offline
+    name: "Radar offline"
+    device_class: problem
+    entity_category: diagnostic
+    lambda: |-
+      return id(last_frame_ms) != 0 && (millis() - id(last_frame_ms)) > 60000;
+
+  - platform: template
+    id: dark
+    name: "Dark"
+    device_class: light
+    lambda: |-
+      float lx = id(lux).state, th = id(dark_threshold).state;
+      if (std::isnan(lx)) return {};
+      if (id(dark).state) return lx < th * 1.5f;   // need 50 % more light to clear
+      return lx < th;
+
+sensor:
+  - platform: seeed_mr60bha2
+    distance:
+      id: radar_distance
+      name: "Target distance"
+      unit_of_measurement: cm
+      accuracy_decimals: 0
+      filters:
+        # v1.2: 0 = "no target this frame"; while Occupied that is a blink, not a reading
+        - lambda: |-
+            if (x <= 0.0f && id(occupied).state) return {};
+            return x;
+        - throttle_average: 2s
+        - delta: 3
+      on_raw_value:
+        - lambda: |-
+            id(last_frame_ms) = millis();
+            id(frame_count) += 1;
+            if (x != id(prev_raw_d)) { id(prev_raw_d) = x; id(last_change_ms) = millis(); }
+            if (x > 0.0f) {
+              if (id(ref_ms) != 0 && fabsf(x - id(ref_d)) > 25.0f) {
+                id(last_move_ms) = millis(); id(ref_d) = x; id(ref_ms) = millis();
+              } else if (id(ref_ms) == 0 || (millis() - id(ref_ms)) > 1000) {
+                id(ref_d) = x; id(ref_ms) = millis();
+              }
+            }
+        - script.execute: presence_eval
+    num_targets:
+      id: radar_targets
+      name: "Targets"
+      icon: mdi:account-group
+      accuracy_decimals: 0
+      filters:
+        - lambda: |-
+            if (x <= 0.0f && id(occupied).state) return {};
+            return x;
+        - throttle_average: 5s
+        - round: 0
+        - delta: 0.5
+      on_raw_value:
+        - lambda: id(last_frame_ms) = millis();
+    # Radar reports 0 when nobody is in the 0.5-1.5 m core zone - publish
+    # unknown instead so HA graphs do not flat-line at zero.
+    breath_rate:
+      id: breath_rate_raw
+      name: "Breath rate"
+      unit_of_measurement: bpm
+      icon: mdi:lungs
+      accuracy_decimals: 0
+      filters:
+        - lambda: "return x > 0.0f ? x : NAN;"
+        - throttle_average: 15s
+      on_raw_value:
+        - lambda: if (x != id(prev_raw_br)) { id(prev_raw_br) = x; id(last_change_ms) = millis(); }
+    heart_rate:
+      id: heart_rate_raw
+      name: "Heart rate"
+      unit_of_measurement: bpm
+      icon: mdi:heart-pulse
+      accuracy_decimals: 0
+      filters:
+        - lambda: "return x > 0.0f ? x : NAN;"
+        - throttle_average: 15s
+      on_raw_value:
+        - lambda: if (x != id(prev_raw_hr)) { id(prev_raw_hr) = x; id(last_change_ms) = millis(); }
+
+  - platform: template
+    id: radar_fps
+    name: "Radar frame rate"
+    icon: mdi:radar
+    unit_of_measurement: "/s"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - delta: 1.0               # v1.12: 9.8 <-> 10.0 jitter wrote ~13k rows/day; only real drops matter
+
+  - platform: template
+    id: phase_fps
+    name: "Radar phase rate"
+    icon: mdi:sine-wave
+    unit_of_measurement: "/s"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - delta: 1.0               # v1.12: 9.8 <-> 10.0 jitter wrote ~13k rows/day; only real drops matter
+
+  - platform: template
+    name: "Radar resets"
+    icon: mdi:radar
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(reset_count);
+
+  - platform: bh1750
+    id: lux
+    name: "Illuminance"
+    address: 0x23
+    update_interval: 5s
+    filters:
+      - or:
+          - delta: 2
+          - throttle: 60s
+
+  - platform: template
+    id: since_seen
+    name: "Last target"
+    icon: mdi:account-clock
+    unit_of_measurement: s
+    device_class: duration
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (id(occupied).state) return 0.0f;      // v1.2: same value = no recorder row
+      return (millis() - id(last_seen_ms)) / 1000.0f;   // v1.7: nobody since boot counts from boot
+
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+  - platform: internal_temperature
+    name: "MCU temperature"
+    entity_category: diagnostic
+
+# -------------------------------------------------------
+# LED (WS2812 on GPIO1). Kept as a light entity like the stock firmware so
+# automations can still drive it; the Presence LED switch layers on top.
+# -------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: led
+    name: "LED"
+    pin: GPIO1
+    num_leds: 1
+    channel_colors: GRB
+    chipset: ws2812
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 300ms

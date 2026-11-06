@@ -1,0 +1,757 @@
+# =======================================================
+# NU-Presence-24GHz-2  v1.9 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# ESP32-C3-MINI, LD2450 on UART 20/21, WS2812 on GPIO3, buzzer on GPIO10. Pins from
+# github.com/ApolloAutomation/MTR-1 (Integrations/ESPHome/Core.yaml).
+# v1.1: motion only, at the user's request. The LTR-390 / DPS310 I2C sensors are gone (they failed on this unit:
+# SDA held low on GPIO1, scan empty, a real power cycle did not clear it; never proven working here).
+#
+# Same idea as NU-Presence-24GHz-1, but the LD2450 knows WHERE a target is (X/Y for up to 3), not only how far:
+#   * Occupied (v1.8) is NOT the driver's flag any more, see presence_2450.h. The LD2450 has no breathing detection:
+#     a seated person fades out for a minute or more, and static ghosts can sit in a slot for half an hour. So a
+#     person is a TRACK: it starts only from a target that moved (inside Moving range, at Moving speed), it follows
+#     any target near it, and when it is lost it clears after "Clear delay" if it was moving up to the loss (walked
+#     out) or after "Still hold" if it was still (faded out, assumed to be sitting there). Still target = Occupied
+#     and not moving. Zone N = a track inside the zone. v1.9: tracks survive Restart, OTA and crashes (RTC memory, their
+#     countdowns carry on); after a power cut nobody is tracked until they move. Radar silent for 2 s (last_rx_ms) =
+#     slots read as empty, because the driver leaves its sensors at their last values.
+#   * Target count, Target N distance in metres; an empty slot reads 0.0 (v1.2, the driver sends unknown).
+#     Target N X / Y are on the device but disabled in HA by default (they change constantly); the tuning page
+#     shows them live anyway. device_class is blanked on these so HA
+#     does not convert them to feet on a US unit system: they stay metres with no registry override.
+#   * Zone 1-3: rectangles, drawn on the page. Occupancy with "Zone hold" seconds of hold. The radar has no
+#     still-energy gates, so there is nothing like the LD2410's per-gate tuning: zones and Zone type do that job.
+#   * Zone type: Disabled = zones only count targets; Detection = the radar reports only inside the zones;
+#     Filter = it ignores targets inside them (a fan, a curtain, the TV wall).
+#   * Tuning page http://<device-ip>:8080/ (radar_web_2450.h, up 70 s after boot): live targets with trails on a top-down room map,
+#     drag a rectangle to set a zone, all in metres. The raw zone numbers are millimetres, so they stay internal.
+#   * v1.4 Zone N X1 / Y1 / X2 / Y2: the same zone edges as metre boxes in HA. Each one reads the radar's stored
+#     value every 5 s and writes through to the internal mm number, so HA and the page stay in step. X = sideways
+#     (0 = straight ahead), Y = forward from the sensor; X1 / Y1 is one corner, X2 / Y2 the opposite one. All four 0 =
+#     zone off. Every box applies as soon as it is entered.
+#   * Moving target (v1.5) is NOT the driver's flag any more. The LD2450 has no sensitivity setting (no per-gate
+#     energies like the LD2410), and the driver's own moving flag is held for the whole Clear delay and renewed by
+#     any stray speed spike (81 % on with a person sitting at 0 cm/s in a 90 s sample). The exposed "Moving target"
+#     is now: any target closer than "Moving range" (m) moving at "Moving speed" (cm/s) or faster, held for
+#     "Moving hold" seconds. Those three numbers are the sensitivity. The driver's flag stays on the device as
+#     bs_mv_raw (internal) for the tuning page. v1.6: the three numbers are also on the page (radar_web_2450.h v1.2)
+#     with presets and a live speed readout, under "Moving target".
+#   * Presence LED: blue while Moving target is on, green while occupied and still, off when clear; on by default.
+#     The light itself is internal, so only the "Presence LED" switch appears in HA. "Presence LED state"
+#     (Blue / Green / Off) reports the colour. v1.5 removed "LED blue hold": the LED locks to Moving target.
+#   * Wi-Fi, uptime, MCU temperature, Radar byte rate (0 = radar silent).
+#
+# boot_done: nothing touches the LED until on_boot -100. A restored switch fires its action during setup, before
+# the light exists; that exact pattern crashed the AirGradient units on every boot (airgradient-esphome note).
+#
+# First install: USB, or OTA from the Apollo firmware if it is on the network. Later updates are OTA with the API key.
+# The local copy keeps placeholders; the live copy on HA holds the real key and AP password.
+# =======================================================
+substitutions:
+  device_name: nu-presence-24ghz-2
+  friendly_name: Nu-Presence-24GHz-2
+  api_key: !secret api_key
+  ap_ssid: "Nu-Presence-24GHz-2 Hotspot"
+  ap_password: !secret ap_password
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - presence_2450.h           # v1.9 still presence tracks
+    - radar_web_2450.h          # tuning page on :8080
+  # v1.7: tell HA the page's port. USE_WEBSERVER(_PORT) is what the web_server component would define; here only the
+  # api (device info -> HA's "Visit" link = http://<ip>:8080) and mdns (_http service) read it, there is no web_server.
+  platformio_options:
+    build_flags:
+      - "-DUSE_WEBSERVER"
+      - "-DUSE_WEBSERVER_PORT=8080"
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: 'presence_restore(millis());'
+        - globals.set:
+            id: boot_done
+            value: 'true'
+        - script.execute: led_update
+
+esp32:
+  board: esp32-c3-devkitm-1
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+    advanced:
+      include_builtin_idf_components:   # radar_web_2450.h runs its own httpd; nothing else pulls esp_http_server in
+        - esp_http_server
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "16"     # API + OTA + mDNS + 5 httpd sockets
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG   # GPIO20/21 are UART0 and belong to the radar
+  level: INFO
+  logs:
+    ld2450: WARN
+
+api:
+  encryption:
+    key: ${api_key}
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:        # reuses the API key
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 15min
+  ap:
+    ssid: ${ap_ssid}
+    password: ${ap_password}
+
+# no captive_portal: it holds LWIP sockets the :8080 httpd needs (same as 24GHz-1)
+
+debug:
+  update_interval: 60s
+
+globals:
+  - id: boot_done
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: rx_bytes
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_rx_ms              # last radar bytes; without them the driver's sensors are frozen, not live
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_move_ms            # last moment an in-range target was really moving
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+uart:
+  id: uart_bus
+  tx_pin: GPIO21                # plain output: Apollo's input + pullup mode leaves TX dead on current ESPHome (the driver re-applies it)
+  rx_pin:
+    number: GPIO20
+    mode:
+      input: true
+      pullup: true
+  rx_buffer_size: 1024
+  baud_rate: 256000
+  parity: NONE
+  stop_bits: 1
+  debug:                        # counts RX bytes; the component still gets them
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 50ms
+    sequence:
+      - lambda: |-
+          id(rx_bytes) += bytes.size();
+          id(last_rx_ms) = millis();
+
+ld2450:
+  id: radar
+  uart_id: uart_bus
+
+output:
+  - platform: ledc
+    pin: GPIO10
+    id: buzzer
+
+rtttl:
+  output: buzzer
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          id(radar_bps).publish_state(id(rx_bytes) / 5.0f);
+          id(rx_bytes) = 0;
+  # writes that came in over :8080 are performed here, on the main loop (doing them on the httpd task crashed 24GHz-1)
+  - interval: 100ms
+    then:
+      - lambda: 'radar_web_pump();'
+      # v1.8: raw radar slots (mm, cm/s, NaN when empty) into the presence tracks
+      - lambda: |-
+          if (!id(boot_done)) return;
+          float x[3] = {id(t1x).get_raw_state(), id(t2x).get_raw_state(), id(t3x).get_raw_state()};
+          float y[3] = {id(t1y).get_raw_state(), id(t2y).get_raw_state(), id(t3y).get_raw_state()};
+          float s[3] = {id(t1s).get_raw_state(), id(t2s).get_raw_state(), id(t3s).get_raw_state()};
+          float cd = id(n_timeout).state, sh = id(still_hold).state;
+          presence_tick(x, y, s, millis() - id(last_rx_ms) < PR_SILENT_MS, id(mv_range).state * 1000.0f, id(mv_speed).state,
+                        (uint32_t) ((std::isnan(cd) ? 30.0f : cd) * 1000.0f), (uint32_t) ((std::isnan(sh) ? 300.0f : sh) * 1000.0f), millis());
+  # hand the entities to radar_web_2450.h and start the httpd (returns at once when it is already running)
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto &c = radar_web_cfg();
+          c.occ = id(occupied); c.mv = id(bs_mv); c.st = id(bs_st);
+          c.zn[0] = id(zn1); c.zn[1] = id(zn2); c.zn[2] = id(zn3);
+          c.tx[0] = id(t1x); c.ty[0] = id(t1y); c.ts[0] = id(t1s);
+          c.tx[1] = id(t2x); c.ty[1] = id(t2y); c.ts[1] = id(t2s);
+          c.tx[2] = id(t3x); c.ty[2] = id(t3y); c.ts[2] = id(t3s);
+          c.count = id(t_count);
+          c.zc[0][0] = id(z1x1); c.zc[0][1] = id(z1y1); c.zc[0][2] = id(z1x2); c.zc[0][3] = id(z1y2);
+          c.zc[1][0] = id(z2x1); c.zc[1][1] = id(z2y1); c.zc[1][2] = id(z2x2); c.zc[1][3] = id(z2y2);
+          c.zc[2][0] = id(z3x1); c.zc[2][1] = id(z3y1); c.zc[2][2] = id(z3x2); c.zc[2][3] = id(z3y2);
+          c.timeout = id(n_timeout); c.hold = id(zone_hold);
+          c.mvs = id(mv_speed); c.mvr = id(mv_range); c.mvh = id(mv_hold); c.mvraw = id(bs_mv_raw);
+          c.sth = id(still_hold); c.occraw = id(occ_raw);
+          c.multi = id(sw_multi); c.zt = id(sel_zt); c.fw = id(ts_fw); c.uptime = id(s_uptime); c.rssi = id(s_rssi);
+          radar_web_register();
+
+binary_sensor:
+  - platform: ld2450
+    ld2450_id: radar
+    has_target:
+      id: occ_raw
+      internal: true
+    has_moving_target:
+      id: bs_mv_raw
+      internal: true
+
+  - platform: template
+    id: occupied
+    name: "Occupied"
+    device_class: occupancy
+    lambda: 'return presence_occupied();'
+    on_state:
+      - script.execute: led_update
+  - platform: template
+    id: bs_st
+    name: "Still target"
+    icon: mdi:human-male
+    lambda: 'return id(occupied).state && !id(bs_mv).state;'
+
+  # Moving target: raw speed (cm/s) and forward distance (mm) per slot, NaN when empty. Evaluated every loop.
+  - platform: template
+    id: bs_mv
+    name: "Moving target"
+    device_class: motion
+    lambda: |-
+      esphome::sensor::Sensor *sp[3] = {id(t1s), id(t2s), id(t3s)};
+      esphome::sensor::Sensor *fy[3] = {id(t1y), id(t2y), id(t3y)};
+      float ymax = id(mv_range).state * 1000.0f, smin = id(mv_speed).state;
+      bool live = millis() - id(last_rx_ms) < PR_SILENT_MS;   // silent radar: last speed is frozen, not movement
+      for (int i = 0; live && i < 3; i++) {
+        float v = sp[i]->get_raw_state(), y = fy[i]->get_raw_state();
+        if (!std::isnan(v) && !std::isnan(y) && y <= ymax && fabsf(v) >= smin) id(last_move_ms) = millis();
+      }
+      return id(last_move_ms) != 0 && (float) (millis() - id(last_move_ms)) < id(mv_hold).state * 1000.0f;
+    on_state:
+      - script.execute: led_update
+
+  - platform: template
+    id: zn1
+    name: "Zone 1"
+    device_class: occupancy
+    lambda: 'return presence_in_rect(id(z1x1).state, id(z1y1).state, id(z1x2).state, id(z1y2).state);'
+    filters:
+      - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
+  - platform: template
+    id: zn2
+    name: "Zone 2"
+    device_class: occupancy
+    lambda: 'return presence_in_rect(id(z2x1).state, id(z2y1).state, id(z2x2).state, id(z2y2).state);'
+    filters:
+      - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
+  - platform: template
+    id: zn3
+    name: "Zone 3"
+    device_class: occupancy
+    lambda: 'return presence_in_rect(id(z3x1).state, id(z3y1).state, id(z3x2).state, id(z3y2).state);'
+    filters:
+      - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
+
+sensor:
+  - platform: ld2450
+    ld2450_id: radar
+    target_count:
+      id: t_count
+      name: "Target count"
+      filters:
+        - throttle: 1s
+        - delta: 0.5
+    # the driver publishes mm at ~10 Hz and NaN for an empty slot (page reads raw); HA gets metres, empty = 0.0
+    target_1:
+      x: {id: t1x, name: "Target 1 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      y: {id: t1y, name: "Target 1 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      distance: {name: "Target 1 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      speed: {id: t1s, internal: true}
+    target_2:
+      x: {id: t2x, name: "Target 2 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      y: {id: t2y, name: "Target 2 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      distance: {name: "Target 2 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      speed: {id: t2s, internal: true}
+    target_3:
+      x: {id: t3x, name: "Target 3 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      y: {id: t3y, name: "Target 3 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      distance: {name: "Target 3 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      speed: {id: t3s, internal: true}
+
+  - platform: template
+    id: radar_bps
+    name: "Radar byte rate"
+    icon: mdi:swap-horizontal
+    unit_of_measurement: "B/s"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - throttle: 60s
+
+  - platform: wifi_signal
+    id: s_rssi
+    name: "WiFi RSSI"
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    id: s_uptime
+    name: "Uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: internal_temperature
+    name: "MCU temperature"
+    update_interval: 60s
+    entity_category: diagnostic
+
+number:
+  - platform: ld2450
+    ld2450_id: radar
+    presence_timeout:
+      id: n_timeout
+      name: "Clear delay"
+    # millimetres: internal on purpose, edited in metres on the tuning page
+    zone_1:
+      x1: {id: z1x1, internal: true}
+      y1: {id: z1y1, internal: true}
+      x2: {id: z1x2, internal: true}
+      y2: {id: z1y2, internal: true}
+    zone_2:
+      x1: {id: z2x1, internal: true}
+      y1: {id: z2y1, internal: true}
+      x2: {id: z2x2, internal: true}
+      y2: {id: z2y2, internal: true}
+    zone_3:
+      x1: {id: z3x1, internal: true}
+      y1: {id: z3y1, internal: true}
+      x2: {id: z3x2, internal: true}
+      y2: {id: z3y2, internal: true}
+  - platform: template
+    id: z1x1m
+    name: "Zone 1 X1"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: -4.86
+    max_value: 4.86
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z1x1).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z1x1
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z1y1m
+    name: "Zone 1 Y1"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.56
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z1y1).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z1y1
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z1x2m
+    name: "Zone 1 X2"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: -4.86
+    max_value: 4.86
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z1x2).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z1x2
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z1y2m
+    name: "Zone 1 Y2"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.56
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z1y2).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z1y2
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z2x1m
+    name: "Zone 2 X1"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: -4.86
+    max_value: 4.86
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z2x1).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z2x1
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z2y1m
+    name: "Zone 2 Y1"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.56
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z2y1).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z2y1
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z2x2m
+    name: "Zone 2 X2"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: -4.86
+    max_value: 4.86
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z2x2).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z2x2
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z2y2m
+    name: "Zone 2 Y2"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.56
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z2y2).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z2y2
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z3x1m
+    name: "Zone 3 X1"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: -4.86
+    max_value: 4.86
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z3x1).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z3x1
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z3y1m
+    name: "Zone 3 Y1"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.56
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z3y1).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z3y1
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z3x2m
+    name: "Zone 3 X2"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: -4.86
+    max_value: 4.86
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z3x2).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z3x2
+          value: !lambda 'return roundf(x * 1000.0f);'
+  - platform: template
+    id: z3y2m
+    name: "Zone 3 Y2"
+    icon: mdi:vector-rectangle
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.56
+    step: 0.01
+    mode: box
+    entity_category: config
+    update_interval: 5s
+    lambda: |-
+      float v = id(z3y2).state;
+      if (std::isnan(v)) return {};
+      return v / 1000.0f;
+    set_action:
+      - number.set:
+          id: z3y2
+          value: !lambda 'return roundf(x * 1000.0f);'
+  # Still presence (v1.8): how long a person who faded out while still counts as sitting there
+  - platform: template
+    id: still_hold
+    name: "Still hold"
+    icon: mdi:seat-recline-normal
+    unit_of_measurement: "s"
+    min_value: 30
+    max_value: 3600
+    step: 10
+    initial_value: 300
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  # Moving target sensitivity (v1.5)
+  - platform: template
+    id: mv_speed
+    name: "Moving speed"
+    icon: mdi:speedometer
+    unit_of_measurement: "cm/s"
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: mv_range
+    name: "Moving range"
+    icon: mdi:arrow-expand-vertical
+    unit_of_measurement: "m"
+    min_value: 0.5
+    max_value: 7.5
+    step: 0.1
+    initial_value: 6
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: mv_hold
+    name: "Moving hold"
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_hold
+    name: "Zone hold"
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 600
+    step: 5
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+
+switch:
+  - platform: ld2450
+    ld2450_id: radar
+    bluetooth:
+      name: "Radar Bluetooth"
+      entity_category: config
+    multi_target:
+      id: sw_multi
+      name: "Multi target"
+      entity_category: config
+  - platform: template
+    id: presence_led
+    name: "Presence LED"
+    icon: mdi:led-on
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    on_turn_on:
+      - script.execute: led_update
+    on_turn_off:
+      - script.execute: led_update
+
+select:
+  - platform: ld2450
+    ld2450_id: radar
+    zone_type:
+      id: sel_zt
+      name: "Zone type"
+      entity_category: config
+
+button:
+  - platform: ld2450
+    ld2450_id: radar
+    factory_reset:
+      name: "Radar factory reset"
+      entity_category: diagnostic
+    restart:
+      name: "Radar restart"
+      entity_category: diagnostic
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: ld2450
+    ld2450_id: radar
+    version:
+      id: ts_fw
+      name: "Radar firmware"
+    mac_address:
+      name: "Radar MAC"
+  - platform: template
+    id: led_state
+    name: "Presence LED state"
+    icon: mdi:led-on
+    entity_category: diagnostic
+    update_interval: never
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led
+    name: "LED"
+    internal: true
+    pin: GPIO3
+    num_leds: 1
+    chipset: ws2812
+    channel_colors: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 300ms
+
+script:
+  - id: led_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: presence_led
+                    - binary_sensor.is_on: occupied
+                    - binary_sensor.is_on: bs_mv
+                then:
+                  - light.turn_on:          # moving target -> blue
+                      id: led
+                      brightness: 15%
+                      red: 0
+                      green: 0.1
+                      blue: 1
+                  - text_sensor.template.publish:
+                      id: led_state
+                      state: "Blue"
+                else:
+                  - if:
+                      condition:
+                        and:
+                          - switch.is_on: presence_led
+                          - binary_sensor.is_on: occupied
+                      then:
+                        - light.turn_on:    # occupied, still only -> green
+                            id: led
+                            brightness: 15%
+                            red: 0
+                            green: 1
+                            blue: 0
+                        - text_sensor.template.publish:
+                            id: led_state
+                            state: "Green"
+                      else:
+                        - light.turn_off:
+                            id: led
+                        - text_sensor.template.publish:
+                            id: led_state
+                            state: "Off"

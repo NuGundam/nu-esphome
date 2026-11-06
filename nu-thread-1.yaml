@@ -1,0 +1,116 @@
+esphome:
+  name: nu-thread-1
+  friendly_name: Nu-Thread-1
+
+esp32:
+  board: esp32-h2-devkitm-1
+  framework:
+    type: esp-idf
+
+network:
+  enable_ipv6: true
+
+openthread:
+  device_type: FTD
+  # 2026-10-13: full ESP32-H2 TX power for a mains-powered router (ESPHome default is ~0 dBm)
+  output_power: 20dBm
+  tlv: "0e080000000000020000000300000c4a0300001335060004001fffe002088745d7c15bc12edd0708fd5b0b205cd6d29e05102f8f9a62445bd8f59259bcb344454edf030e68612d7468726561642d666265620102fbeb041074a57f8b46fd2a5e027a33c76ff432bb0c0402a0f7f8"
+
+logger:
+  baud_rate: 115200
+  level: INFO
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+sensor:
+  # 2026-10-13: radio health counters since boot. Retries vs TX frames = link quality to neighbours,
+  # CCA failures = channel busy (Wi-Fi overlap), FCS errors = corrupted frames received.
+  - platform: openthread_info
+    tx_total:
+      name: "Thread TX Frames"
+      entity_category: diagnostic
+    tx_retries:
+      name: "Thread TX Retries"
+      entity_category: diagnostic
+    tx_err_cca:
+      name: "Thread TX CCA Failures"
+      entity_category: diagnostic
+    rx_total:
+      name: "Thread RX Frames"
+      entity_category: diagnostic
+    rx_err_fcs:
+      name: "Thread RX FCS Errors"
+      entity_category: diagnostic
+    partition_id_changes:
+      name: "Thread Partition Changes"
+      entity_category: diagnostic
+
+  - platform: internal_temperature
+    name: "Internal Temperature"
+
+  - platform: adc
+    pin: GPIO3
+    id: soil_moisture
+    name: "Soil Moisture"
+    unit_of_measurement: "%"
+    device_class: moisture
+    update_interval: 3s
+    attenuation: 12db
+    filters:
+      - median:
+          window_size: 7
+          send_every: 4
+          send_first_at: 1
+      - calibrate_linear:
+          - 2.30 -> 0.0
+          - 1.05 -> 100.0
+      - clamp:
+          min_value: 0
+          max_value: 100
+
+text_sensor:
+  - platform: template
+    name: "Soil Moisture Status"
+    icon: "mdi:sprout"
+    update_interval: 10s
+    lambda: |-
+      float sm = id(soil_moisture).state;
+      if (isnan(sm)) return {"Warming up"};
+      char buf[48];
+      if      (sm <= 10.0f) snprintf(buf, sizeof(buf), "Bone Dry (%.0f%%)", sm);
+      else if (sm <= 25.0f) snprintf(buf, sizeof(buf), "Dry (%.0f%%)", sm);
+      else if (sm <= 50.0f) snprintf(buf, sizeof(buf), "Low Moisture (%.0f%%)", sm);
+      else if (sm <= 75.0f) snprintf(buf, sizeof(buf), "Moist (%.0f%%)", sm);
+      else if (sm <= 90.0f) snprintf(buf, sizeof(buf), "Very Moist (%.0f%%)", sm);
+      else                  snprintf(buf, sizeof(buf), "Saturated (%.0f%%)", sm);
+      return {buf};
+
+  - platform: openthread_info
+    ip_address:
+      name: "IP Address"
+    channel:
+      name: "Channel"
+    role:
+      name: "Device Role"
+    rloc16:
+      name: "RLOC16"
+    ext_addr:
+      name: "Extended Address"
+    eui64:
+      name: "EUI64 Interface ID"
+    network_name:
+      name: "Network Name"
+    pan_id:
+      name: "PAN ID"
+    ext_pan_id:
+      name: "Extended PAN ID"
+
+    

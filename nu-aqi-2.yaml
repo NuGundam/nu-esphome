@@ -1,0 +1,11 @@
+# NU-AQI-2 — device-specific values only.
+# All logic lives in common/nuaqi-common.yaml (edit that to change every unit).
+substitutions:
+  device_name: nu-aqi-2
+  friendly_name: Nu-AQI-2
+  api_key: !secret api_key
+  ota_password: !secret ota_password
+  ap_ssid: "Nu-Aqi-2 Fallback Hotspot"
+  ap_password: !secret ap_password
+packages:
+  nuaqi_common: !include common/nuaqi-common.yaml

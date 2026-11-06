@@ -1,0 +1,573 @@
+# ══════════════════════════════════════════════════════════════════════════
+# nu-esp32-2432s028r.yaml  -  FULL FILE, touch UI v2 (2026-10-03)
+# ESP32-2432S028R "Cheap Yellow Display" - Office 1 light panel.
+#
+# The top half (down to `display:`) is this device's existing settings, rebuilt
+# from the config ESPHome reported for it. The rest is the new UI.
+#
+# Why the light turned on by itself: the XPT2046 resistive panel reports
+# phantom touches (the screen woke 15-20x/day with nobody there). In v1 the
+# touch that woke the sleeping screen was ALSO delivered to the widgets, the
+# arc sent light.turn_on on every release, and one tap anywhere on ~60% of
+# the screen acted. v2 guards:
+#   1. A touch on a dim/sleeping screen only wakes it (ui_armed); the controls
+#      arm 0.4 s after that touch is released and disarm when the screen dims.
+#   2. The arc only reacts on its ring, and only sends when touched while armed.
+#   3. Touch pressure threshold raised 400 -> 600.
+# v2.1: guard no longer uses the touchscreen on_touch event or touch duration
+#      (that version rejected every touch). Adds text_sensor "Last Touch Event".
+# ══════════════════════════════════════════════════════════════════════════
+
+esphome:
+  name: nu-esp32-2432s028r
+  friendly_name: NU-ESP32-2432S028R
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+  on_client_connected:
+    - delay: 1s
+    - script.execute: sync_ui_state
+
+ota:
+  - platform: web_server
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 17dB
+  fast_connect: true
+  ap:
+    ssid: "Nu-Esp32-2432S028R"
+    password: !secret ap_password
+
+captive_portal:
+
+spi:
+  - id: tft_bus
+    clk_pin: 14
+    mosi_pin: 13
+    miso_pin: 12
+  - id: touch_bus
+    clk_pin: 25
+    mosi_pin: 32
+    miso_pin: 39
+
+output:
+  - platform: ledc
+    pin: 21
+    id: backlight_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: "Panel Backlight"
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 250ms
+
+display:
+  - platform: mipi_spi
+    model: ESP32-2432S028-9342
+    spi_id: tft_bus
+    cs_pin:
+      number: 15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: 2
+      ignore_strapping_warning: true
+    data_rate: 40MHz
+    color_order: BGR
+    invert_colors: false
+    dimensions:
+      width: 320
+      height: 240
+
+globals:
+  - id: user_dragging        # finger is on the brightness arc (accepted touch)
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: last_brightness      # last brightness HA reported for the light (1-255)
+    type: int
+    restore_value: false
+    initial_value: "128"
+  - id: desired_brightness   # brightness being dialled in on the arc
+    type: int
+    restore_value: false
+    initial_value: "128"
+  - id: ui_armed             # controls act only while the screen is fully awake
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - script.execute: update_clock
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: update_clock
+
+touchscreen:
+  - platform: xpt2046
+    id: panel_touch
+    spi_id: touch_bus
+    cs_pin: 33
+    interrupt_pin: 36
+    update_interval: 50ms
+    # Pressure needed to count as a touch. Was 400 (the default); noise crossed it.
+    # If real taps start getting missed, lower toward 500; if phantoms persist, raise toward 900.
+    threshold: 600
+    calibration:
+      x_min: 220
+      x_max: 3760
+      y_min: 270
+      y_max: 3760
+    transform:
+      mirror_x: true
+      mirror_y: true
+      swap_xy: true
+    on_release:
+      # Wake on RELEASE, so the touch that wakes a sleeping screen is never seen by the widgets.
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+      - light.turn_on:
+          id: backlight
+          brightness: 100%
+      - lambda: |-
+          if (!id(ui_armed)) id(panel_event).publish_state("wake");
+      - script.execute: arm_ui
+      - script.execute: end_touch
+
+binary_sensor:
+  - platform: homeassistant
+    id: ha_office_light_state
+    entity_id: light.office_1_light_2
+    internal: true
+    on_state:
+      - script.execute: sync_ui_state
+
+sensor:
+  # v1 read sensor.office_1_light_brightness, which does not exist in HA, so the
+  # arc never followed the real brightness. Read the light's own attribute instead.
+  - platform: homeassistant
+    id: ha_office_light_brightness
+    entity_id: light.office_1_light_2
+    attribute: brightness
+    internal: true
+    on_value:
+      - lambda: |-
+          if (!isnan(x) && x >= 1) id(last_brightness) = (int) x;
+      - script.execute: sync_ui_state
+
+text_sensor:
+  # What the panel last did with a touch - visible in HA for troubleshooting.
+  - platform: template
+    id: panel_event
+    name: "Last Touch Event"
+    icon: mdi:gesture-tap
+    entity_category: diagnostic
+
+script:
+  # Arm the controls shortly after the screen is awake and bright.
+  - id: arm_ui
+    mode: restart
+    then:
+      - delay: 400ms
+      - lambda: id(ui_armed) = true;
+
+  # Safety net: clear the drag flag if LVGL never delivered the arc's release.
+  - id: end_touch
+    mode: restart
+    then:
+      - delay: 300ms
+      - if:
+          condition:
+            lambda: return id(user_dragging);
+          then:
+            - lambda: id(user_dragging) = false;
+            - script.execute: sync_ui_state
+
+  # Throttled live brightness while dragging (at most one call per 150 ms).
+  - id: send_brightness
+    mode: single
+    then:
+      - homeassistant.action:
+          action: light.turn_on
+          data:
+            entity_id: light.office_1_light_2
+            brightness: !lambda return to_string(id(desired_brightness));
+      - delay: 150ms
+
+  - id: update_clock
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: clock_label
+          text: !lambda |-
+            static char buf[12];
+            buf[0] = 0;
+            auto t = id(ha_time).now();
+            if (t.is_valid()) {
+              int h = t.hour % 12;
+              if (h == 0) h = 12;
+              snprintf(buf, sizeof(buf), "%d:%02d %s", h, t.minute, t.hour < 12 ? "AM" : "PM");
+            }
+            return buf;
+
+  # Paint the UI from Home Assistant's state (skipped while the user is dragging).
+  - id: sync_ui_state
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return !id(user_dragging);
+          then:
+            - if:
+                condition:
+                  lambda: return id(ha_office_light_state).state;
+                then:
+                  - lvgl.arc.update:
+                      id: brightness_arc
+                      value: !lambda return id(last_brightness);
+                      indicator:
+                        arc_color: 0xFFB300
+                      knob:
+                        bg_color: 0xFFFFFF
+                  - lvgl.widget.update:
+                      id: power_btn
+                      bg_color: 0xFFB300
+                      shadow_color: 0xFFB300
+                      shadow_width: 22
+                      shadow_opa: 40%
+                  - lvgl.label.update:
+                      id: power_icon
+                      text_color: 0x1A1200
+                  - lvgl.label.update:
+                      id: pct_label
+                      text_color: 0x1A1200
+                      text: !lambda |-
+                        static char buf[8];
+                        int pct = (int) (id(last_brightness) / 2.55f + 0.5f);
+                        if (pct < 1) pct = 1;
+                        snprintf(buf, sizeof(buf), "%d%%", pct);
+                        return buf;
+                else:
+                  - lvgl.arc.update:
+                      id: brightness_arc
+                      value: 0
+                      indicator:
+                        arc_color: 0x2A2F3A
+                      knob:
+                        bg_color: 0x4B5263
+                  - lvgl.widget.update:
+                      id: power_btn
+                      bg_color: 0x1B1F2A
+                      shadow_width: 0
+                      shadow_opa: 0%
+                  - lvgl.label.update:
+                      id: power_icon
+                      text_color: 0x8A93A6
+                  - lvgl.label.update:
+                      id: pct_label
+                      text: "OFF"
+                      text_color: 0x8A93A6
+
+lvgl:
+  buffer_size: 30%
+  bg_color: 0x0B0D12
+  # The touchscreen's on_release wakes the screen instead, so the wake touch never reaches a widget.
+  resume_on_input: false
+  touchscreens:
+    - touchscreen_id: panel_touch
+      long_press_time: 400ms
+      long_press_repeat_time: 100ms
+  on_idle:
+    - timeout: 45s
+      then:
+        - lambda: id(ui_armed) = false;      # dimmed: the next touch only brightens
+        - light.turn_on:
+            id: backlight
+            brightness: 35%
+    - timeout: 180s
+      then:
+        - lambda: id(ui_armed) = false;
+        - light.turn_off: backlight
+        - lvgl.pause:
+
+  style_definitions:
+    - id: preset_style
+      bg_color: 0x1B1F2A
+      bg_opa: COVER
+      border_width: 0
+      radius: 14
+      shadow_width: 0
+      text_color: 0xE6E8EE
+      text_font: montserrat_18
+    - id: preset_pressed
+      bg_color: 0xFFB300
+      text_color: 0x1A1200
+
+  pages:
+    - id: main_page
+      bg_color: 0x0B0D12
+      bg_opa: COVER
+      widgets:
+        # ── top bar ──────────────────────────────────────────────
+        - obj:
+            width: 320
+            height: 30
+            align: TOP_LEFT
+            bg_color: 0x12151C
+            bg_opa: COVER
+            border_width: 0
+            radius: 0
+            pad_left: 12
+            pad_right: 12
+            pad_top: 0
+            pad_bottom: 0
+            scrollable: false
+            clickable: false
+            widgets:
+              - label:
+                  text: "Office 1"
+                  align: LEFT_MID
+                  text_font: montserrat_16
+                  text_color: 0xE6E8EE
+              - label:
+                  id: clock_label
+                  text: ""
+                  align: RIGHT_MID
+                  text_font: montserrat_14
+                  text_color: 0x8A93A6
+
+        # ── brightness dial (drag the ring) ──────────────────────
+        - arc:
+            id: brightness_arc
+            width: 184
+            height: 184
+            align: LEFT_MID
+            x: 10
+            y: 15
+            min_value: 0
+            max_value: 255
+            value: 128
+            start_angle: 135
+            end_angle: 45
+            adjustable: true
+            adv_hittest: true          # only the ring is touchable, not the whole square
+            arc_width: 14
+            arc_color: 0x1B1F2A
+            arc_rounded: true
+            indicator:
+              arc_width: 14
+              arc_color: 0x2A2F3A
+              arc_rounded: true
+            knob:
+              bg_color: 0x4B5263
+              pad_all: 5
+            on_press:
+              - lambda: id(user_dragging) = id(ui_armed);
+            on_value:
+              - if:
+                  condition:
+                    lambda: return id(user_dragging);
+                  then:
+                    - lambda: |-
+                        int v = (int) x;
+                        if (v < 3) v = 3;
+                        id(desired_brightness) = v;
+                    - lvgl.label.update:
+                        id: pct_label
+                        text: !lambda |-
+                          static char buf[8];
+                          int pct = (int) (id(desired_brightness) / 2.55f + 0.5f);
+                          if (pct < 1) pct = 1;
+                          snprintf(buf, sizeof(buf), "%d%%", pct);
+                          return buf;
+                    - script.execute: send_brightness
+            on_release:
+              - if:
+                  condition:
+                    lambda: return id(user_dragging);
+                  then:
+                    - lambda: |-
+                        id(user_dragging) = false;
+                        id(panel_event).publish_state("dial " + to_string((int) (id(desired_brightness) / 2.55f + 0.5f)) + "%");
+                    - script.stop: send_brightness
+                    - homeassistant.action:
+                        action: light.turn_on
+                        data:
+                          entity_id: light.office_1_light_2
+                          brightness: !lambda return to_string(id(desired_brightness));
+                  else:
+                    # ignored touch (screen was dim or asleep): snap the dial back
+                    - lambda: |-
+                        id(user_dragging) = false;
+                        id(panel_event).publish_state("ignored dial (screen was dim)");
+                    - script.execute: sync_ui_state
+
+        # ── power button in the middle of the dial ───────────────
+        - button:
+            id: power_btn
+            width: 104
+            height: 104
+            align: LEFT_MID
+            x: 50
+            y: 15
+            radius: 52
+            bg_color: 0x1B1F2A
+            bg_opa: COVER
+            border_width: 0
+            shadow_width: 0
+            on_click:
+              - if:
+                  condition:
+                    lambda: return id(ui_armed);
+                  then:
+                    - lambda: id(panel_event).publish_state("power toggle");
+                    - homeassistant.action:
+                        action: light.toggle
+                        data:
+                          entity_id: light.office_1_light_2
+                  else:
+                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+            widgets:
+              - label:
+                  id: power_icon
+                  text: ""
+                  align: CENTER
+                  y: -16
+                  text_font: montserrat_28
+                  text_color: 0x8A93A6
+              - label:
+                  id: pct_label
+                  text: "--"
+                  align: CENTER
+                  y: 22
+                  text_font: montserrat_20
+                  text_color: 0x8A93A6
+
+        # ── brightness presets ───────────────────────────────────
+        - button:
+            width: 100
+            height: 42
+            align: TOP_RIGHT
+            x: -10
+            y: 38
+            styles: preset_style
+            pressed:
+              styles: preset_pressed
+            on_click:
+              - if:
+                  condition:
+                    lambda: return id(ui_armed);
+                  then:
+                    - lambda: id(panel_event).publish_state("preset 100%");
+                    - homeassistant.action:
+                        action: light.turn_on
+                        data:
+                          entity_id: light.office_1_light_2
+                          brightness_pct: "100"
+                  else:
+                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+            widgets:
+              - label:
+                  text: "100%"
+                  align: CENTER
+        - button:
+            width: 100
+            height: 42
+            align: TOP_RIGHT
+            x: -10
+            y: 88
+            styles: preset_style
+            pressed:
+              styles: preset_pressed
+            on_click:
+              - if:
+                  condition:
+                    lambda: return id(ui_armed);
+                  then:
+                    - lambda: id(panel_event).publish_state("preset 75%");
+                    - homeassistant.action:
+                        action: light.turn_on
+                        data:
+                          entity_id: light.office_1_light_2
+                          brightness_pct: "75"
+                  else:
+                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+            widgets:
+              - label:
+                  text: "75%"
+                  align: CENTER
+        - button:
+            width: 100
+            height: 42
+            align: TOP_RIGHT
+            x: -10
+            y: 138
+            styles: preset_style
+            pressed:
+              styles: preset_pressed
+            on_click:
+              - if:
+                  condition:
+                    lambda: return id(ui_armed);
+                  then:
+                    - lambda: id(panel_event).publish_state("preset 50%");
+                    - homeassistant.action:
+                        action: light.turn_on
+                        data:
+                          entity_id: light.office_1_light_2
+                          brightness_pct: "50"
+                  else:
+                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+            widgets:
+              - label:
+                  text: "50%"
+                  align: CENTER
+        - button:
+            width: 100
+            height: 42
+            align: TOP_RIGHT
+            x: -10
+            y: 188
+            styles: preset_style
+            pressed:
+              styles: preset_pressed
+            on_click:
+              - if:
+                  condition:
+                    lambda: return id(ui_armed);
+                  then:
+                    - lambda: id(panel_event).publish_state("preset 25%");
+                    - homeassistant.action:
+                        action: light.turn_on
+                        data:
+                          entity_id: light.office_1_light_2
+                          brightness_pct: "25"
+                  else:
+                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+            widgets:
+              - label:
+                  text: "25%"
+                  align: CENTER

@@ -1,0 +1,12 @@
+# AirGradient Loft - device-specific values only.
+# All logic lives in common/airgradient-one-common.yaml.
+substitutions:
+  device_name: airgradient-loft
+  friendly_name: AirGradient Loft
+  api_key: !secret api_key
+  ap_ssid: "AirGradient-Loft Fallback"
+  ap_password: !secret ap_password
+  voc_learning_offset: '12'
+  nox_learning_offset: '12'
+packages:
+  ag_common: !include common/airgradient-one-common.yaml

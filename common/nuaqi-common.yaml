@@ -1,0 +1,722 @@
+# =======================================================
+# NUAQI-COMMON  v2.0 — shared package for NU-AQI-1/2/4/5
+# (SHT40 + SGP41 + SCD40 units; NU-AQI-3 SEN66 unit is standalone)
+#
+# Each device's yaml sets substitutions and includes this file:
+#   substitutions:
+#     device_name: nu-aqi-1
+#     ...
+#   packages:
+#     nuaqi_common: !include common/nuaqi-common.yaml
+#
+# Edit THIS file to change all four devices at once.
+# =======================================================
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - nuaqi_helpers.h       # WiFi TX power readback helper
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  # 80MHz cuts core heat dramatically; this device only polls I2C sensors.
+  cpu_frequency: 80MHz
+  framework:
+    type: esp-idf
+logger:
+  baud_rate: 115200
+  level: INFO
+# Provides the live CPU-frequency sensor below.
+debug:
+  update_interval: 60s
+api:
+  encryption:
+    key: "${api_key}"
+  reboot_timeout: 0s
+ota:
+  - platform: esphome
+    password: "${ota_password}"
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Boot value only — the "Adaptive WiFi TX Power" loop (see interval:)
+  # adjusts power at runtime between 8.5 and 20 dBm based on link quality.
+  output_power: 8.5dB
+  fast_connect: true
+  # reboot if WiFi stays down 15 min (a wedged stack otherwise never recovers)
+  reboot_timeout: 15min
+  power_save_mode: light
+  ap:
+    ssid: "${ap_ssid}"
+    password: "${ap_password}"
+captive_portal:
+# -------------------------------------------------------
+# GLOBALS
+# -------------------------------------------------------
+globals:
+  - id: aqi_brightness
+    type: float
+    restore_value: no
+    initial_value: '1.0'
+  - id: aqi_level_score
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: last_aqi_level
+    type: int
+    restore_value: no
+    initial_value: '-99'
+  - id: sensor_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: aqi_r
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: aqi_g
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: aqi_b
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  # Adaptive WiFi TX power setpoint (dBm); survives reboot
+  - id: wifi_power_setpoint
+    type: float
+    restore_value: yes
+    initial_value: '8.5'
+  # Current dynamic temperature correction in °C, recomputed every 30s
+  - id: temp_offset_dynamic
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+# -------------------------------------------------------
+# Sun and Time
+# -------------------------------------------------------
+switch:
+  - platform: template
+    name: "AQI Auto Night Mode"
+    id: auto_night_mode
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          id(aqi_brightness) = id(sun_component).is_above_horizon() ? 1.0f : 0.5f;
+      - script.execute: update_aqi_led
+    turn_off_action:
+      - globals.set:
+          id: aqi_brightness
+          value: '1.0'
+      - script.execute: update_aqi_led
+  # Enables the runtime WiFi power control loop (see interval:).
+  - platform: template
+    name: "Adaptive WiFi TX Power"
+    id: adaptive_wifi_power
+    icon: "mdi:wifi-cog"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+# NOTE: on_boot is intentionally not used for brightness init.
+# At priority -100 WiFi is not yet up, so sun_component.is_above_horizon()
+# returns a stale value. The time sync callback handles the first correct
+# brightness set once HA time is available (also after any HA reconnect).
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - lambda: |-
+          if (id(auto_night_mode).state) {
+            id(aqi_brightness) = id(sun_component).is_above_horizon() ? 1.0f : 0.5f;
+          }
+      - script.execute: update_aqi_led
+sun:
+  id: sun_component
+  latitude: !secret home_latitude
+  longitude: !secret home_longitude
+  on_sunrise:
+    - elevation: 0°
+      then:
+        - if:
+            condition:
+              switch.is_on: auto_night_mode
+            then:
+              - globals.set:
+                  id: aqi_brightness
+                  value: '1.0'
+              - script.execute: update_aqi_led
+  on_sunset:
+    - elevation: 0°
+      then:
+        - if:
+            condition:
+              switch.is_on: auto_night_mode
+            then:
+              - globals.set:
+                  id: aqi_brightness
+                  value: '0.5'
+              - script.execute: update_aqi_led
+# -------------------------------------------------------
+# LED
+# -------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    name: "AQI LED"
+    id: aqi_led_strip
+    chipset: WS2812
+    pin: GPIO48
+    num_leds: 1
+    channel_colors: GRB
+# -------------------------------------------------------
+# I2C + MULTIPLEXER
+# -------------------------------------------------------
+i2c:
+  sda: GPIO5
+  scl: GPIO4
+  scan: true
+  id: i2c0
+tca9548a:
+  - address: 0x70
+    id: multiplex0
+    i2c_id: i2c0
+    channels:
+      - bus_id: multiplex0channel0
+        channel: 0
+      - bus_id: multiplex0channel1
+        channel: 1
+      - bus_id: multiplex0channel2
+        channel: 2
+# -------------------------------------------------------
+# NUMBER (user-adjustable offsets)
+# -------------------------------------------------------
+number:
+  # Manual additive offsets — same meaning and entity ids as before,
+  # so your saved calibration values carry over.
+  - platform: template
+    name: "T-Offset"
+    id: sht40_temperature
+    entity_category: "config"
+    min_value: -20
+    max_value: 20
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 0     # used only when nothing is saved (fresh flash) - was min_value -20
+    mode: box
+  - platform: template
+    name: "H-Offset"
+    id: sht40_humidity
+    entity_category: "config"
+    min_value: -20
+    max_value: 20
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 0     # used only when nothing is saved (fresh flash) - was min_value -20
+    mode: box
+  # Dynamic part: fraction of (ESP internal °C − raw SHT40 °C) subtracted.
+  # 0 disables dynamic compensation. Typical 0.05–0.20.
+  - platform: template
+    name: "Temp Offset Heat Coefficient"
+    id: temp_offset_coeff
+    icon: "mdi:chip"
+    entity_category: "config"
+    min_value: 0.0
+    max_value: 0.5
+    step: 0.01
+    initial_value: 0.12
+    optimistic: true
+    restore_value: true
+# -------------------------------------------------------
+# SENSORS
+# -------------------------------------------------------
+sensor:
+  # Radiant temp from Home Assistant
+  - platform: homeassistant
+    id: radiant_temp_sum
+    entity_id: sensor.radiant_temp_whole_house
+    filters:
+      - lambda: |-
+          if (isnan(x)) return {};
+          return x;
+  - platform: wifi_signal
+    update_interval: 60s
+    id: wifi_signal_raw
+    internal: true
+    filters:
+      - delta: 1
+  - platform: template
+    name: "WiFi Signal Quality"
+    id: wifi_quality
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:wifi"
+    update_interval: 60s
+    entity_category: "diagnostic"
+    filters:
+      - delta: 1
+    lambda: |-
+      if (isnan(id(wifi_signal_raw).state)) return {};
+      int q = 2 * (100 + (int)id(wifi_signal_raw).state);
+      return (float)std::clamp(q, 0, 100);
+  # Internal °C source for the dynamic offset math.
+  - platform: internal_temperature
+    id: esp_temp_c
+    internal: true
+    update_interval: 30s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+  # Same reading in °F for HA (renamed from "ESP32 Internal Temperature" —
+  # the old entity mixed °C readings with °F-style thresholds).
+  - platform: copy
+    source_id: esp_temp_c
+    name: "ESP32 Internal Temperature (F)"
+    id: esp_temp
+    icon: "mdi:chip"
+    entity_category: "diagnostic"
+    unit_of_measurement: "°F"
+    filters:
+      - lambda: return (x * 1.8f) + 32.0f;
+      - delta: 1
+  # Shows the live dynamic correction being subtracted (excludes T-Offset).
+  - platform: template
+    name: "Temp Offset Applied"
+    id: temp_offset_applied
+    icon: "mdi:thermometer-minus"
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    entity_category: "diagnostic"
+    update_interval: 60s
+    filters:
+      - delta: 0.1
+    lambda: |-
+      return id(temp_offset_dynamic) * 1.8f;
+  # Actual CPU clock, read live (confirms cpu_frequency: took effect).
+  - platform: debug
+    cpu_frequency:
+      name: "ESP32 CPU Frequency"
+      id: esp_cpu_freq
+      icon: "mdi:chip"
+      entity_category: "diagnostic"
+      unit_of_measurement: "MHz"
+      accuracy_decimals: 0
+      filters:
+        - multiply: 0.000001   # component reports Hz
+        - delta: 1
+  # Actual WiFi max TX power from the radio driver
+  # (confirms output_power: took effect). Helper lives in nuaqi_helpers.h.
+  - platform: template
+    name: "WiFi TX Power"
+    id: wifi_tx_power
+    icon: "mdi:wifi-arrow-up"
+    entity_category: "diagnostic"
+    unit_of_measurement: "dBm"
+    accuracy_decimals: 2
+    update_interval: 60s
+    filters:
+      - delta: 0.1
+    lambda: |-
+      return nuaqi_wifi_tx_power_dbm();
+  # SGP41 — VOC/NOx — on Multiplexer Channel 2
+  - platform: sgp4x
+    i2c_id: multiplex0channel2
+    id: sgp41_vn
+    voc_index:
+      name: "VOC Index"
+      icon: "mdi:flask-outline"
+      id: sgp41_voc
+      algorithm_tuning:
+        index_offset: 100
+        learning_time_offset_hours: 240
+        learning_time_gain_hours: 240
+        gating_max_duration_minutes: 360
+        std_initial: 150
+        gain_factor: 120
+      filters:
+        - exponential_moving_average:
+            alpha: 0.05
+            send_every: 10
+    nox_index:
+      name: "NOx Index"
+      icon: "mdi:smog"
+      id: sgp41_nox
+      filters:
+        - exponential_moving_average:
+            alpha: 0.2
+            send_every: 5
+    # Sources deliver the heat-corrected temp/RH, improving the gas
+    # index algorithm's own compensation.
+    compensation:
+      temperature_source: sht40_temperature_raw
+      humidity_source: sht40_humidity_raw
+    store_baseline: true
+    update_interval: 10s
+    address: 0x59
+  # SHT40 — Temp/Humidity — on Multiplexer Channel 0
+  - platform: sht4x
+    i2c_id: multiplex0channel0
+    id: sht40_th
+    temperature:
+      name: "Temperature"
+      id: sht40_temperature_raw
+      icon: "mdi:thermometer"
+      accuracy_decimals: 1
+      filters:
+        - sliding_window_moving_average:
+            window_size: 10
+            send_every: 1
+        # corrected = smoothed + manual T-Offset − dynamic ESP-heat term.
+        # temp_offset_dynamic is recomputed every 30s (see interval).
+        - lambda: |-
+            return x + id(sht40_temperature).state - id(temp_offset_dynamic);
+    humidity:
+      name: "Humidity"
+      id: sht40_humidity_raw
+      icon: "mdi:water-percent"
+      accuracy_decimals: 1
+      filters:
+        - sliding_window_moving_average:
+            window_size: 10
+            send_every: 1
+        # Manual H-Offset, then Magnus rescale: RH measured at the (heated)
+        # sensor temperature is too LOW for the true cooler air.
+        - lambda: |-
+            float rh  = x + id(sht40_humidity).state;
+            float dyn = id(temp_offset_dynamic);
+            float t_meas = id(sht40_temperature_raw).get_raw_state();
+            if (!isnan(t_meas) && dyn > 0.0f) {
+              auto ps = [](float t) { return expf(17.62f * t / (243.12f + t)); };
+              rh = rh * ps(t_meas) / ps(t_meas - dyn);
+            }
+            return rh > 100.0f ? 100.0f : (rh < 0.0f ? 0.0f : rh);
+    update_interval: 10s
+    address: 0x44
+  # Feels Like Temperature
+  - platform: template
+    name: "*AQI Feels Like Temp*"
+    id: aqi_feels_like_temperature
+    icon: "mdi:thermometer-lines"
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      float Tc = id(sht40_temperature_raw).state;
+      float RH = id(sht40_humidity_raw).state;
+      if (isnan(Tc) || isnan(RH)) return NAN;
+      float T = (Tc * 9.0f / 5.0f) + 32.0f;
+      float feels = T + (0.1f * (RH - 50.0f));
+      float radiant = id(radiant_temp_sum).state;
+      if (!isnan(radiant)) {
+        float adj = (radiant - T) * 0.05f;
+        if      (adj >  2.0f) adj =  2.0f;
+        else if (adj < -2.0f) adj = -2.0f;
+        feels += adj;
+      }
+      return feels;
+  # Absolute Humidity
+  - platform: absolute_humidity
+    name: "*Absolute Humidity*"
+    id: sht40_absolute_humidity
+    temperature: sht40_temperature_raw
+    humidity: sht40_humidity_raw
+    icon: "mdi:water-opacity"
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 2
+  # SCD40 — CO2 — on Multiplexer Channel 1
+  - platform: scd4x
+    i2c_id: multiplex0channel1
+    co2:
+      name: "Carbon dioxide"
+      id: scd40_co2
+      icon: "mdi:molecule-co2"
+      on_value:
+        then:
+          - lambda: |-
+              if (!isnan(x) && x > 0) {
+                id(sensor_ready) = true;
+              }
+    automatic_self_calibration: true
+    altitude_compensation: 55m
+    temperature_offset: 2.0
+    update_interval: 10s
+    address: 0x62
+# -------------------------------------------------------
+# TEXT SENSORS
+# -------------------------------------------------------
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP32 IP Address"
+      icon: "mdi:ip-network"
+    ssid:
+      name: "SSID"
+      icon: "mdi:router-wireless"
+  - platform: template
+    name: "Unit Temperature Status"
+    id: esp_temp_status
+    icon: "mdi:chip"
+    entity_category: "diagnostic"
+    update_interval: 60s
+    lambda: |-
+      float t = id(esp_temp).state;   // °F
+      if (t >= 185) return {"Overheating"};
+      if (t >= 125) return {"Warm"};
+      return {"Normal"};
+  - platform: template
+    name: "AQI AH"
+    icon: "mdi:water-opacity"
+    update_interval: 10s
+    lambda: |-
+      float ah = id(sht40_absolute_humidity).state;
+      if (isnan(ah)) return {"Warming up"};
+      char buf[48];
+      const char* label =
+        (ah <= 6.0f)  ? "Very Dry" :
+        (ah <= 8.0f)  ? "Dry" :
+        (ah <= 10.5f) ? "Comfortable" :
+        (ah <= 12.0f) ? "Humid" :
+        (ah <= 15.0f) ? "Very Humid" : "Excessive";
+      snprintf(buf, sizeof(buf), "%s (%.1f g/m³)", label, ah);
+      return {buf};
+  - platform: template
+    name: "AQI TVOC"
+    id: aqi_tvoc_text
+    icon: "mdi:flask-outline"
+    update_interval: 10s
+    lambda: |-
+      float v = id(sgp41_voc).state;
+      if (isnan(v) || v <= 0) return {"Warming up"};
+      char buf[64];
+      const char* label =
+        (v <= 150) ? "Excellent" :
+        (v <= 250) ? "Good" :
+        (v <= 350) ? "Moderate" :
+        (v <= 450) ? "Unhealthy for Sensitive Groups" :
+        (v <= 500) ? "Unhealthy" : nullptr;
+      if (!label) return {"Warming up"};
+      snprintf(buf, sizeof(buf), "%s (%.0f index)", label, v);
+      return {buf};
+  - platform: template
+    name: "AQI NOx"
+    id: aqi_nox_text
+    icon: "mdi:smog"
+    update_interval: 10s
+    lambda: |-
+      float n = id(sgp41_nox).state;
+      if (isnan(n) || n < 1) return {"Warming up"};
+      char buf[64];
+      const char* label =
+        (n <=  50) ? "Excellent" :
+        (n <= 100) ? "Good" :
+        (n <= 200) ? "Moderate" :
+        (n <= 300) ? "Poor" :
+        (n <= 400) ? "Very Poor" : "Hazardous";
+      snprintf(buf, sizeof(buf), "%s (%.0f index)", label, n);
+      return {buf};
+  - platform: template
+    name: "AQI CO2"
+    icon: "mdi:molecule-co2"
+    update_interval: 10s
+    lambda: |-
+      float c = id(scd40_co2).state;
+      if (isnan(c) || c <= 0) return {"Warming up"};
+      char buf[64];
+      const char* label =
+        (c <= 600)  ? "Excellent" :
+        (c <= 1000) ? "Good" :
+        (c <= 1500) ? "Moderate" :
+        (c <= 2000) ? "Unhealthy for Sensitive Groups" :
+        (c <= 5000) ? "Unhealthy" : nullptr;
+      if (!label) return {"Warming up"};
+      snprintf(buf, sizeof(buf), "%s (%.0f ppm)", label, c);
+      return {buf};
+  # NOx now scored alongside VOC and CO2 (was measured but never scored).
+  - platform: template
+    name: "*AQI Combined Level*"
+    id: combined_aqi_level
+    icon: "mdi:air-filter"
+    update_interval: 10s
+    lambda: |-
+      float voc = id(sgp41_voc).state;
+      float co2 = id(scd40_co2).state;
+      float nox = id(sgp41_nox).state;
+      if (!id(sensor_ready) || isnan(voc) || voc <= 0 || isnan(co2) || co2 <= 0) {
+        return std::string("Warming up");
+      }
+      int vs = (voc <= 150) ? 0 : (voc <= 250) ? 1 : (voc <= 350) ? 2 : (voc <= 450) ? 3 : 4;
+      int cs = (co2 <= 600) ? 0 : (co2 <= 1000) ? 1 : (co2 <= 1500) ? 2 : (co2 <= 2000) ? 3 : 4;
+      int ns = (isnan(nox) || nox < 1) ? 0 : (nox <= 100) ? 0 : (nox <= 200) ? 1 : (nox <= 300) ? 2 : (nox <= 400) ? 3 : 4;
+      static const char* labels[] = {
+        "Excellent", "Good", "Moderate",
+        "Unhealthy for Sensitive Groups", "Unhealthy", "Very Unhealthy"
+      };
+      return std::string(labels[std::max({vs, cs, ns})]);
+# -------------------------------------------------------
+# INTERVAL — drives LED from stable polling, no callbacks
+# -------------------------------------------------------
+interval:
+  # Dynamic temperature-correction recalculation.
+  # correction = coeff * max(0, ESP_internal°C − raw_SHT40°C)
+  # get_raw_state() reads the UNCOMPENSATED value, avoiding feedback loops.
+  - interval: 30s
+    then:
+      - lambda: |-
+          float esp_c = id(esp_temp_c).state;
+          float t_raw = id(sht40_temperature_raw).get_raw_state();
+          float coeff = id(temp_offset_coeff).state;
+          if (isnan(esp_c) || isnan(t_raw) || isnan(coeff)) {
+            id(temp_offset_dynamic) = 0.0f;
+            return;
+          }
+          float d = esp_c - t_raw;
+          if (d < 0.0f) d = 0.0f;
+          id(temp_offset_dynamic) = coeff * d;
+  # Adaptive WiFi TX power: steps up fast on a weak link, trims slowly
+  # when comfortably strong, so each unit finds its own minimum heat.
+  # Runtime driver call — output_power: in wifi: is just the boot value.
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (!id(adaptive_wifi_power).state) return;
+          float q = id(wifi_quality).state;
+          // link down or no reading yet = weak link -> step power up (the quality sensor
+          // keeps its last good value while disconnected, so it can't be trusted then)
+          if (!wifi::global_wifi_component->is_connected() || isnan(q)) q = 0.0f;
+          float p = id(wifi_power_setpoint);
+          if (q < 55.0f)      p += 2.0f;   // weak link: step up fast
+          else if (q > 75.0f) p -= 0.5f;   // strong link: trim slowly
+          if (p < 8.5f)  p = 8.5f;
+          if (p > 20.0f) p = 20.0f;
+          id(wifi_power_setpoint) = p;
+          nuaqi_wifi_set_tx_power_dbm(p);  // re-asserted every pass
+  - interval: 10s
+    then:
+      - lambda: |-
+          float voc = id(sgp41_voc).state;
+          float co2 = id(scd40_co2).state;
+          float nox = id(sgp41_nox).state;
+          int new_level;
+          if (!id(sensor_ready) || isnan(voc) || voc <= 0 || isnan(co2) || co2 <= 0) {
+            new_level = -1;
+          } else {
+            int vs = (voc <= 150) ? 0 : (voc <= 250) ? 1 : (voc <= 350) ? 2 : (voc <= 450) ? 3 : 4;
+            int cs = (co2 <= 600) ? 0 : (co2 <= 1000) ? 1 : (co2 <= 1500) ? 2 : (co2 <= 2000) ? 3 : 4;
+            int ns = (isnan(nox) || nox < 1) ? 0 : (nox <= 100) ? 0 : (nox <= 200) ? 1 : (nox <= 300) ? 2 : (nox <= 400) ? 3 : 4;
+            new_level = std::max({vs, cs, ns});
+          }
+          id(aqi_level_score) = new_level;
+          if (new_level < 0) {
+            if (id(last_aqi_level) != new_level) {
+              id(last_aqi_level) = new_level;
+              id(warmup_blink).execute();
+            }
+            return;
+          }
+          // Stop warmup blink the moment we become ready
+          if (id(last_aqi_level) < 0) {
+            id(warmup_blink).stop();
+          }
+          // Only update LED when score actually changes
+          if (new_level != id(last_aqi_level)) {
+            id(last_aqi_level) = new_level;
+            id(update_aqi_led).execute();
+          }
+# -------------------------------------------------------
+# BUTTONS
+# -------------------------------------------------------
+button:
+  - platform: template
+    name: "CO2 Recalibration"
+    icon: "mdi:molecule-co2"
+    on_press:
+      then:
+        - scd4x.perform_forced_calibration:
+            value: 400
+  - platform: restart
+    name: "ESP32-S3 Reboot"
+    icon: "mdi:restart"
+# -------------------------------------------------------
+# SCRIPTS
+# -------------------------------------------------------
+script:
+  - id: update_aqi_led
+    mode: restart
+    then:
+      # no colour yet during warm-up (time sync / night-mode toggles call this too);
+      # once ready, stop the warm-up blink first so its trailing turn_off can't blank the LED
+      - if:
+          condition:
+            lambda: 'return id(aqi_level_score) >= 0;'
+          then:
+            - script.stop: warmup_blink
+            - lambda: |-
+                int lvl = id(aqi_level_score);
+                float r, g, b;
+                switch (lvl) {
+                  case 0: r=0.0f;   g=0.894f; b=0.0f;   break;
+                  case 1: r=1.0f;   g=1.0f;   b=0.0f;   break;
+                  case 2: r=1.0f;   g=0.494f; b=0.0f;   break;
+                  case 3: r=1.0f;   g=0.0f;   b=0.0f;   break;
+                  case 4: r=0.561f; g=0.247f; b=0.592f; break;
+                  default: return;
+                }
+                id(aqi_r) = r;
+                id(aqi_g) = g;
+                id(aqi_b) = b;
+            - if:
+                condition:
+                  lambda: 'return id(aqi_level_score) >= 2;'
+                then:
+                  - script.execute: aqi_pulse_control
+                else:
+                  - script.stop: aqi_pulse_control
+                  - light.turn_on:
+                      id: aqi_led_strip
+                      red: !lambda 'return id(aqi_r);'
+                      green: !lambda 'return id(aqi_g);'
+                      blue: !lambda 'return id(aqi_b);'
+                      brightness: !lambda 'return id(aqi_brightness);'
+  - id: aqi_pulse_control
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return id(aqi_level_score) >= 2;'
+          then:
+            - light.turn_on:
+                id: aqi_led_strip
+                red: !lambda 'return id(aqi_r);'
+                green: !lambda 'return id(aqi_g);'
+                blue: !lambda 'return id(aqi_b);'
+                brightness: !lambda 'return id(aqi_brightness);'
+                transition_length: 800ms
+            - delay: 1000ms
+            - light.turn_off:
+                id: aqi_led_strip
+            - delay: !lambda |-
+                switch (id(aqi_level_score)) {
+                  case 2: return 900;
+                  case 3: return 800;
+                  case 4: return 700;
+                  default: return 1000;
+                }
+  - id: warmup_blink
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: 'return id(aqi_level_score) == -1;'
+          then:
+            - light.turn_on:
+                id: aqi_led_strip
+                red: 0.0
+                green: 0.4
+                blue: 1.0
+                brightness: !lambda 'return id(aqi_brightness);'
+            - delay: 1000ms
+            - light.turn_off:
+                id: aqi_led_strip
+            - delay: 1000ms

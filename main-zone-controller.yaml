@@ -1,0 +1,915 @@
+# =============================================================================
+# main-zone-controller.yaml
+#
+# DAMPER INDEX MAP
+#   0  Bathroom 2       1  Bathroom 3       2  Office 3
+#   3  Dining Room      4  Office 1      5  Family Room
+#   6  Bedroom 2    7  Office 2     8  Kitchen
+#   9  Laundry         10  Loft            11  Main Hallway
+#  12  Master Bathroom 13  Master Bedroom  14  Fresh Air
+#
+# VALVE POSITION SEMANTICS
+#   0.0 = fully closed   1.0 = fully open
+#   relay ON  → tick drives pos toward 0.0 (closing)
+#   relay OFF → tick drives pos toward 1.0 (opening)
+#
+# NOTE: The 15 valve blocks below are machine-generated from the rooms[]
+#   table in the Python generator comment at the bottom of this file.
+#   To add/rename a zone: edit ONLY the generator, then re-run it.
+#   Do NOT hand-edit the valve blocks directly.
+# =============================================================================
+
+esphome:
+  name: main-zone-controller
+  friendly_name: main-zone-controller
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 115200
+  level: ERROR
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+  # failsafe: HA gone 30 min -> all zone dampers open (no closed-duct static pressure while the
+  # air handler keeps running on its own thermostat) and the fresh-air damper closed
+  on_client_connected:
+    - script.stop: damper_failsafe
+  on_client_disconnected:
+    - script.execute: damper_failsafe
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 14.0dB
+  fast_connect: true
+  # reboot if WiFi stays down 15 min (a wedged stack otherwise never recovers)
+  reboot_timeout: 15min
+  power_save_mode: none        # was: light — avoid beacon-interval dropouts
+  ap:
+    ssid: "Main-Zone-Controller"
+    password: !secret ap_password
+
+captive_portal:
+
+# ─────────────────────────────────────────────────────────────
+# GLOBALS
+#
+# positions[0..14]        — current position  0.0=closed  1.0=open
+# target_positions[0..14] — desired position set by open/close/position_action
+# stopped[0..14]          — true = hold current position (stop_action)
+#                           cleared by any open/close/position_action
+# ─────────────────────────────────────────────────────────────
+globals:
+  - id: positions
+    type: float[15]
+    restore_value: no
+    initial_value: "{1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f}"
+
+  - id: target_positions
+    type: float[15]
+    restore_value: no
+    initial_value: "{1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f}"
+
+  - id: stopped
+    type: bool[15]
+    restore_value: no
+    initial_value: "{false,false,false,false,false,false,false,false,false,false,false,false,false,false,false}"
+
+# ─────────────────────────────────────────────────────────────
+# I2C / PCF8574
+# ─────────────────────────────────────────────────────────────
+i2c:
+  sda: 4
+  scl: 5
+  scan: true
+  id: bus_a
+
+pcf8574:
+  - id: pcf8574_hub_out_1
+    address: 0x24
+  - id: pcf8574_hub_out_2
+    address: 0x25
+  - id: pcf8574_hub_in_1
+    address: 0x22
+  - id: pcf8574_hub_in_2
+    address: 0x23
+
+one_wire:
+  - platform: gpio
+    pin: GPIO14
+
+# ─────────────────────────────────────────────────────────────
+# INTERVAL — 1 s tick drives all 15 dampers toward target_positions[]
+#
+# Per-channel logic:
+#   stopped[i]        → hold, do nothing
+#   relay ON  → closing  (pos → 0.0);  stop when pos ≤ target
+#   relay OFF → opening  (pos → 1.0);  stop when pos ≥ target
+#
+# Reaching the target auto-sets stopped[i]=true and goes IDLE,
+# exactly like an explicit stop_action.
+# ─────────────────────────────────────────────────────────────
+interval:
+  - interval: 1s
+    id: damper_tick
+    then:
+      - lambda: |-
+          using VS = esphome::valve::ValveOperation;
+
+          auto tick = [](
+              esphome::switch_::Switch *relay,
+              esphome::valve::Valve    *valve,
+              float                    &pos,
+              bool                     &halted,
+              float                    &target)
+          {
+            if (halted) return;
+
+            const float STEP = 1.0f / 30.0f;
+            bool closing = relay->state;   // relay ON = damper closing
+
+            if (closing) {
+              if (pos <= 0.0f) { halted = true; return; }
+              pos = max(0.0f, pos - STEP);
+              valve->current_operation = VS::VALVE_OPERATION_CLOSING;
+              valve->position = pos;
+              if (pos <= target) {
+                pos    = target;
+                halted = true;
+                valve->current_operation = VS::VALVE_OPERATION_IDLE;
+              }
+            } else {
+              if (pos >= 1.0f) { halted = true; return; }
+              pos = min(1.0f, pos + STEP);
+              valve->current_operation = VS::VALVE_OPERATION_OPENING;
+              valve->position = pos;
+              if (pos >= target) {
+                pos    = target;
+                halted = true;
+                valve->current_operation = VS::VALVE_OPERATION_IDLE;
+              }
+            }
+            valve->publish_state();
+          };
+
+          auto &p  = id(positions);
+          auto &tp = id(target_positions);
+          auto &s  = id(stopped);
+
+          tick(id(relay_1),  id(valve_1),  p[0],  s[0],  tp[0]);
+          tick(id(relay_2),  id(valve_2),  p[1],  s[1],  tp[1]);
+          tick(id(relay_3),  id(valve_3),  p[2],  s[2],  tp[2]);
+          tick(id(relay_4),  id(valve_4),  p[3],  s[3],  tp[3]);
+          tick(id(relay_5),  id(valve_5),  p[4],  s[4],  tp[4]);
+          tick(id(relay_6),  id(valve_6),  p[5],  s[5],  tp[5]);
+          tick(id(relay_7),  id(valve_7),  p[6],  s[6],  tp[6]);
+          tick(id(relay_8),  id(valve_8),  p[7],  s[7],  tp[7]);
+          tick(id(relay_9),  id(valve_9),  p[8],  s[8],  tp[8]);
+          tick(id(relay_10), id(valve_10), p[9],  s[9],  tp[9]);
+          tick(id(relay_11), id(valve_11), p[10], s[10], tp[10]);
+          tick(id(relay_12), id(valve_12), p[11], s[11], tp[11]);
+          tick(id(relay_13), id(valve_13), p[12], s[12], tp[12]);
+          tick(id(relay_14), id(valve_14), p[13], s[13], tp[13]);
+          tick(id(relay_15), id(valve_15), p[14], s[14], tp[14]);
+
+# ─────────────────────────────────────────────────────────────
+# SENSORS
+# ─────────────────────────────────────────────────────────────
+sensor:
+  - platform: dallas_temp
+    address: 0xe400000037d9f528
+    name: "Main Duct Temperature"
+    update_interval: 3s
+    filters:
+      - offset: -1.66
+      - delta: 0.5
+
+  - platform: wifi_signal
+    update_interval: 60s
+    id: wifi_signal_raw
+    filters:
+      - delta: 1
+
+  - platform: template
+    name: "WiFi Signal Quality"
+    id: wifi_quality
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:wifi"
+    update_interval: 60s
+    lambda: |-
+      if (isnan(id(wifi_signal_raw).state)) return {};
+      int quality = 2 * (100 + (int) id(wifi_signal_raw).state);
+      if (quality > 100) return 100;
+      else if (quality < 0) return 0;
+      else return quality;
+    filters:
+      - delta: 1
+    entity_category: "diagnostic"
+
+  - platform: internal_temperature
+    name: "ESP32 Internal Temperature (F)"
+    id: esp_temp
+    update_interval: 60s
+    filters:
+      - delta: 1
+      - lambda: return (x * 1.8) + 32;
+    unit_of_measurement: "°F"
+    entity_category: "diagnostic"
+
+  - platform: uptime
+    name: Uptime
+    id: sys_uptime
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+# ─────────────────────────────────────────────────────────────
+# TEXT SENSORS
+# ─────────────────────────────────────────────────────────────
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP32 IP Address"
+      icon: mdi:ip
+    ssid:
+      name: "SSID"
+      icon: mdi:ip-outline
+
+  - platform: template
+    name: "Unit Temperature Status"
+    id: esp_temp_status
+    icon: "mdi:thermometer"
+    lambda: |-
+      if (id(esp_temp).state >= 185)      return {"Overheating"};
+      else if (id(esp_temp).state >= 140) return {"Warm"};
+      else                                return {"Normal"};
+    entity_category: "diagnostic"
+    update_interval: 60s
+
+# ─────────────────────────────────────────────────────────────
+# SWITCHES  (inverted: switch ON in HA = relay energised = damper closing)
+# ─────────────────────────────────────────────────────────────
+switch:
+  - platform: gpio
+    id: relay_1
+    pin: { pcf8574: pcf8574_hub_out_1, number: 0, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_2
+    pin: { pcf8574: pcf8574_hub_out_1, number: 1, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_3
+    pin: { pcf8574: pcf8574_hub_out_1, number: 2, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_4
+    pin: { pcf8574: pcf8574_hub_out_1, number: 3, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_5
+    pin: { pcf8574: pcf8574_hub_out_1, number: 4, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_6
+    pin: { pcf8574: pcf8574_hub_out_1, number: 5, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_7
+    pin: { pcf8574: pcf8574_hub_out_1, number: 6, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_8
+    pin: { pcf8574: pcf8574_hub_out_1, number: 7, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_9
+    pin: { pcf8574: pcf8574_hub_out_2, number: 0, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_10
+    pin: { pcf8574: pcf8574_hub_out_2, number: 1, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_11
+    pin: { pcf8574: pcf8574_hub_out_2, number: 2, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_12
+    pin: { pcf8574: pcf8574_hub_out_2, number: 3, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_13
+    pin: { pcf8574: pcf8574_hub_out_2, number: 4, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_14
+    pin: { pcf8574: pcf8574_hub_out_2, number: 5, mode: OUTPUT, inverted: true }
+
+  - platform: gpio
+    id: relay_15
+    pin: { pcf8574: pcf8574_hub_out_2, number: 6, mode: OUTPUT, inverted: true }
+
+# ─────────────────────────────────────────────────────────────
+# BINARY SENSORS
+# ─────────────────────────────────────────────────────────────
+binary_sensor:
+  - platform: gpio
+    id: analog_sensor_1
+    internal: true
+    pin: { pcf8574: pcf8574_hub_in_1, number: 0, mode: INPUT, inverted: true }
+
+  - platform: gpio
+    id: analog_sensor_2
+    internal: true
+    pin: { pcf8574: pcf8574_hub_in_1, number: 1, mode: INPUT, inverted: true }
+
+  - platform: gpio
+    id: analog_sensor_3
+    internal: true
+    pin: { pcf8574: pcf8574_hub_in_1, number: 2, mode: INPUT, inverted: true }
+
+  - platform: gpio
+    id: analog_sensor_4
+    internal: true
+    pin: { pcf8574: pcf8574_hub_in_1, number: 3, mode: INPUT, inverted: true }
+
+  - platform: gpio
+    id: analog_sensor_5
+    internal: true
+    pin: { pcf8574: pcf8574_hub_in_1, number: 4, mode: INPUT, inverted: true }
+
+  - platform: gpio
+    id: analog_sensor_6
+    internal: true
+    pin: { pcf8574: pcf8574_hub_in_1, number: 5, mode: INPUT, inverted: true }
+
+  - platform: template
+    name: "ZB1 Office 1 Damper"
+    device_class: opening
+    lambda: return !id(analog_sensor_1).state;
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "ZB2 Bedroom 2 Damper"
+    device_class: opening
+    lambda: return !id(analog_sensor_2).state;
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "ZB3 Office 2 Damper"
+    device_class: opening
+    lambda: return !id(analog_sensor_3).state;
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "ZB4 Master Bedroom Damper"
+    device_class: opening
+    lambda: return !id(analog_sensor_4).state;
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "ZB5 Fresh Air Damper"
+    device_class: opening
+    lambda: return !id(analog_sensor_5).state;
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "ZB6 Office 3"
+    device_class: opening
+    lambda: return !id(analog_sensor_6).state;
+    icon: "mdi:toggle-switch"
+
+# ─────────────────────────────────────────────────────────────
+# VALVES  (machine-generated — edit the generator below, not these blocks)
+#
+# open_action     → target=1.0, relay OFF  → tick drives pos → 1.0
+# close_action    → target=0.0, relay ON   → tick drives pos → 0.0
+# position_action → target=pos, relay set by direction; tick stops at target
+# stop_action     → stopped[i]=true, target snapped to current pos
+#
+# The tick auto-sets stopped[i]=true when pos reaches target,
+# so no external stop call is needed after open/close/position.
+# ─────────────────────────────────────────────────────────────
+script:
+  - id: damper_failsafe
+    mode: restart
+    then:
+      - delay: 30min
+      - if:
+          condition:
+            not:
+              api.connected:
+          then:
+            - logger.log:
+                format: "Failsafe: no Home Assistant for 30 min - opening zone dampers, closing fresh air"
+                level: ERROR
+            - valve.open: valve_1
+            - valve.open: valve_2
+            - valve.open: valve_3
+            - valve.open: valve_4
+            - valve.open: valve_5
+            - valve.open: valve_6
+            - valve.open: valve_7
+            - valve.open: valve_8
+            - valve.open: valve_9
+            - valve.open: valve_10
+            - valve.open: valve_11
+            - valve.open: valve_12
+            - valve.open: valve_13
+            - valve.open: valve_14
+            - valve.close: valve_15
+
+valve:
+  # ──  1  Bathroom 2
+  - platform: template
+    id: valve_1
+    name: "Bathroom 2 Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[0] = false;
+          id(target_positions)[0] = 1.0f;
+      - switch.turn_off: relay_1
+    close_action:
+      - lambda: |-
+          id(stopped)[0] = false;
+          id(target_positions)[0] = 0.0f;
+      - switch.turn_on: relay_1
+    position_action:
+      - lambda: |-
+          id(stopped)[0] = false;
+          id(target_positions)[0] = pos;
+          if (pos >= id(positions)[0])
+            id(relay_1).turn_off();
+          else
+            id(relay_1).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[0] = true;
+          id(target_positions)[0] = id(positions)[0];
+          id(valve_1).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_1).publish_state();
+    lambda: return id(positions)[0];
+
+  # ──  2  Bathroom 3
+  - platform: template
+    id: valve_2
+    name: "Bathroom 3 Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[1] = false;
+          id(target_positions)[1] = 1.0f;
+      - switch.turn_off: relay_2
+    close_action:
+      - lambda: |-
+          id(stopped)[1] = false;
+          id(target_positions)[1] = 0.0f;
+      - switch.turn_on: relay_2
+    position_action:
+      - lambda: |-
+          id(stopped)[1] = false;
+          id(target_positions)[1] = pos;
+          if (pos >= id(positions)[1])
+            id(relay_2).turn_off();
+          else
+            id(relay_2).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[1] = true;
+          id(target_positions)[1] = id(positions)[1];
+          id(valve_2).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_2).publish_state();
+    lambda: return id(positions)[1];
+
+  # ──  3  Office 3
+  - platform: template
+    id: valve_3
+    name: "Office 3 Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[2] = false;
+          id(target_positions)[2] = 1.0f;
+      - switch.turn_off: relay_3
+    close_action:
+      - lambda: |-
+          id(stopped)[2] = false;
+          id(target_positions)[2] = 0.0f;
+      - switch.turn_on: relay_3
+    position_action:
+      - lambda: |-
+          id(stopped)[2] = false;
+          id(target_positions)[2] = pos;
+          if (pos >= id(positions)[2])
+            id(relay_3).turn_off();
+          else
+            id(relay_3).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[2] = true;
+          id(target_positions)[2] = id(positions)[2];
+          id(valve_3).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_3).publish_state();
+    lambda: return id(positions)[2];
+
+  # ──  4  Dining Room
+  - platform: template
+    id: valve_4
+    name: "Dining Room Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[3] = false;
+          id(target_positions)[3] = 1.0f;
+      - switch.turn_off: relay_4
+    close_action:
+      - lambda: |-
+          id(stopped)[3] = false;
+          id(target_positions)[3] = 0.0f;
+      - switch.turn_on: relay_4
+    position_action:
+      - lambda: |-
+          id(stopped)[3] = false;
+          id(target_positions)[3] = pos;
+          if (pos >= id(positions)[3])
+            id(relay_4).turn_off();
+          else
+            id(relay_4).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[3] = true;
+          id(target_positions)[3] = id(positions)[3];
+          id(valve_4).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_4).publish_state();
+    lambda: return id(positions)[3];
+
+  # ──  5  Office 1
+  - platform: template
+    id: valve_5
+    name: "Office 1 Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[4] = false;
+          id(target_positions)[4] = 1.0f;
+      - switch.turn_off: relay_5
+    close_action:
+      - lambda: |-
+          id(stopped)[4] = false;
+          id(target_positions)[4] = 0.0f;
+      - switch.turn_on: relay_5
+    position_action:
+      - lambda: |-
+          id(stopped)[4] = false;
+          id(target_positions)[4] = pos;
+          if (pos >= id(positions)[4])
+            id(relay_5).turn_off();
+          else
+            id(relay_5).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[4] = true;
+          id(target_positions)[4] = id(positions)[4];
+          id(valve_5).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_5).publish_state();
+    lambda: return id(positions)[4];
+
+  # ──  6  Family Room
+  - platform: template
+    id: valve_6
+    name: "Family Room Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[5] = false;
+          id(target_positions)[5] = 1.0f;
+      - switch.turn_off: relay_6
+    close_action:
+      - lambda: |-
+          id(stopped)[5] = false;
+          id(target_positions)[5] = 0.0f;
+      - switch.turn_on: relay_6
+    position_action:
+      - lambda: |-
+          id(stopped)[5] = false;
+          id(target_positions)[5] = pos;
+          if (pos >= id(positions)[5])
+            id(relay_6).turn_off();
+          else
+            id(relay_6).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[5] = true;
+          id(target_positions)[5] = id(positions)[5];
+          id(valve_6).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_6).publish_state();
+    lambda: return id(positions)[5];
+
+  # ──  7  Bedroom 2
+  - platform: template
+    id: valve_7
+    name: "Bedroom 2 Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[6] = false;
+          id(target_positions)[6] = 1.0f;
+      - switch.turn_off: relay_7
+    close_action:
+      - lambda: |-
+          id(stopped)[6] = false;
+          id(target_positions)[6] = 0.0f;
+      - switch.turn_on: relay_7
+    position_action:
+      - lambda: |-
+          id(stopped)[6] = false;
+          id(target_positions)[6] = pos;
+          if (pos >= id(positions)[6])
+            id(relay_7).turn_off();
+          else
+            id(relay_7).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[6] = true;
+          id(target_positions)[6] = id(positions)[6];
+          id(valve_7).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_7).publish_state();
+    lambda: return id(positions)[6];
+
+  # ──  8  Office 2
+  - platform: template
+    id: valve_8
+    name: "Office 2 Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[7] = false;
+          id(target_positions)[7] = 1.0f;
+      - switch.turn_off: relay_8
+    close_action:
+      - lambda: |-
+          id(stopped)[7] = false;
+          id(target_positions)[7] = 0.0f;
+      - switch.turn_on: relay_8
+    position_action:
+      - lambda: |-
+          id(stopped)[7] = false;
+          id(target_positions)[7] = pos;
+          if (pos >= id(positions)[7])
+            id(relay_8).turn_off();
+          else
+            id(relay_8).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[7] = true;
+          id(target_positions)[7] = id(positions)[7];
+          id(valve_8).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_8).publish_state();
+    lambda: return id(positions)[7];
+
+  # ──  9  Kitchen
+  - platform: template
+    id: valve_9
+    name: "Kitchen Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[8] = false;
+          id(target_positions)[8] = 1.0f;
+      - switch.turn_off: relay_9
+    close_action:
+      - lambda: |-
+          id(stopped)[8] = false;
+          id(target_positions)[8] = 0.0f;
+      - switch.turn_on: relay_9
+    position_action:
+      - lambda: |-
+          id(stopped)[8] = false;
+          id(target_positions)[8] = pos;
+          if (pos >= id(positions)[8])
+            id(relay_9).turn_off();
+          else
+            id(relay_9).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[8] = true;
+          id(target_positions)[8] = id(positions)[8];
+          id(valve_9).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_9).publish_state();
+    lambda: return id(positions)[8];
+
+  # ── 10  Laundry
+  - platform: template
+    id: valve_10
+    name: "Laundry Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[9] = false;
+          id(target_positions)[9] = 1.0f;
+      - switch.turn_off: relay_10
+    close_action:
+      - lambda: |-
+          id(stopped)[9] = false;
+          id(target_positions)[9] = 0.0f;
+      - switch.turn_on: relay_10
+    position_action:
+      - lambda: |-
+          id(stopped)[9] = false;
+          id(target_positions)[9] = pos;
+          if (pos >= id(positions)[9])
+            id(relay_10).turn_off();
+          else
+            id(relay_10).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[9] = true;
+          id(target_positions)[9] = id(positions)[9];
+          id(valve_10).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_10).publish_state();
+    lambda: return id(positions)[9];
+
+  # ── 11  Loft
+  - platform: template
+    id: valve_11
+    name: "Loft Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[10] = false;
+          id(target_positions)[10] = 1.0f;
+      - switch.turn_off: relay_11
+    close_action:
+      - lambda: |-
+          id(stopped)[10] = false;
+          id(target_positions)[10] = 0.0f;
+      - switch.turn_on: relay_11
+    position_action:
+      - lambda: |-
+          id(stopped)[10] = false;
+          id(target_positions)[10] = pos;
+          if (pos >= id(positions)[10])
+            id(relay_11).turn_off();
+          else
+            id(relay_11).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[10] = true;
+          id(target_positions)[10] = id(positions)[10];
+          id(valve_11).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_11).publish_state();
+    lambda: return id(positions)[10];
+
+  # ── 12  Main Hallway
+  - platform: template
+    id: valve_12
+    name: "Main Hallway Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[11] = false;
+          id(target_positions)[11] = 1.0f;
+      - switch.turn_off: relay_12
+    close_action:
+      - lambda: |-
+          id(stopped)[11] = false;
+          id(target_positions)[11] = 0.0f;
+      - switch.turn_on: relay_12
+    position_action:
+      - lambda: |-
+          id(stopped)[11] = false;
+          id(target_positions)[11] = pos;
+          if (pos >= id(positions)[11])
+            id(relay_12).turn_off();
+          else
+            id(relay_12).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[11] = true;
+          id(target_positions)[11] = id(positions)[11];
+          id(valve_12).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_12).publish_state();
+    lambda: return id(positions)[11];
+
+  # ── 13  Master Bathroom
+  - platform: template
+    id: valve_13
+    name: "Master Bathroom Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[12] = false;
+          id(target_positions)[12] = 1.0f;
+      - switch.turn_off: relay_13
+    close_action:
+      - lambda: |-
+          id(stopped)[12] = false;
+          id(target_positions)[12] = 0.0f;
+      - switch.turn_on: relay_13
+    position_action:
+      - lambda: |-
+          id(stopped)[12] = false;
+          id(target_positions)[12] = pos;
+          if (pos >= id(positions)[12])
+            id(relay_13).turn_off();
+          else
+            id(relay_13).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[12] = true;
+          id(target_positions)[12] = id(positions)[12];
+          id(valve_13).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_13).publish_state();
+    lambda: return id(positions)[12];
+
+  # ── 14  Master Bedroom
+  - platform: template
+    id: valve_14
+    name: "Master Bedroom Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[13] = false;
+          id(target_positions)[13] = 1.0f;
+      - switch.turn_off: relay_14
+    close_action:
+      - lambda: |-
+          id(stopped)[13] = false;
+          id(target_positions)[13] = 0.0f;
+      - switch.turn_on: relay_14
+    position_action:
+      - lambda: |-
+          id(stopped)[13] = false;
+          id(target_positions)[13] = pos;
+          if (pos >= id(positions)[13])
+            id(relay_14).turn_off();
+          else
+            id(relay_14).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[13] = true;
+          id(target_positions)[13] = id(positions)[13];
+          id(valve_14).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_14).publish_state();
+    lambda: return id(positions)[13];
+
+  # ── 15  Fresh Air
+  - platform: template
+    id: valve_15
+    name: "Fresh Air Damper"
+    device_class: gas
+    open_action:
+      - lambda: |-
+          id(stopped)[14] = false;
+          id(target_positions)[14] = 1.0f;
+      - switch.turn_off: relay_15
+    close_action:
+      - lambda: |-
+          id(stopped)[14] = false;
+          id(target_positions)[14] = 0.0f;
+      - switch.turn_on: relay_15
+    position_action:
+      - lambda: |-
+          id(stopped)[14] = false;
+          id(target_positions)[14] = pos;
+          if (pos >= id(positions)[14])
+            id(relay_15).turn_off();
+          else
+            id(relay_15).turn_on();
+    stop_action:
+      - lambda: |-
+          id(stopped)[14] = true;
+          id(target_positions)[14] = id(positions)[14];
+          id(valve_15).current_operation = esphome::valve::VALVE_OPERATION_IDLE;
+          id(valve_15).publish_state();
+    lambda: return id(positions)[14];
+
+# =============================================================================
+# GENERATOR — to regenerate the valve: section, run:
+#
+#   python3 -c "
+#   rooms = [
+#     (1,'Bathroom 2',0),(2,'Bathroom 3',1),(3,'Office 3',2),
+#     (4,'Dining Room',3),(5,'Office 1',4),(6,'Family Room',5),
+#     (7,'Bedroom 2',6),(8,'Office 2',7),(9,'Kitchen',8),
+#     (10,'Laundry',9),(11,'Loft',10),(12,'Main Hallway',11),
+#     (13,'Master Bathroom',12),(14,'Master Bedroom',13),(15,'Fresh Air',14),
+#   ]
+#   # ... (same gen_valve function as in this file)
+#   "
+#
+# Adding a new zone: increment array sizes to [16], add row to rooms[],
+# add relay_16 switch on pcf8574_hub_out_2 number:7, re-run generator.
+# =============================================================================

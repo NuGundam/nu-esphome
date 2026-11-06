@@ -1,0 +1,1002 @@
+# =======================================================
+# AIRGRADIENT-ONE-COMMON v0.5 - shared package for AirGradient ONE (I-9PSL) units
+# ESP32-C3-MINI + SenseAir S8 (CO2) + PMS5003 (PM) + SHT40 (T/RH) + SGP41 (VOC/NOx)
+# + 1.3" SH1106 OLED + 11x WS2812 bar + button on GPIO9 + external watchdog on GPIO2.
+#
+# NU-AQI-3 behaviour on AirGradient hardware (no web dashboard). Pins and the EPA
+# PM2.5 formula come from github.com/MallocArray/airgradient_esphome (config 5.3.6),
+# copied here so a build never pulls remote code.
+#
+# Each device's yaml sets substitutions and includes this file:
+#   substitutions:
+#     device_name: airgradient-loft
+#     friendly_name: AirGradient Loft
+#     api_key / ap_ssid / ap_password
+#     voc_learning_offset: '12'     (Kitchen ran 60 on the stock firmware)
+#     nox_learning_offset: '12'
+#   packages:
+#     ag_common: !include common/airgradient-one-common.yaml
+#
+# Keep these entity names: HA reads sensor.airgradient_loft_<name> in sensor_templates,
+# statistics, trend_short, automations, humidifier.jinja and the HVAC card. With the old
+# AirGradient device removed first, friendly_name + these names land on the same ids:
+#   Carbon dioxide, Humidity, NOx index, PM0.3, PM1, PM2.5, PM10, Temperature, VOC index
+#
+# Matched to the stock firmware (read from /config on 2026-11-05):
+#   * PM2.5 uses the EPA 2021 correction (stock: correctionAlgorithm epa_2021), from
+#     raw PM2.5 and humidity. PM1 / PM10 / PM0.3 are uncorrected.
+#   * Temperature / humidity had no correction, so the offset defaults to 0 here
+#     (NU-AQI-3's 1.5 C would shift the readings HVAC logic uses). Calibrate later.
+#   * About one reading a minute, like the HA integration's polling, so the recorder
+#     load stays the same.
+#   * CO2 ABC is left alone: the S8 keeps its own 8-day setting.
+#
+# Combined level = NU-AQI-3 scoring: worst of VOC, CO2, NOx and NowCast PM AQI.
+# LED bar (v0.2) works like the stock bar: one LED at the far left, more as the air gets
+# worse, all lit LEDs one colour. Each level gets two LEDs: 1-2 green Excellent, 3-4 yellow
+# Good, 5-6 orange Moderate, 7-8 red Sensitive, 9-10 purple Unhealthy, 11 maroon at the very
+# top. The count comes from how far the worst reading is through its level, with a small
+# hysteresis on the way down. Index 0 is the far left on the Loft unit (checked by eye:
+# 10 - i started on the right); "LED bar reversed" flips it. One blue LED sweeps left to
+# right while warming up. Night mode halves the bar and OLED. "Test AQI LED bar" walks 1
+# to 11, then puts the bar back. Colours go through gamma 2.8, so stock's orange green of
+# 128 lands near 15 % and reads red: 200 is about half, the orange stock actually shows.
+# v0.4: the light is internal (no HA entity, user did not want the toggle on the device
+# page); "LED bar brightness" 0 switches the bar off. The AQI text sensors report the
+# category only ("Excellent"), so their HA history is a few clean bands instead of a new
+# band per index change; the numbers are the plain sensors next to them.
+# v0.5: boot_done gate. The restored brightness numbers fire on_value during their own
+# setup (priority 800), before the light (799) and display (400) exist as working parts;
+# v0.4 started the LED effect from there and crashed on every boot (null LightState in
+# AddressableLightEffect::start_internal, both units rolled back to v0.3). The brightness
+# scripts now do nothing until on_boot -100 sets boot_done and applies both itself.
+#
+# GPIO2 feeds the external watchdog: remove that interval and the board resets itself.
+# =======================================================
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - nuaqi_helpers.h       # WiFi TX power read / set
+  on_boot:
+    - priority: -100
+      then:
+        - globals.set:
+            id: boot_done
+            value: 'true'
+        - script.execute: apply_display_brightness
+        - script.execute: apply_led_brightness
+
+esp32:
+  board: esp32-c3-devkitm-1
+  flash_size: 4MB
+  cpu_frequency: 80MHz      # same heat cut as NU-AQI-3
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG   # both UARTs are taken by the S8 and the PMS5003
+  level: INFO
+
+debug:
+  update_interval: 60s
+
+api:
+  encryption:
+    key: ${api_key}
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:        # reuses the API key, like the NU-Presence units
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Boot value only: the adaptive loop moves it between 8.5 and 20 dBm
+  output_power: 8.5dB
+  fast_connect: true
+  reboot_timeout: 15min
+  power_save_mode: NONE
+  ap:
+    ssid: ${ap_ssid}
+    password: ${ap_password}
+
+captive_portal:
+
+uart:
+  - id: senseair_co2_uart
+    rx_pin: GPIO0
+    tx_pin: GPIO1
+    baud_rate: 9600
+  - id: pms5003_uart
+    rx_pin: GPIO20
+    tx_pin: GPIO21
+    baud_rate: 9600
+
+i2c:
+  sda: GPIO7
+  scl: GPIO6
+  frequency: 400kHz
+
+globals:
+  - id: sensor_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: aqi_level_score
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: aqi_worst            # 0 VOC, 1 CO2, 2 NOx, 3 PM: what set the level
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: boot_done            # v0.5: set at on_boot -100; brightness scripts wait for it
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: led_lit              # LEDs lit, 1 to 11
+    type: int
+    restore_value: no
+    initial_value: '1'
+  - id: led_test_step        # above 0 = the test is showing this many LEDs
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: aqi_brightness       # 1.0 day, 0.5 night when Auto Night Mode is on
+    type: float
+    restore_value: no
+    initial_value: '1.0'
+  - id: temp_offset_current
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: nowcast_pm25
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: nowcast_pm10
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: wifi_power_setpoint
+    type: float
+    restore_value: yes
+    initial_value: '8.5'
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - lambda: |-
+          if (id(auto_night_mode).state) {
+            id(aqi_brightness) = id(sun_component).is_above_horizon() ? 1.0f : 0.5f;
+            id(apply_led_brightness).execute();
+            id(apply_display_brightness).execute();
+          }
+
+sun:
+  id: sun_component
+  latitude: !secret home_latitude
+  longitude: !secret home_longitude
+  on_sunrise:
+    - elevation: 0°
+      then:
+        - if:
+            condition:
+              switch.is_on: auto_night_mode
+            then:
+              - globals.set:
+                  id: aqi_brightness
+                  value: '1.0'
+              - script.execute: apply_led_brightness
+              - script.execute: apply_display_brightness
+  on_sunset:
+    - elevation: 0°
+      then:
+        - if:
+            condition:
+              switch.is_on: auto_night_mode
+            then:
+              - globals.set:
+                  id: aqi_brightness
+                  value: '0.5'
+              - script.execute: apply_led_brightness
+              - script.execute: apply_display_brightness
+
+switch:
+  - platform: template
+    name: "AQI Auto Night Mode"
+    id: auto_night_mode
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          id(aqi_brightness) = id(sun_component).is_above_horizon() ? 1.0f : 0.5f;
+      - script.execute: apply_led_brightness
+      - script.execute: apply_display_brightness
+    turn_off_action:
+      - globals.set:
+          id: aqi_brightness
+          value: '1.0'
+      - script.execute: apply_led_brightness
+      - script.execute: apply_display_brightness
+  - platform: template
+    name: "LED bar reversed"
+    id: led_bar_reversed
+    icon: "mdi:swap-horizontal"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    name: "Adaptive WiFi TX Power"
+    id: adaptive_wifi_power
+    icon: "mdi:wifi-cog"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+number:
+  # Fixed part of the offset (C). 0 = reads like the stock firmware until calibrated.
+  - platform: template
+    name: "Temp Offset Base"
+    id: temp_offset_base
+    icon: "mdi:thermometer-minus"
+    entity_category: "config"
+    unit_of_measurement: "°C"
+    min_value: -10.0
+    max_value: 10.0
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+  # Fraction of (ESP internal C - raw sensor C) subtracted. 0 = off.
+  - platform: template
+    name: "Temp Offset Heat Coefficient"
+    id: temp_offset_coeff
+    icon: "mdi:chip"
+    entity_category: "config"
+    unit_of_measurement: ""
+    min_value: 0.0
+    max_value: 0.5
+    step: 0.01
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+  - platform: template
+    name: "LED bar brightness"
+    id: led_bar_pct
+    icon: "mdi:led-strip-variant"
+    entity_category: "config"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: apply_led_brightness
+  - platform: template
+    name: "Display brightness"
+    id: display_pct
+    icon: "mdi:brightness-6"
+    entity_category: "config"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: apply_display_brightness
+
+output:
+  - platform: gpio
+    id: external_watchdog
+    pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+
+light:
+  - platform: esp32_rmt_led_strip
+    name: "AQI LED"
+    id: led_bar
+    internal: true            # v0.4: no HA entity; LED bar brightness 0 = off
+    channel_colors: GRB
+    pin: GPIO10
+    num_leds: 11
+    chipset: ws2812
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0s
+    on_turn_on:
+      - light.control:
+          id: led_bar
+          effect: "AQI bar"
+    effects:
+      - addressable_lambda:
+          name: "AQI bar"
+          update_interval: 100ms
+          lambda: |-
+            static const Color chart[11] = {
+              Color(0, 255, 0),   Color(0, 255, 0),      // Excellent - green
+              Color(255, 255, 0), Color(255, 255, 0),    // Good - yellow
+              Color(255, 200, 0), Color(255, 200, 0),    // Moderate - orange
+              Color(255, 0, 0),   Color(255, 0, 0),      // Sensitive - red
+              Color(180, 0, 255), Color(180, 0, 255),    // Unhealthy - purple
+              Color(126, 0, 35)                          // top of the scale - maroon
+            };
+            int test = id(led_test_step);
+            bool rev = id(led_bar_reversed).state;
+            if (test == 0 && id(aqi_level_score) < 0) {   // warming up: blue sweep, left to right
+              int pos = (millis() / 200) % 11;
+              for (int i = 0; i < 11; i++)
+                it[rev ? 10 - i : i] = i == pos ? Color(0, 102, 255) : Color(0, 0, 0);
+              return;
+            }
+            int lit = test > 0 ? test : id(led_lit);
+            if (lit < 1) lit = 1;
+            if (lit > 11) lit = 11;
+            Color c = chart[lit - 1];
+            for (int i = 0; i < 11; i++)
+              it[rev ? 10 - i : i] = i < lit ? c : Color(0, 0, 0);
+
+binary_sensor:
+  - platform: template
+    name: "Sensor Ready"
+    id: sensor_ready_bs
+    lambda: |-
+      return id(sensor_ready);
+  # Short press = next OLED page. No calibration on the button: that is an HA press.
+  - platform: gpio
+    id: config_button
+    internal: true
+    pin:
+      number: GPIO9
+      mode: INPUT_PULLUP
+      inverted: true
+      ignore_strapping_warning: true
+    on_press:
+      - display.page.show_next: oled_display
+      - component.update: oled_display
+
+sensor:
+  - platform: senseair
+    id: senseair_co2
+    uart_id: senseair_co2_uart
+    update_interval: 60s
+    co2:
+      name: "Carbon dioxide"
+      id: co2
+      filters:
+        - skip_initial: 1     # can return 0 on the first read after boot
+      on_value:
+        then:
+          - lambda: |-
+              if (!isnan(x) && x > 0) id(sensor_ready) = true;
+
+  - platform: pmsx003
+    type: PMSX003
+    uart_id: pms5003_uart
+    update_interval: 30s      # keeps the fan spinning; filters below publish once a minute
+    pm_1_0:
+      name: "PM1"
+      id: pm_1_0
+      unit_of_measurement: "μg/m³"
+      filters:
+        - throttle_average: 60s
+    pm_2_5:
+      id: pm_2_5_raw
+      internal: true
+    pm_10_0:
+      name: "PM10"
+      id: pm_10_0
+      unit_of_measurement: "μg/m³"
+      filters:
+        - throttle_average: 60s
+    pm_0_3um:
+      name: "PM0.3"
+      id: pm_0_3um
+      icon: "mdi:blur"
+      unit_of_measurement: "particles/dL"
+      filters:
+        - throttle_average: 60s
+
+  # EPA 2021 correction, as the stock firmware applies it to PM2.5
+  - platform: template
+    name: "PM2.5"
+    id: pm_2_5
+    device_class: pm25
+    state_class: measurement
+    unit_of_measurement: "μg/m³"
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      float pm = id(pm_2_5_raw).state, rh = id(humidity).get_raw_state();
+      if (isnan(pm)) return NAN;
+      if (pm <= 0.0f) return 0.0f;
+      if (isnan(rh)) return pm;
+      float r;
+      if (pm < 30.0f) {
+        r = 0.524f * pm - 0.0862f * rh + 5.75f;
+      } else if (pm < 50.0f) {
+        float k = pm / 20.0f - 1.5f;
+        r = (0.786f * k + 0.524f * (1.0f - k)) * pm - 0.0862f * rh + 5.75f;
+      } else if (pm < 210.0f) {
+        r = 0.786f * pm - 0.0862f * rh + 5.75f;
+      } else if (pm < 260.0f) {
+        float k = pm / 50.0f - 4.2f;
+        r = (0.69f * k + 0.786f * (1.0f - k)) * pm - 0.0862f * rh * (1.0f - k)
+            + 2.966f * k + 5.75f * (1.0f - k) + 8.84e-4f * pm * pm * k;
+      } else {
+        r = 2.966f + 0.69f * pm + 8.84e-4f * pm * pm;
+      }
+      return r <= 0.0f ? 0.0f : r;
+
+  - platform: sht4x
+    address: 0x44
+    update_interval: 60s
+    temperature:
+      name: "Temperature"
+      id: temp
+      filters:
+        # get_raw_state() elsewhere reads the uncompensated value, so no feedback loop
+        - lambda: return x - id(temp_offset_current);
+    humidity:
+      name: "Humidity"
+      id: humidity
+      filters:
+        # RH re-scaled (Magnus) to the compensated temperature; x when the offset is 0
+        - lambda: |-
+            float off = id(temp_offset_current);
+            float t_meas = id(temp).get_raw_state();
+            if (isnan(t_meas) || off == 0.0f) return x;
+            float t_true = t_meas - off;
+            auto ps = [](float t) { return expf(17.62f * t / (243.12f + t)); };
+            float rh = x * ps(t_meas) / ps(t_true);
+            return rh > 100.0f ? 100.0f : (rh < 0.0f ? 0.0f : rh);
+
+  - platform: sgp4x
+    update_interval: 60s
+    voc_index:
+      name: "VOC index"
+      id: voc
+      algorithm_tuning:
+        learning_time_offset_hours: ${voc_learning_offset}
+    nox_index:
+      name: "NOx index"
+      id: nox
+      algorithm_tuning:
+        learning_time_offset_hours: ${nox_learning_offset}
+    compensation:
+      temperature_source: temp
+      humidity_source: humidity
+
+  - platform: absolute_humidity
+    name: "Absolute Humidity"
+    id: abs_humidity
+    temperature: temp
+    humidity: humidity
+    icon: "mdi:water-opacity"
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "AQI Feels Like Temp"
+    id: aqi_feels_like_temperature
+    icon: "mdi:thermometer-lines"
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      if (!id(sensor_ready)) return NAN;
+      float Tc = id(temp).state;
+      float RH = id(humidity).state;
+      if (isnan(Tc) || isnan(RH)) return NAN;
+      float T = (Tc * 9.0f / 5.0f) + 32.0f;
+      return T + (0.1f * (RH - 50.0f));
+
+  # EPA NowCast AQI, same maths as NU-AQI-3: PM2.5 + PM10, May-2024 breakpoints, max of both
+  - platform: template
+    name: "Average PM AQI"
+    id: avg_pm_aqi
+    icon: "mdi:chart-bar"
+    unit_of_measurement: "AQI"
+    accuracy_decimals: 0
+    update_interval: 60s
+    filters:
+      - delta: 1
+    lambda: |-
+      if (!id(sensor_ready)) return NAN;
+      float c25 = id(nowcast_pm25);
+      float c10 = id(nowcast_pm10);
+      if (isnan(c25)) c25 = id(pm_2_5).state;
+      if (isnan(c10)) c10 = id(pm_10_0).get_raw_state();
+      if (isnan(c25) || isnan(c10)) return NAN;
+      c25 = floorf(c25 * 10.0f) / 10.0f;
+      c10 = floorf(c10);
+      static const struct { float lo, hi; int alo, ahi; } bp25[] = {
+        {0.0f,     9.0f,   0,  50},
+        {9.1f,    35.4f,  51, 100},
+        {35.5f,   55.4f, 101, 150},
+        {55.5f,  125.4f, 151, 200},
+        {125.5f, 225.4f, 201, 300},
+        {225.5f, 325.4f, 301, 500}
+      };
+      static const struct { float lo, hi; int alo, ahi; } bp10[] = {
+        {0.0f,    54.0f,   0,  50},
+        {55.0f,  154.0f,  51, 100},
+        {155.0f, 254.0f, 101, 150},
+        {255.0f, 354.0f, 151, 200},
+        {355.0f, 424.0f, 201, 300},
+        {425.0f, 604.0f, 301, 500}
+      };
+      auto calc = [](float c, const auto* t, int nb) -> int {
+        if (c <= 0.0f) return 0;
+        for (int i = 0; i < nb; i++)
+          if (c >= t[i].lo && c <= t[i].hi)
+            return (int)roundf((t[i].ahi - t[i].alo) * (c - t[i].lo)
+                               / (t[i].hi - t[i].lo)) + t[i].alo;
+        return 500;
+      };
+      return (float)std::max(calc(c25, bp25, 6), calc(c10, bp10, 6));
+
+  - platform: wifi_signal
+    update_interval: 60s
+    id: wifi_signal_raw
+    internal: true
+  - platform: template
+    name: "WiFi Signal Quality"
+    id: wifi_quality
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:wifi"
+    update_interval: 60s
+    entity_category: "diagnostic"
+    filters:
+      - delta: 1
+    lambda: |-
+      if (isnan(id(wifi_signal_raw).state)) return {};
+      int q = 2 * (100 + (int)id(wifi_signal_raw).state);
+      return (float)std::clamp(q, 0, 100);
+
+  - platform: internal_temperature
+    id: esp_temp_c
+    internal: true
+    update_interval: 30s
+  - platform: copy
+    source_id: esp_temp_c
+    name: "ESP32 Internal Temperature (F)"
+    id: esp_temp
+    icon: "mdi:chip"
+    entity_category: "diagnostic"
+    unit_of_measurement: "°F"
+    filters:
+      - lambda: return (x * 1.8f) + 32.0f;
+      - delta: 1
+  - platform: template
+    name: "AQI LED Count"
+    id: aqi_led_count
+    icon: "mdi:led-strip-variant"
+    accuracy_decimals: 0
+    entity_category: "diagnostic"
+    update_interval: 30s
+    filters:
+      - delta: 0.5      # delta passes only changes larger than this: 1 would swallow every single step
+    lambda: |-
+      return id(aqi_level_score) < 0 ? 0.0f : (float) id(led_lit);
+  - platform: template
+    name: "Temp Offset Applied"
+    id: temp_offset_applied
+    icon: "mdi:thermometer-minus"
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    entity_category: "diagnostic"
+    update_interval: 60s
+    filters:
+      - delta: 0.1
+    lambda: |-
+      return id(temp_offset_current) * 1.8f;
+  - platform: debug
+    cpu_frequency:
+      name: "ESP32 CPU Frequency"
+      id: esp_cpu_freq
+      icon: "mdi:chip"
+      entity_category: "diagnostic"
+      unit_of_measurement: "MHz"
+      accuracy_decimals: 0
+      filters:
+        - multiply: 0.000001
+        - delta: 1
+  - platform: template
+    name: "WiFi TX Power"
+    id: wifi_tx_power
+    icon: "mdi:wifi-arrow-up"
+    entity_category: "diagnostic"
+    unit_of_measurement: "dBm"
+    accuracy_decimals: 2
+    update_interval: 60s
+    filters:
+      - delta: 0.1
+    lambda: |-
+      return nuaqi_wifi_tx_power_dbm();
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP32 IP Address"
+      icon: "mdi:ip-network"
+    ssid:
+      name: "SSID"
+      icon: "mdi:router-wireless"
+  - platform: template
+    name: "Unit Temperature Status"
+    id: esp_temp_status
+    icon: "mdi:chip"
+    entity_category: "diagnostic"
+    update_interval: 60s
+    lambda: |-
+      float t = id(esp_temp).state;
+      if (t >= 185) return {"Overheating"};
+      if (t >= 125) return {"Warm"};
+      return {"Normal"};
+  - platform: template
+    name: "AQI AH"
+    id: aqi_ah
+    icon: "mdi:water-opacity"
+    update_interval: 60s
+    lambda: |-
+      if (!id(sensor_ready)) return {"Warming up"};
+      float ah = id(abs_humidity).state;
+      if (isnan(ah)) return {"Warming up"};
+      const char* label =
+        (ah <= 6.0f)  ? "Very Dry" :
+        (ah <= 8.0f)  ? "Dry" :
+        (ah <= 10.5f) ? "Comfortable" :
+        (ah <= 12.0f) ? "Humid" :
+        (ah <= 15.0f) ? "Very Humid" : "Excessive";
+      return {label};
+  - platform: template
+    name: "AQI CO2"
+    id: aqi_co2
+    icon: "mdi:molecule-co2"
+    update_interval: 60s
+    lambda: |-
+      float c = id(co2).state;
+      if (isnan(c) || c <= 0) return {"Warming up"};
+      const char* label =
+        (c <= 600)  ? "Excellent" :
+        (c <= 1000) ? "Good" :
+        (c <= 1500) ? "Moderate" :
+        (c <= 2000) ? "Unhealthy for Sensitive Groups" :
+        (c <= 5000) ? "Unhealthy" : nullptr;
+      if (!label) return {"Warming up"};
+      return {label};
+  - platform: template
+    name: "AQI TVOC"
+    id: aqi_tvoc_text
+    icon: "mdi:flask-outline"
+    update_interval: 60s
+    lambda: |-
+      if (!id(sensor_ready)) return {"Warming up"};
+      float v = id(voc).state;
+      if (isnan(v) || v <= 0) return {"Warming up"};
+      const char* label =
+        (v <= 150) ? "Excellent" :
+        (v <= 250) ? "Good" :
+        (v <= 350) ? "Moderate" :
+        (v <= 450) ? "Unhealthy for Sensitive Groups" :
+        (v <= 500) ? "Unhealthy" : nullptr;
+      if (!label) return {"Warming up"};
+      return {label};
+  - platform: template
+    name: "AQI NOx"
+    id: aqi_nox_text
+    icon: "mdi:smog"
+    update_interval: 60s
+    lambda: |-
+      if (!id(sensor_ready)) return {"Warming up"};
+      float n = id(nox).state;
+      if (isnan(n) || n <= 0) return {"Warming up"};
+      const char* label =
+        (n <=  50) ? "Excellent" :
+        (n <= 100) ? "Good" :
+        (n <= 200) ? "Moderate" :
+        (n <= 300) ? "Poor" :
+        (n <= 400) ? "Very Poor" :
+        (n <= 500) ? "Hazardous" : nullptr;
+      if (!label) return {"Warming up"};
+      return {label};
+  - platform: template
+    name: "PM AQI"
+    id: pm_aqi_text
+    icon: "mdi:air-filter"
+    update_interval: 60s
+    lambda: |-
+      if (!id(sensor_ready)) return {"Warming up"};
+      float p = id(avg_pm_aqi).state;
+      if (isnan(p)) return {"Warming up"};
+      const char* label =
+        (p <=  25) ? "Excellent" :
+        (p <=  50) ? "Good" :
+        (p <= 100) ? "Moderate" :
+        (p <= 150) ? "Unhealthy for Sensitive Groups" :
+        (p <= 200) ? "Unhealthy" :
+        (p <= 300) ? "Very Unhealthy" : "Hazardous";
+      return {label};
+  - platform: template
+    name: "AQI Combined Level"
+    id: combined_aqi_level
+    icon: "mdi:air-filter"
+    update_interval: 10s
+    lambda: |-
+      static const char* labels[] = {
+        "Excellent", "Good", "Moderate",
+        "Unhealthy for Sensitive Groups", "Unhealthy"
+      };
+      int l = id(aqi_level_score);
+      if (l < 0 || l > 4) return std::string("Warming up");
+      return std::string(labels[l]);
+
+font:
+  - file: "gfonts://Open Sans"
+    id: open_sans_9
+    size: 9
+    glyphs: &oled_glyphs '!"%()+=,-_.:/°µ³0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz'
+  - file: "gfonts://Open Sans"
+    id: open_sans_14
+    size: 14
+    glyphs: *oled_glyphs
+  - file: "gfonts://Open Sans"
+    id: open_sans_20
+    size: 20
+    glyphs: *oled_glyphs
+
+display:
+  - platform: ssd1306_i2c
+    model: "SH1106 128x64"
+    id: oled_display
+    address: 0x3C
+    update_interval: 5s
+    pages:
+      # the readings, laid out like the stock screen
+      - id: page_main
+        lambda: |-
+          it.printf(0, 0, id(open_sans_14), "%.1f°F", id(temp).state * 9.0f / 5.0f + 32.0f);
+          it.printf(128, 0, id(open_sans_14), TextAlign::TOP_RIGHT, "%.1f%%", id(humidity).state);
+          it.line(0, 17, 128, 17);
+          it.printf(0, 19, id(open_sans_9), "CO2");
+          it.printf(0, 27, id(open_sans_20), "%.0f", id(co2).state);
+          it.printf(0, 52, id(open_sans_9), "ppm");
+          it.line(50, 19, 50, 64);
+          it.printf(54, 19, id(open_sans_9), "PM2.5");
+          it.printf(54, 27, id(open_sans_20), "%.0f", id(pm_2_5).state);
+          it.printf(54, 52, id(open_sans_9), "µg/m³");
+          it.line(100, 19, 100, 64);
+          it.printf(104, 18, id(open_sans_9), "VOC");
+          it.printf(104, 29, id(open_sans_9), "%.0f", id(voc).state);
+          it.printf(104, 41, id(open_sans_9), "NOx");
+          it.printf(104, 52, id(open_sans_9), "%.0f", id(nox).state);
+      # the combined level and which reading set it
+      - id: page_level
+        lambda: |-
+          static const char* names[] = {"Excellent", "Good", "Moderate", "Sensitive", "Unhealthy"};
+          static const char* worst[] = {"VOC", "CO2", "NOx", "PM"};
+          int l = id(aqi_level_score);
+          it.printf(64, 0, id(open_sans_14), TextAlign::TOP_CENTER, "Air quality");
+          it.line(0, 17, 128, 17);
+          if (l < 0 || l > 4) {
+            it.printf(64, 28, id(open_sans_20), TextAlign::TOP_CENTER, "Warming up");
+          } else {
+            it.printf(64, 21, id(open_sans_20), TextAlign::TOP_CENTER, "%s", names[l]);
+            if (l > 0) it.printf(64, 47, id(open_sans_14), TextAlign::TOP_CENTER, "from %s", worst[id(aqi_worst)]);
+          }
+      - id: page_detail
+        lambda: |-
+          it.printf(0, 0, id(open_sans_14), "PM AQI:");
+          it.printf(128, 0, id(open_sans_14), TextAlign::TOP_RIGHT, "%.0f", id(avg_pm_aqi).state);
+          it.printf(0, 16, id(open_sans_14), "Abs hum:");
+          it.printf(128, 16, id(open_sans_14), TextAlign::TOP_RIGHT, "%.1f g/m³", id(abs_humidity).state);
+          it.printf(0, 32, id(open_sans_14), "Feels like:");
+          it.printf(128, 32, id(open_sans_14), TextAlign::TOP_RIGHT, "%.1f°F", id(aqi_feels_like_temperature).state);
+          it.printf(0, 48, id(open_sans_14), "PM0.3:");
+          it.printf(128, 48, id(open_sans_14), TextAlign::TOP_RIGHT, "%.0f", id(pm_0_3um).state);
+
+interval:
+  # External hardware watchdog: must be pulsed or it resets the board
+  - interval: 2.5min
+    then:
+      - output.turn_on: external_watchdog
+      - delay: 20ms
+      - output.turn_off: external_watchdog
+
+  - interval: 10s
+    then:
+      - display.page.show_next: oled_display
+      - component.update: oled_display
+
+  # Temperature offset = base + coeff * max(0, ESP C - raw sensor C)
+  - interval: 30s
+    then:
+      - lambda: |-
+          float esp_c  = id(esp_temp_c).state;
+          float t_raw  = id(temp).get_raw_state();
+          float base   = id(temp_offset_base).state;
+          float coeff  = id(temp_offset_coeff).state;
+          if (isnan(esp_c) || isnan(t_raw)) {
+            id(temp_offset_current) = isnan(base) ? 0.0f : base;
+            return;
+          }
+          float d = esp_c - t_raw;
+          if (d < 0.0f) d = 0.0f;
+          id(temp_offset_current) = base + coeff * d;
+
+  # EPA NowCast: 12 hourly averages, recomputed each minute. PM2.5 here is the corrected value.
+  - interval: 60s
+    then:
+      - lambda: |-
+          static float sum25 = 0.0f, sum10 = 0.0f;
+          static int   cnt = 0;
+          static float h25[12], h10[12];
+          static int   hours = 0;
+          float p25 = id(pm_2_5).state;
+          float p10 = id(pm_10_0).get_raw_state();
+          if (!id(sensor_ready) || isnan(p25) || isnan(p10)) return;
+          sum25 += p25; sum10 += p10; cnt++;
+          if (cnt >= 60) {
+            for (int i = 11; i > 0; i--) { h25[i] = h25[i-1]; h10[i] = h10[i-1]; }
+            h25[0] = sum25 / cnt; h10[0] = sum10 / cnt;
+            if (hours < 12) hours++;
+            sum25 = 0.0f; sum10 = 0.0f; cnt = 0;
+          }
+          float c25[13], c10a[13];
+          int n = 0;
+          if (cnt > 0) { c25[n] = sum25 / cnt; c10a[n] = sum10 / cnt; n++; }
+          for (int i = 0; i < hours && n < 12; i++) { c25[n] = h25[i]; c10a[n] = h10[i]; n++; }
+          auto nowcast = [](const float* c, int n) -> float {
+            if (n == 0) return NAN;
+            if (n == 1) return c[0];
+            float cmin = c[0], cmax = c[0];
+            for (int i = 1; i < n; i++) {
+              if (c[i] < cmin) cmin = c[i];
+              if (c[i] > cmax) cmax = c[i];
+            }
+            float w = (cmax > 0.0f) ? 1.0f - (cmax - cmin) / cmax : 1.0f;
+            if (w < 0.5f) w = 0.5f;
+            float num = 0.0f, den = 0.0f, wi = 1.0f;
+            for (int i = 0; i < n; i++) { num += wi * c[i]; den += wi; wi *= w; }
+            return (den > 0.0f) ? num / den : NAN;
+          };
+          id(nowcast_pm25) = nowcast(c25, n);
+          id(nowcast_pm10) = nowcast(c10a, n);
+
+  # Adaptive WiFi TX power: up fast on a weak link, down slowly on a strong one
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (!id(adaptive_wifi_power).state) return;
+          float q = id(wifi_quality).state;
+          if (!wifi::global_wifi_component->is_connected() || isnan(q)) q = 0.0f;
+          float p = id(wifi_power_setpoint);
+          if (q < 55.0f)      p += 2.0f;
+          else if (q > 75.0f) p -= 0.5f;
+          if (p < 8.5f)  p = 8.5f;
+          if (p > 20.0f) p = 20.0f;
+          id(wifi_power_setpoint) = p;
+          nuaqi_wifi_set_tx_power_dbm(p);
+
+  # Combined level: NU-AQI-3 thresholds, worst of the four. score = level + how far through it,
+  # so level = ceil(score) - 1 gives the same answer as the <= ladders on NU-AQI-3.
+  - interval: 10s
+    then:
+      - lambda: |-
+          float v      = id(voc).state;
+          float c      = id(co2).state;
+          float n      = id(nox).state;
+          float pm_aqi = id(avg_pm_aqi).state;
+          if (!id(sensor_ready) || isnan(v) || v <= 0 || isnan(c) || c <= 0 || isnan(pm_aqi)) {
+            id(aqi_level_score) = -1;
+            return;
+          }
+          // first value = clean air for that reading, the rest are the level edges
+          static const float bv[6] = {100,   150,  250,  350,  450,  500};
+          static const float bc[6] = {420,   600, 1000, 1500, 2000, 5000};
+          static const float bn[6] = {  1,    50,  100,  200,  300,  500};
+          static const float bp[6] = {  0,    50,  100,  150,  200,  300};
+          auto score = [](float x, const float *b) -> float {
+            if (isnan(x) || x <= b[0]) return 0.0f;
+            for (int i = 0; i < 5; i++)
+              if (x <= b[i + 1]) return i + (x - b[i]) / (b[i + 1] - b[i]);
+            return 5.0f;
+          };
+          float s[4] = {score(v, bv), score(c, bc), score(n, bn), score(pm_aqi, bp)};
+          int worst = 0;
+          for (int i = 1; i < 4; i++) if (s[i] > s[worst]) worst = i;
+          float top = s[worst];
+          id(aqi_worst) = worst;
+          int level = (int) ceilf(top) - 1;
+          id(aqi_level_score) = level < 0 ? 0 : (level > 4 ? 4 : level);
+          // two LEDs per level; only drop an LED once clearly below its edge
+          auto leds = [](float t) -> int { int l = 1 + (int) floorf(t * 2.0f); return l > 11 ? 11 : l; };
+          int target = leds(top), cur = id(led_lit);
+          if (target < cur && leds(top + 0.1f) >= cur) target = cur;
+          id(led_lit) = target;
+
+button:
+  - platform: restart
+    name: "ESP32-C3 Reboot"
+    icon: "mdi:restart"
+  - platform: template
+    name: "Test AQI LED bar"
+    id: test_led_bar
+    icon: "mdi:led-strip-variant"
+    entity_category: "config"
+    on_press:
+      - script.execute: led_bar_test
+  - platform: template
+    name: "Calibrate CO2 sensor"
+    id: calibrate_co2
+    icon: "mdi:molecule-co2"
+    entity_category: "config"
+    on_press:
+      - senseair.background_calibration: senseair_co2
+      - delay: 70s
+      - senseair.background_calibration_result: senseair_co2
+
+script:
+  - id: apply_display_brightness
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(boot_done)) return;
+          float b = id(display_pct).state;
+          if (isnan(b)) b = 100.0f;
+          b = b / 100.0f * id(aqi_brightness);
+          if (b <= 0.0f) { id(oled_display).turn_off(); return; }
+          id(oled_display).turn_on();
+          id(oled_display).set_contrast(b);
+
+  - id: apply_led_brightness
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(boot_done) && id(led_test_step) == 0;'
+          then:
+            - if:
+                condition:
+                  lambda: 'return !isnan(id(led_bar_pct).state) && id(led_bar_pct).state <= 0.0f;'
+                then:
+                  - light.turn_off: led_bar
+                else:
+                  - light.turn_on:
+                      id: led_bar
+                      effect: "AQI bar"
+                      brightness: !lambda |-
+                        float b = id(led_bar_pct).state;
+                        return (isnan(b) ? 1.0f : b / 100.0f) * id(aqi_brightness) * 0.8f;
+
+  # Good to bad and back to the live reading. The bar comes on for this even if brightness is 0.
+  - id: led_bar_test
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(boot_done);'
+          then:
+            - script.stop: led_bar_test
+      - lambda: 'id(led_test_step) = 1;'
+      - light.turn_on:
+          id: led_bar
+          effect: "AQI bar"
+          brightness: 80%
+      - repeat:
+          count: 11
+          then:
+            - lambda: 'id(led_test_step) = iteration + 1;'
+            - delay: 800ms
+      - delay: 2s
+      - lambda: 'id(led_test_step) = 0;'
+      - script.execute: apply_led_brightness

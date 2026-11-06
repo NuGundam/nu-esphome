@@ -1,0 +1,667 @@
+# =======================================================
+# NU-Presence-24GHz-1  v1.13 (gate energies + distance zones + tuning web page :8080 with room view) - HLK-LD2410C 24 GHz presence radar on an
+# Arduino Nano ESP32 (ESP32-S3), radar on the Nano's TX / RX header pins.
+#
+# Wiring (LD2410C header, 1.27 mm):
+#   VCC -> Nano 5V (VBUS)      the module wants 5 V, its UART is 3.3 V logic
+#   GND -> Nano GND
+#   TX  -> Nano D0 / RX  = GPIO44
+#   RX  -> Nano D1 / TX  = GPIO43
+#   OUT -> not used (presence comes over UART)
+# GPIO43/44 are the S3's UART0, so the logger is moved to the native USB port.
+#
+# What you get in HA:
+#   * Occupied (occupancy): the radar's own presence = moving OR still target,
+#     held for "Clear delay" (the module's unoccupied duration, default 5 s).
+#     A still person is tracked by the still-energy channel, so sitting on a
+#     couch does not clear it like a PIR / the Meross does.
+#   * Moving target / Still target, distances and energies for tuning.
+#   * Tuning from HA: Clear delay, max moving / still gate (each gate is
+#     0.75 m, 8 gates = 6 m), and per-gate move / still sensitivity numbers
+#     (raise a gate's threshold to ignore a fan or a curtain at that distance).
+#   * Engineering mode switch (per-gate energies appear while it is on),
+#     Bluetooth switch (off by default - the HLKRadarTool app is the only
+#     reason to turn it on), module restart / factory reset / version.
+#   * Presence LED: the Nano's RGB LED glows blue while a moving target is
+#     detected, green while occupied (still target only), off when clear (v1.9; v1.10 brighter: blue 70 %, green 50 %).
+#   * Diagnostics: Wi-Fi RSSI, uptime, MCU temperature, restart, and (v1.1)
+#     "Radar byte rate": raw UART RX bytes/s - 0 = TX/RX swapped or module not
+#     powered, ~300+ with everything else Unknown = wrong baud rate.
+#   * v1.3 Gate energies: with Engineering mode on, "Gate N move/still energy"
+#     (0-100) show what every 0.75 m ring sees. Tuning recipe: room empty for
+#     10 min = noise floor per gate; someone in each spot you want IGNORED;
+#     someone in each spot you WANT; set each gate's threshold above the
+#     ignored/noise energy and below the wanted one. Threshold 100 = ring off.
+#   * v1.3 Zones: the LD2410 has no angle, only distance, so a zone is a
+#     distance band. "Zone A" / "Zone B" are occupancy sensors that are on
+#     while the radar has a target between "Zone X near" and "Zone X far"
+#     (m, from HA, saved on the ESP); "Zone edge" m of hysteresis so a
+#     target sitting on the line does not flap; "Zone hold" s keeps a zone on
+#     after the target leaves the band. Aim the module so the spots you care
+#     about sit at different distances and the places to ignore are past
+#     "Max gate" or beside/behind it (foil on the case blocks that side).
+#   * v1.4 Tuning page at http://<device-ip>:8080/ (radar_web.h, same idea as
+#     NU-AQI-3's custom_web.h): live distance + zones on an axis, the nine
+#     gates as bars with draggable thresholds and peak hold, every number
+#     above editable. Writes go through the ESPHome entities, so HA sees them.
+#
+# API key and AP password: the dashboard wizard stub (nu-presence-24ghz-1.yaml.bak_wizard_20261031).
+# First install over USB; after that updates are OTA (encrypted with the API key).
+# =======================================================
+substitutions:
+  device_name: nu-presence-24ghz-1
+  friendly_name: Nu-Presence-24GHz-1
+  api_key: !secret api_key
+  ap_ssid: "Nu-Presence-24GHz-1 Hotspot"
+  ap_password: !secret ap_password
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - radar_web.h               # v1.4 tuning page on :8080
+  # v1.13: HA's "Visit" link = http://<ip>:8080. USE_WEBSERVER(_PORT) is what the web_server component would define;
+  # only the api device info and the mdns _http service read it here, there is no web_server.
+  platformio_options:
+    build_flags:
+      - "-DUSE_WEBSERVER"
+      - "-DUSE_WEBSERVER_PORT=8080"
+  on_boot:
+    - priority: -100
+      then:
+        # v1.12: zone numbers were cm until now; a value past the metre range is an old saved one
+        - lambda: |-
+            esphome::number::Number *zs[] = {id(zone_a_near), id(zone_a_far), id(zone_b_near), id(zone_b_far), id(zone_edge)};
+            for (auto *n : zs)
+              if (n->has_state() && n->state > n->traits.get_max_value()) n->make_call().set_value(n->state / 100.0f).perform();
+        - script.execute: led_update
+        # v1.5: the radar boots slower than the ESP, so the component's own settings query at setup can miss -
+        # firmware, resolution, max gates, clear delay and thresholds then stay unknown until someone presses
+        # "Radar query settings". Ask again once the module is surely up.
+        - delay: 20s
+        - button.press: btn_query
+
+esp32:
+  board: arduino_nano_esp32
+  variant: esp32s3
+  cpu_frequency: 80MHz          # plenty for one UART radar; runs cooler (same as NU-AQI-3)
+  framework:
+    type: esp-idf
+    advanced:
+      include_builtin_idf_components:   # radar_web.h runs its own httpd; nothing else pulls esp_http_server in
+        - esp_http_server
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "16"     # v1.5: API + OTA + mDNS + 5 httpd sockets; two browsers on :8080 starved 3
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG   # UART0 pins (GPIO43/44) belong to the radar
+  level: INFO
+  logs:
+    ld2410: WARN                   # the component logs every frame at DEBUG
+
+api:
+  encryption:
+    key: ${api_key}
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 15min
+  ap:
+    ssid: ${ap_ssid}
+    password: ${ap_password}
+
+# captive_portal dropped in v1.4: it holds LWIP sockets the :8080 httpd needs (same as NU-AQI-3). The fallback AP
+# still comes up; configure Wi-Fi by reflashing over USB instead.
+
+debug:
+  update_interval: 60s
+
+# -------------------------------------------------------
+# RADAR
+# -------------------------------------------------------
+uart:
+  id: uart_bus
+  tx_pin: GPIO43
+  rx_pin: GPIO44
+  baud_rate: 256000             # LD2410C factory default
+  parity: NONE
+  stop_bits: 1
+  debug:                        # v1.1: count RX bytes (the component still gets them); v1.3: hex dump removed
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 50ms
+    sequence:
+      - lambda: |-
+          id(rx_bytes) += bytes.size();
+
+globals:
+  - id: rx_bytes
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: raw_dist                  # v1.3: last target distance (cm) straight from the radar, before the recorder filters
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          id(radar_bps).publish_state(id(rx_bytes) / 5.0f);
+          id(rx_bytes) = 0;
+  # v1.6: writes that came in over :8080 are performed here, on the main loop (doing them on the httpd task crashed
+  # the ESP with a task watchdog - the ld2410 driver and its UART are not thread-safe)
+  - interval: 100ms
+    then:
+      - lambda: 'radar_web_pump();'
+  # v1.4: hand the entities to radar_web.h and start the httpd (returns at once when it is already running)
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto &c = radar_web_cfg();
+          c.dist = id(t_dist); c.mdist = id(m_dist); c.sdist = id(s_dist); c.men = id(m_en); c.sen = id(s_en);
+          c.occ = id(occupied); c.mv = id(bs_mv); c.st = id(bs_st); c.za = id(zone_a); c.zb = id(zone_b);
+          c.a_near = id(zone_a_near); c.a_far = id(zone_a_far); c.b_near = id(zone_b_near); c.b_far = id(zone_b_far);
+          c.edge = id(zone_edge); c.hold = id(zone_hold); c.maxm = id(n_maxm); c.maxs = id(n_maxs); c.timeout = id(n_timeout);
+          c.eng = id(sw_eng); c.res = id(sel_res); c.fw = id(ts_fw); c.uptime = id(s_uptime); c.rssi = id(s_rssi); c.query = id(btn_query);
+          esphome::sensor::Sensor *gm[9] = {id(gme0), id(gme1), id(gme2), id(gme3), id(gme4), id(gme5), id(gme6), id(gme7), id(gme8)};
+          esphome::sensor::Sensor *gs[9] = {id(gse0), id(gse1), id(gse2), id(gse3), id(gse4), id(gse5), id(gse6), id(gse7), id(gse8)};
+          esphome::number::Number *gmt[9] = {id(gmt0), id(gmt1), id(gmt2), id(gmt3), id(gmt4), id(gmt5), id(gmt6), id(gmt7), id(gmt8)};
+          esphome::number::Number *gst[9] = {id(gst0), id(gst1), id(gst2), id(gst3), id(gst4), id(gst5), id(gst6), id(gst7), id(gst8)};
+          for (int i = 0; i < 9; i++) { c.gm[i] = gm[i]; c.gs[i] = gs[i]; c.gmt[i] = gmt[i]; c.gst[i] = gst[i]; }
+          radar_web_register();
+
+ld2410:
+  id: radar
+  uart_id: uart_bus
+
+binary_sensor:
+  - platform: ld2410
+    has_target:
+      id: occupied
+      name: "Occupied"
+      device_class: occupancy
+      on_state:
+        - script.execute: led_update
+    has_moving_target:
+      id: bs_mv
+      name: "Moving target"
+      device_class: motion
+      on_state:
+        - script.execute: led_update
+    has_still_target:
+      id: bs_st
+      name: "Still target"
+      icon: mdi:human-male
+
+  # v1.3 distance zones (see header). Evaluated every loop from raw_dist; hysteresis = Zone edge, hold = Zone hold.
+  - platform: template
+    id: zone_a
+    name: "Zone A"
+    device_class: occupancy
+    lambda: |-
+      if (!id(occupied).state) return false;
+      const float d = id(raw_dist) / 100.0f, h = id(zone_a).state ? id(zone_edge).state : 0.0f;
+      return d >= id(zone_a_near).state - h && d <= id(zone_a_far).state + h;
+    filters:
+      - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
+  - platform: template
+    id: zone_b
+    name: "Zone B"
+    device_class: occupancy
+    lambda: |-
+      if (!id(occupied).state) return false;
+      const float d = id(raw_dist) / 100.0f, h = id(zone_b).state ? id(zone_edge).state : 0.0f;
+      return d >= id(zone_b_near).state - h && d <= id(zone_b_far).state + h;
+    filters:
+      - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
+
+sensor:
+  - platform: ld2410
+    # distances in cm; the radar reports every ~100 ms, so average and dead-band them for the recorder
+    detection_distance:
+      id: t_dist
+      name: "Target distance"
+      on_raw_value:
+        - lambda: 'id(raw_dist) = x;'
+      filters:
+        - throttle_average: 2s
+        - delta: 10
+    moving_distance:
+      id: m_dist
+      name: "Moving distance"
+      filters:
+        - throttle_average: 2s
+        - delta: 10
+    still_distance:
+      id: s_dist
+      name: "Still distance"
+      filters:
+        - throttle_average: 2s
+        - delta: 10
+    # energies 0-100: how sure the radar is; useful for setting gate thresholds
+    moving_energy:
+      id: m_en
+      name: "Moving energy"
+      filters:
+        - throttle_average: 5s
+        - delta: 5
+    still_energy:
+      id: s_en
+      name: "Still energy"
+      filters:
+        - throttle_average: 5s
+        - delta: 5
+    light:
+      name: "Light level"
+      icon: mdi:brightness-5
+      filters:
+        - throttle_average: 10s
+        - delta: 5
+    # v1.3 per-gate energies (0-100), only reported while Engineering mode is on; the raw data behind the thresholds below
+    g0:
+      move_energy:
+        id: gme0
+        name: "Gate 0 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse0
+        name: "Gate 0 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g1:
+      move_energy:
+        id: gme1
+        name: "Gate 1 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse1
+        name: "Gate 1 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g2:
+      move_energy:
+        id: gme2
+        name: "Gate 2 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse2
+        name: "Gate 2 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g3:
+      move_energy:
+        id: gme3
+        name: "Gate 3 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse3
+        name: "Gate 3 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g4:
+      move_energy:
+        id: gme4
+        name: "Gate 4 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse4
+        name: "Gate 4 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g5:
+      move_energy:
+        id: gme5
+        name: "Gate 5 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse5
+        name: "Gate 5 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g6:
+      move_energy:
+        id: gme6
+        name: "Gate 6 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse6
+        name: "Gate 6 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g7:
+      move_energy:
+        id: gme7
+        name: "Gate 7 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse7
+        name: "Gate 7 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g8:
+      move_energy:
+        id: gme8
+        name: "Gate 8 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse8
+        name: "Gate 8 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+
+  - platform: template
+    id: radar_bps
+    name: "Radar byte rate"
+    icon: mdi:serial-port
+    unit_of_measurement: "B/s"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - delta: 5
+
+  - platform: wifi_signal
+    id: s_rssi
+    name: "WiFi RSSI"
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    id: s_uptime
+    name: "Uptime"
+    entity_category: diagnostic
+  - platform: internal_temperature
+    name: "MCU temperature"
+    entity_category: diagnostic
+
+# -------------------------------------------------------
+# TUNING (written to the module, survive its reboots)
+# -------------------------------------------------------
+number:
+  - platform: ld2410
+    timeout:
+      id: n_timeout
+      name: "Clear delay"           # unoccupied duration 0-65535 s; the module's own hold
+      icon: mdi:timer-sand
+    light_threshold:
+      name: "Light threshold"
+    max_move_distance_gate:
+      id: n_maxm
+      name: "Max moving gate"       # 0.75 m per gate
+      icon: mdi:ruler
+    max_still_distance_gate:
+      id: n_maxs
+      name: "Max still gate"
+      icon: mdi:ruler
+    # per-gate sensitivity: energy (0-100) a gate needs before it counts. Higher = less sensitive.
+    g0:
+      move_threshold:
+        id: gmt0
+        name: "Gate 0 (0-0.75 m) move"
+      still_threshold:
+        id: gst0
+        name: "Gate 0 (0-0.75 m) still"
+    g1:
+      move_threshold:
+        id: gmt1
+        name: "Gate 1 (0.75-1.5 m) move"
+      still_threshold:
+        id: gst1
+        name: "Gate 1 (0.75-1.5 m) still"
+    g2:
+      move_threshold:
+        id: gmt2
+        name: "Gate 2 (1.5-2.25 m) move"
+      still_threshold:
+        id: gst2
+        name: "Gate 2 (1.5-2.25 m) still"
+    g3:
+      move_threshold:
+        id: gmt3
+        name: "Gate 3 (2.25-3 m) move"
+      still_threshold:
+        id: gst3
+        name: "Gate 3 (2.25-3 m) still"
+    g4:
+      move_threshold:
+        id: gmt4
+        name: "Gate 4 (3-3.75 m) move"
+      still_threshold:
+        id: gst4
+        name: "Gate 4 (3-3.75 m) still"
+    g5:
+      move_threshold:
+        id: gmt5
+        name: "Gate 5 (3.75-4.5 m) move"
+      still_threshold:
+        id: gst5
+        name: "Gate 5 (3.75-4.5 m) still"
+    g6:
+      move_threshold:
+        id: gmt6
+        name: "Gate 6 (4.5-5.25 m) move"
+      still_threshold:
+        id: gst6
+        name: "Gate 6 (4.5-5.25 m) still"
+    g7:
+      move_threshold:
+        id: gmt7
+        name: "Gate 7 (5.25-6 m) move"
+      still_threshold:
+        id: gst7
+        name: "Gate 7 (5.25-6 m) still"
+    g8:
+      move_threshold:
+        id: gmt8
+        name: "Gate 8 (6-6.75 m) move"
+      still_threshold:
+        id: gst8
+        name: "Gate 8 (6-6.75 m) still"
+
+  # v1.3 zone edges, hysteresis and hold - saved on the ESP. v1.12: metres (raw_dist stays cm)
+  - platform: template
+    id: zone_a_near
+    name: "Zone A near"
+    icon: mdi:arrow-collapse-left
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_a_far
+    name: "Zone A far"
+    icon: mdi:arrow-collapse-right
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_b_near
+    name: "Zone B near"
+    icon: mdi:arrow-collapse-left
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_b_far
+    name: "Zone B far"
+    icon: mdi:arrow-collapse-right
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 4
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_edge
+    name: "Zone edge"
+    icon: mdi:arrow-expand-horizontal
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 1
+    step: 0.05
+    initial_value: 0.15
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_hold
+    name: "Zone hold"
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 600
+    step: 5
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+
+switch:
+  - platform: ld2410
+    engineering_mode:
+      id: sw_eng
+      name: "Engineering mode"
+      entity_category: config
+    bluetooth:
+      name: "Radar Bluetooth"
+      entity_category: config
+  - platform: template
+    id: presence_led
+    name: "Presence LED"
+    icon: mdi:led-on
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - script.execute: led_update
+    on_turn_off:
+      - script.execute: led_update
+
+select:
+  - platform: ld2410
+    distance_resolution:
+      id: sel_res
+      name: "Distance resolution"     # 0.75 m (default) or 0.2 m per gate
+      entity_category: config
+    light_function:
+      name: "Light function"
+      entity_category: config
+    out_pin_level:
+      name: "OUT pin level"
+      entity_category: config
+
+button:
+  - platform: ld2410
+    factory_reset:
+      name: "Radar factory reset"
+      entity_category: diagnostic
+    restart:
+      name: "Radar restart"
+      entity_category: diagnostic
+    query_params:
+      id: btn_query
+      name: "Radar query settings"
+      entity_category: diagnostic
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: ld2410
+    version:
+      id: ts_fw
+      name: "Radar firmware"
+      entity_category: diagnostic
+    mac_address:
+      name: "Radar MAC"
+      entity_category: diagnostic
+
+# -------------------------------------------------------
+# LED - the Nano ESP32's RGB LED (active low; 0 / 45 / 46 are strapping pins,
+# fine as outputs once booted)
+# -------------------------------------------------------
+output:
+  - platform: ledc
+    id: led_r
+    pin:
+      number: GPIO46
+      inverted: true
+      ignore_strapping_warning: true
+  - platform: ledc
+    id: led_g
+    pin:
+      number: GPIO0
+      inverted: true
+      ignore_strapping_warning: true
+  - platform: ledc
+    id: led_b
+    pin:
+      number: GPIO45
+      inverted: true
+      ignore_strapping_warning: true
+
+light:
+  - platform: rgb
+    id: led
+    name: "LED"
+    red: led_r
+    green: led_g
+    blue: led_b
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 300ms
+
+script:
+  - id: led_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: presence_led
+              - binary_sensor.is_on: bs_mv
+          then:
+            - light.turn_on:          # moving target -> blue
+                id: led
+                brightness: 70%
+                red: 0
+                green: 0.1
+                blue: 1
+          else:
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: presence_led
+                    - binary_sensor.is_on: occupied
+                then:
+                  - light.turn_on:    # occupied, still only -> green
+                      id: led
+                      brightness: 50%
+                      red: 0
+                      green: 1
+                      blue: 0
+                else:
+                  - light.turn_off:
+                      id: led

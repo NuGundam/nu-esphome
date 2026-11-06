@@ -1,0 +1,11 @@
+# NU-Presence-1 (Dining Room) - device-specific values only.
+# All logic lives in common/mr60-presence-common.yaml (edit that to change every unit).
+# API key and AP password came from the dashboard wizard stub (nu-presence-1.yaml.bak_wizard_20261030).
+substitutions:
+  device_name: nu-presence-1
+  friendly_name: NU-Presence-1
+  api_key: !secret api_key
+  ap_ssid: "Nu-Presence-1 Fallback Hotspot"
+  ap_password: !secret ap_password
+packages:
+  mr60_common: !include common/mr60-presence-common.yaml

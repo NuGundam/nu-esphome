@@ -1,0 +1,12 @@
+# AirGradient Kitchen - device-specific values only.
+# All logic lives in common/airgradient-one-common.yaml.
+substitutions:
+  device_name: airgradient-kitchen
+  friendly_name: AirGradient Kitchen
+  api_key: !secret api_key
+  ap_ssid: "AirGradient-Kitchen Fallback"
+  ap_password: !secret ap_password
+  voc_learning_offset: '60'     # the stock firmware ran 60 here, 12 on the Loft
+  nox_learning_offset: '12'
+packages:
+  ag_common: !include common/airgradient-one-common.yaml
