@@ -1,3 +1,6 @@
+packages:
+  wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+
 esphome:
   name: nu-wt-1
   friendly_name: NU-WT-1

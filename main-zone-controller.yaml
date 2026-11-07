@@ -19,6 +19,9 @@
 #   Do NOT hand-edit the valve blocks directly.
 # =============================================================================
 
+packages:
+  wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+
 esphome:
   name: main-zone-controller
   friendly_name: main-zone-controller

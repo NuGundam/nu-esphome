@@ -8,6 +8,9 @@ substitutions:
   aci_write_char: "70D51001-2C7F-4E75-AE8A-D758951CE4E0"
   aci_notify_char: "70D51002-2C7F-4E75-AE8A-D758951CE4E0"
 
+packages:
+  wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+
 esphome:
   name: fresh-air-aqi
   friendly_name: fresh-air-aqi

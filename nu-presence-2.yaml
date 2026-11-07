@@ -9,4 +9,5 @@ substitutions:
   ap_ssid: "Nu-Presence-2 Fallback Hotspot"
   ap_password: !secret ap_password
 packages:
+  wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
   mr60_common: !include common/mr60-presence-common.yaml

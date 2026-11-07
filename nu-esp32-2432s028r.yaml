@@ -18,6 +18,9 @@
 #      (that version rejected every touch). Adds text_sensor "Last Touch Event".
 # ══════════════════════════════════════════════════════════════════════════
 
+packages:
+  wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+
 esphome:
   name: nu-esp32-2432s028r
   friendly_name: NU-ESP32-2432S028R

@@ -1,0 +1,88 @@
+# =======================================================
+# WIFI-DIAG v1.0 (2026-11-07) - Wi-Fi diagnostics for every ESP32 device.
+#
+# Add to any device yaml (also new ones):
+#   packages:
+#     wifi_diag: !include common/wifi-diag.yaml
+# and keep wifi_diag.h next to the yamls.
+#
+# Gives five diagnostic entities:
+#   BSSID             the AP radio the device is associated with
+#   Access Point      that BSSID mapped to the router's AP name (wifi_diag.h)
+#   WiFi Reconnects   associations since boot minus the boot join; HA's
+#                     last_changed on it is the time of the latest re-association
+#   WiFi Disconnects  link losses since boot
+#   WiFi TX Power     what the radio driver is set to, dBm
+# Counters reset at boot (total_increasing, so long-term statistics still sum them).
+# The NU-AQI family carries the same sensors inline (nuaqi-common v2.2, nu-aqi-3
+# v5.1, airgradient-one-common v0.6); they move to this package next time they are touched.
+# =======================================================
+esphome:
+  includes:
+    - wifi_diag.h
+
+wifi:
+  on_connect:
+    - lambda: |-
+        id(wd_connects) += 1;
+        id(wd_reconnects).publish_state(id(wd_connects) > 0 ? id(wd_connects) - 1 : 0);
+  on_disconnect:
+    - lambda: |-
+        id(wd_disconnects_n) += 1;
+
+globals:
+  - id: wd_connects
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wd_disconnects_n
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+sensor:
+  - platform: template
+    name: "WiFi Reconnects"
+    id: wd_reconnects
+    icon: "mdi:wifi-refresh"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    name: "WiFi Disconnects"
+    id: wd_disconnects
+    icon: "mdi:wifi-off"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return id(wd_disconnects_n);
+  - platform: template
+    name: "WiFi TX Power"
+    id: wd_tx_power
+    icon: "mdi:antenna"
+    unit_of_measurement: "dBm"
+    device_class: "signal_strength"
+    entity_category: "diagnostic"
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: return wd_tx_power_dbm();
+
+text_sensor:
+  - platform: wifi_info
+    bssid:
+      name: "BSSID"
+      id: wd_bssid
+      icon: "mdi:access-point"
+      entity_category: "diagnostic"
+      on_value:
+        - text_sensor.template.publish:
+            id: wd_access_point
+            state: !lambda 'return wd_ap_name(x);'
+  - platform: template
+    name: "Access Point"
+    id: wd_access_point
+    icon: "mdi:access-point-network"
+    entity_category: "diagnostic"
+    update_interval: never

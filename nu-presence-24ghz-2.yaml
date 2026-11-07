@@ -58,6 +58,9 @@ substitutions:
   ap_ssid: "Nu-Presence-24GHz-2 Hotspot"
   ap_password: !secret ap_password
 
+packages:
+  wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
