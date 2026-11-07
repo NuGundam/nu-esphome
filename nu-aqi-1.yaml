@@ -9,3 +9,8 @@ substitutions:
   ap_password: !secret ap_password
 packages:
   nuaqi_common: !include common/nuaqi-common.yaml
+# 2026-11-06 one-device Wi-Fi test: the router heard this unit at -73..-77 dBm while the adaptive loop sat at its
+# 8.5 dBm floor (quality 74 % is inside its 55-75 dead band, so it never stepped up). Fixed 14 dBm with "Adaptive
+# WiFi TX Power" switched OFF in HA; the loop re-asserts its own setpoint while on. Merges into the package wifi: block.
+wifi:
+  output_power: 14dB

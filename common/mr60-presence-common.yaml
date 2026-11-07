@@ -1,5 +1,5 @@
 # =======================================================
-# MR60-PRESENCE-COMMON v1.16 - shared package for the Seeed MR60BHA2 mmWave kits
+# MR60-PRESENCE-COMMON v1.17 - shared package for the Seeed MR60BHA2 mmWave kits
 # (XIAO ESP32-C6 + MR60BHA2 60 GHz radar + BH1750 lux + 1x WS2812)
 #
 # Each device's yaml sets substitutions and includes this file:
@@ -46,6 +46,9 @@
 #     raw value stays bit-identical for 3 min (2026-10-30 21:38-21:56 the
 #     module froze repeating breath 22.33 / 65.5 cm on an empty loft) -> Occupied
 #     cleared, radar reset automatically, retried every 5 min while stuck.
+#   * v1.17: LED blue 15 -> 40 % so it reads as bright as the green (blue at 15 % looked off), movement
+#     threshold 25 -> 15 cm over 1 s (2026-11-06 seated test: user never saw blue; radial moves rarely passed 25 cm).
+#     LED and "Target moving" only, Occupied logic untouched.
 #   * v1.16: page on http://<device-ip>:8080/ (mr60_web.h, up 70 s after boot): live distance, vitals, trends and every
 #     setting with presets and examples. "Web page" says Starting / Ready / Failed, "Still preset" names the preset
 #     Still hold matches or Custom. HA's Visit link opens the page. captive_portal is gone: it holds LWIP sockets the
@@ -235,7 +238,7 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: last_move_ms          # last moment the target distance differed > 25 cm from the 1 s reference
+  - id: last_move_ms          # last moment the target distance differed > 15 cm from the 1 s reference
     type: uint32_t
     restore_value: no
     initial_value: '0'
@@ -439,7 +442,7 @@ script:
           then:
             - light.turn_on:          # moved in the last "LED blue hold" seconds -> blue
                 id: led
-                brightness: 15%
+                brightness: 40%
                 red: 0
                 green: 0.1
                 blue: 1
@@ -712,7 +715,7 @@ sensor:
             id(frame_count) += 1;
             if (x != id(prev_raw_d)) { id(prev_raw_d) = x; id(last_change_ms) = millis(); }
             if (x > 0.0f) {
-              if (id(ref_ms) != 0 && fabsf(x - id(ref_d)) > 25.0f) {
+              if (id(ref_ms) != 0 && fabsf(x - id(ref_d)) > 15.0f) {
                 id(last_move_ms) = millis(); id(ref_d) = x; id(ref_ms) = millis();
               } else if (id(ref_ms) == 0 || (millis() - id(ref_ms)) > 1000) {
                 id(ref_d) = x; id(ref_ms) = millis();
