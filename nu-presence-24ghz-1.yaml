@@ -58,6 +58,15 @@ substitutions:
 packages:
   wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
 
+# Keeps _esphomelib in mDNS next to the _http service from the USE_WEBSERVER flags (2026-11-07):
+# without it the Device Builder never sees this device's version or config_hash.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mdns_web_slot]
+mdns_web_slot:
+
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}

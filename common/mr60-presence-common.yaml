@@ -1,5 +1,5 @@
 # =======================================================
-# MR60-PRESENCE-COMMON v1.17 - shared package for the Seeed MR60BHA2 mmWave kits
+# MR60-PRESENCE-COMMON v1.18 - shared package for the Seeed MR60BHA2 mmWave kits
 # (XIAO ESP32-C6 + MR60BHA2 60 GHz radar + BH1750 lux + 1x WS2812)
 #
 # Each device's yaml sets substitutions and includes this file:
@@ -46,6 +46,7 @@
 #     raw value stays bit-identical for 3 min (2026-10-30 21:38-21:56 the
 #     module froze repeating breath 22.33 / 65.5 cm on an empty loft) -> Occupied
 #     cleared, radar reset automatically, retried every 5 min while stuck.
+#   * v1.18: mdns_web_slot, so _esphomelib survives beside the USE_WEBSERVER _http service (Device Builder sees the hash).
 #   * v1.17: LED blue 15 -> 40 % so it reads as bright as the green (blue at 15 % looked off), movement
 #     threshold 25 -> 15 cm over 1 s (2026-11-06 seated test: user never saw blue; radial moves rarely passed 25 cm).
 #     LED and "Target moving" only, Occupied logic untouched.
@@ -95,6 +96,15 @@
 # The radar module's own firmware is not touched (Seeed: it cannot be
 # customised; update it only over USB inside the case).
 # =======================================================
+# Keeps _esphomelib in mDNS next to the _http service from the USE_WEBSERVER flags (2026-11-07):
+# without it the Device Builder never sees this device's version or config_hash.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mdns_web_slot]
+mdns_web_slot:
+
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}

@@ -1,5 +1,7 @@
 # =======================================================
-# NU-AQI-3  v5.1
+# NU-AQI-3  v5.2
+# Changes from v5.1:
+#   - mdns_web_slot, so _esphomelib survives beside the USE_WEBSERVER _http service
 # Changes from v5.0:
 #   - "BSSID", "Access Point", "WiFi Reconnects" and "WiFi Disconnects" diagnostics, same as
 #     nuaqi-common v2.2 (2026-11-07 Wi-Fi dropout hunt). Needs nuaqi_helpers.h v5.0.
@@ -31,6 +33,15 @@
 # then adjust "Temp Offset Base" in HA until temperatures match. The dynamic
 # part (coefficient, default 0.12) handles CPU-load/WiFi heat variation.
 # =======================================================
+# Keeps _esphomelib in mDNS next to the _http service from the USE_WEBSERVER flags (2026-11-07):
+# without it the Device Builder never sees this device's version or config_hash.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mdns_web_slot]
+mdns_web_slot:
+
 esphome:
   name: nu-aqi-3
   friendly_name: NU-AQI-3
