@@ -1,5 +1,5 @@
 # =======================================================
-# NUAQI-COMMON  v2.1 — shared package for NU-AQI-1/2/4/5/6
+# NUAQI-COMMON  v2.2 — shared package for NU-AQI-1/2/4/5/6
 # (SHT40 + SGP41 + SCD40 units; NU-AQI-3 SEN66 unit is standalone)
 #
 # Each device's yaml sets substitutions and includes this file:
@@ -14,6 +14,7 @@
 # v2.1 (2026-11-07): "BSSID" text sensor (which radio the unit is on) and a
 #   "WiFi Reconnects" counter from wifi.on_connect, to see which units
 #   re-associate and how often (2026-11-06 dropout hunt). Diagnostic only.
+# v2.2 (2026-11-07): "Access Point" = BSSID mapped to the router's AP name (nuaqi_helpers.h).
 # =======================================================
 esphome:
   name: ${device_name}
@@ -495,8 +496,19 @@ text_sensor:
       icon: "mdi:router-wireless"
     bssid:                      # v2.1: the AP radio we are associated with
       name: "BSSID"
+      id: wifi_bssid
       icon: "mdi:access-point"
       entity_category: "diagnostic"
+      on_value:
+        - text_sensor.template.publish:
+            id: access_point
+            state: !lambda 'return nuaqi_ap_name(x);'
+  - platform: template
+    name: "Access Point"      # BSSID mapped to the router's name (nuaqi_helpers.h)
+    id: access_point
+    icon: "mdi:access-point-network"
+    entity_category: "diagnostic"
+    update_interval: never
   - platform: template
     name: "Unit Temperature Status"
     id: esp_temp_status

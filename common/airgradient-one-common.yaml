@@ -1,5 +1,5 @@
 # =======================================================
-# AIRGRADIENT-ONE-COMMON v0.5 - shared package for AirGradient ONE (I-9PSL) units
+# AIRGRADIENT-ONE-COMMON v0.6 - shared package for AirGradient ONE (I-9PSL) units
 # ESP32-C3-MINI + SenseAir S8 (CO2) + PMS5003 (PM) + SHT40 (T/RH) + SGP41 (VOC/NOx)
 # + 1.3" SH1106 OLED + 11x WS2812 bar + button on GPIO9 + external watchdog on GPIO2.
 #
@@ -45,6 +45,8 @@
 # page); "LED bar brightness" 0 switches the bar off. The AQI text sensors report the
 # category only ("Excellent"), so their HA history is a few clean bands instead of a new
 # band per index change; the numbers are the plain sensors next to them.
+# v0.6 (2026-11-07): "BSSID", "Access Point", "WiFi Reconnects" and "WiFi Disconnects" diagnostics,
+#     same as nuaqi-common v2.2 (Wi-Fi dropout hunt). Needs nuaqi_helpers.h v5.0.
 # v0.5: boot_done gate. The restored brightness numbers fire on_value during their own
 # setup (priority 800), before the light (799) and display (400) exist as working parts;
 # v0.4 started the LED effect from there and crashed on every boot (null LightState in
@@ -102,6 +104,16 @@ wifi:
     ssid: ${ap_ssid}
     password: ${ap_password}
 
+  # v0.6: count associations. The first on_connect after boot is the normal join,
+  # every later one is a re-association (AP kicked us, beacons lost, or a roam).
+  on_connect:
+    - lambda: |-
+        id(wifi_connects) += 1;
+        id(wifi_reconnects_sensor).publish_state(id(wifi_connects) > 0 ? id(wifi_connects) - 1 : 0);
+  on_disconnect:
+    - lambda: |-
+        id(wifi_disconnects) += 1;
+
 captive_portal:
 
 uart:
@@ -120,6 +132,14 @@ i2c:
   frequency: 400kHz
 
 globals:
+  - id: wifi_connects          # associations since boot (first one = the boot join)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wifi_disconnects       # link losses since boot
+    type: int
+    restore_value: no
+    initial_value: '0'
   - id: sensor_ready
     type: bool
     restore_value: no
@@ -363,6 +383,24 @@ binary_sensor:
       - component.update: oled_display
 
 sensor:
+  # Association counters (see wifi: on_connect). Reset at boot, so HA's
+  # last_changed on "WiFi Reconnects" is the time of the latest re-association.
+  - platform: template
+    name: "WiFi Reconnects"
+    id: wifi_reconnects_sensor
+    icon: "mdi:wifi-refresh"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    name: "WiFi Disconnects"
+    icon: "mdi:wifi-off"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return id(wifi_disconnects);
   - platform: senseair
     id: senseair_co2
     uart_id: senseair_co2_uart
@@ -631,6 +669,21 @@ text_sensor:
     ssid:
       name: "SSID"
       icon: "mdi:router-wireless"
+    bssid:                      # the AP radio we are associated with
+      name: "BSSID"
+      id: wifi_bssid
+      icon: "mdi:access-point"
+      entity_category: "diagnostic"
+      on_value:
+        - text_sensor.template.publish:
+            id: access_point
+            state: !lambda 'return nuaqi_ap_name(x);'
+  - platform: template
+    name: "Access Point"      # BSSID mapped to the router's name (nuaqi_helpers.h)
+    id: access_point
+    icon: "mdi:access-point-network"
+    entity_category: "diagnostic"
+    update_interval: never
   - platform: template
     name: "Unit Temperature Status"
     id: esp_temp_status

@@ -1,5 +1,8 @@
 # =======================================================
-# NU-AQI-3  v5.0
+# NU-AQI-3  v5.1
+# Changes from v5.0:
+#   - "BSSID", "Access Point", "WiFi Reconnects" and "WiFi Disconnects" diagnostics, same as
+#     nuaqi-common v2.2 (2026-11-07 Wi-Fi dropout hunt). Needs nuaqi_helpers.h v5.0.
 # Changes from v4.9:
 #   - HA "Visit" link points at the dashboard on :8080 (USE_WEBSERVER build flags, no web_server component)
 # Changes from v4.8:
@@ -86,6 +89,15 @@ wifi:
   ap:
     ssid: "Nu-Aqi-3 Fallback Hotspot"
     password: !secret ap_password
+  # v5.1: count associations. The first on_connect after boot is the normal join,
+  # every later one is a re-association (AP kicked us, beacons lost, or a roam).
+  on_connect:
+    - lambda: |-
+        id(wifi_connects) += 1;
+        id(wifi_reconnects_sensor).publish_state(id(wifi_connects) > 0 ? id(wifi_connects) - 1 : 0);
+  on_disconnect:
+    - lambda: |-
+        id(wifi_disconnects) += 1;
 # web_server disabled — dashboard v3 reads sensor state directly from C++,
 # no HTTP loopback needed. Disabling frees 5 LWIP sockets so the custom
 # httpd on port 8080 can start. Re-enable temporarily for HA entity debugging.
@@ -100,6 +112,14 @@ wifi:
 # GLOBALS
 # -------------------------------------------------------
 globals:
+  - id: wifi_connects          # associations since boot (first one = the boot join)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wifi_disconnects       # link losses since boot
+    type: int
+    restore_value: no
+    initial_value: '0'
   - id: sensor_ready
     type: bool
     restore_value: no
@@ -289,6 +309,24 @@ binary_sensor:
     lambda: |-
       return id(sensor_ready);
 sensor:
+  # Association counters (see wifi: on_connect). Reset at boot, so HA's
+  # last_changed on "WiFi Reconnects" is the time of the latest re-association.
+  - platform: template
+    name: "WiFi Reconnects"
+    id: wifi_reconnects_sensor
+    icon: "mdi:wifi-refresh"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    name: "WiFi Disconnects"
+    icon: "mdi:wifi-off"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return id(wifi_disconnects);
   - platform: sen6x
     id: sen66
     pm_1_0:
@@ -533,6 +571,21 @@ text_sensor:
     ssid:
       name: "SSID"
       icon: "mdi:router-wireless"
+    bssid:                      # the AP radio we are associated with
+      name: "BSSID"
+      id: wifi_bssid
+      icon: "mdi:access-point"
+      entity_category: "diagnostic"
+      on_value:
+        - text_sensor.template.publish:
+            id: access_point
+            state: !lambda 'return nuaqi_ap_name(x);'
+  - platform: template
+    name: "Access Point"      # BSSID mapped to the router's name (nuaqi_helpers.h)
+    id: access_point
+    icon: "mdi:access-point-network"
+    entity_category: "diagnostic"
+    update_interval: never
   - platform: template
     name: "Unit Temperature Status"
     id: esp_temp_status
