@@ -1,5 +1,5 @@
 # =======================================================
-# NUAQI-COMMON  v2.0 — shared package for NU-AQI-1/2/4/5
+# NUAQI-COMMON  v2.1 — shared package for NU-AQI-1/2/4/5/6
 # (SHT40 + SGP41 + SCD40 units; NU-AQI-3 SEN66 unit is standalone)
 #
 # Each device's yaml sets substitutions and includes this file:
@@ -9,7 +9,11 @@
 #   packages:
 #     nuaqi_common: !include common/nuaqi-common.yaml
 #
-# Edit THIS file to change all four devices at once.
+# Edit THIS file to change all five devices at once.
+#
+# v2.1 (2026-11-07): "BSSID" text sensor (which radio the unit is on) and a
+#   "WiFi Reconnects" counter from wifi.on_connect, to see which units
+#   re-associate and how often (2026-11-06 dropout hunt). Diagnostic only.
 # =======================================================
 esphome:
   name: ${device_name}
@@ -49,11 +53,28 @@ wifi:
   ap:
     ssid: "${ap_ssid}"
     password: "${ap_password}"
+  # v2.1: count associations. The first on_connect after boot is the normal join,
+  # every later one is a re-association (AP kicked us, beacons lost, or a roam).
+  on_connect:
+    - lambda: |-
+        id(wifi_connects) += 1;
+        id(wifi_reconnects_sensor).publish_state(id(wifi_connects) > 0 ? id(wifi_connects) - 1 : 0);
+  on_disconnect:
+    - lambda: |-
+        id(wifi_disconnects) += 1;
 captive_portal:
 # -------------------------------------------------------
 # GLOBALS
 # -------------------------------------------------------
 globals:
+  - id: wifi_connects          # v2.1: associations since boot (first one = the boot join)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wifi_disconnects       # v2.1: link losses since boot
+    type: int
+    restore_value: no
+    initial_value: '0'
   - id: aqi_brightness
     type: float
     restore_value: no
@@ -232,6 +253,24 @@ number:
 # SENSORS
 # -------------------------------------------------------
 sensor:
+  # v2.1: association counters (see wifi: on_connect). Reset at boot, so HA's
+  # last_changed on "WiFi Reconnects" is the time of the latest re-association.
+  - platform: template
+    name: "WiFi Reconnects"
+    id: wifi_reconnects_sensor
+    icon: "mdi:wifi-refresh"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    name: "WiFi Disconnects"
+    icon: "mdi:wifi-off"
+    entity_category: "diagnostic"
+    state_class: "total_increasing"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return id(wifi_disconnects);
   # Radiant temp from Home Assistant
   - platform: homeassistant
     id: radiant_temp_sum
@@ -454,6 +493,10 @@ text_sensor:
     ssid:
       name: "SSID"
       icon: "mdi:router-wireless"
+    bssid:                      # v2.1: the AP radio we are associated with
+      name: "BSSID"
+      icon: "mdi:access-point"
+      entity_category: "diagnostic"
   - platform: template
     name: "Unit Temperature Status"
     id: esp_temp_status
