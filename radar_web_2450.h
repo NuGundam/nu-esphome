@@ -1,6 +1,6 @@
 #pragma once
 // ─────────────────────────────────────────────────
-//  NU-Presence-24GHz-2  LD2450 tuning page  v1.4  (radar_web_2450.h)  2026-11-06
+//  NU-Presence-24GHz-2  LD2450 tuning page  v1.5  (radar_web_2450.h)  2026-11-06
 //
 //  Same structure as radar_web.h (24GHz-1): an IDF httpd on port 8080, one embedded page, small JSON endpoints.
 //
@@ -30,6 +30,10 @@
 //
 //  v1.3 (yaml v1.8): "Still presence" card with the Still hold box, and the presence tracks in data.json (trk) and on
 //  the map. A target the radar reports but no track owns is drawn grey: it never moved, so it does not count.
+//
+//  v1.5 (yaml v1.10): current preset on both cards (data.json ps / pm) and in HA, and radar_web_state() for the "Web
+//  page" entity. The names live here only; the page matches them against its button text, so keep the two the same.
+//  The values are also in the page script. Moving preset ignores range: the page sets that from its room box.
 // ─────────────────────────────────────────────────
 #include "esphome.h"
 #include "presence_2450.h"
@@ -66,6 +70,31 @@ static bool rw_push(const char *k, float v) {
   taskEXIT_CRITICAL(&rw_mux);
   return ok;
 }
+
+// which preset the numbers match
+static const char *rw_still_preset(float v) {
+  if (std::isnan(v)) return "Custom";
+  switch ((int) lroundf(v)) {
+    case 60: return "Hallway 60 s";
+    case 300: return "Desk 300 s";
+    case 900: return "Couch or TV 900 s";
+    case 1800: return "Bed 1800 s";
+    default: return "Custom";
+  }
+}
+static const char *rw_move_preset(float speed, float hold) {
+  if (std::isnan(speed) || std::isnan(hold)) return "Custom";
+  int s = (int) lroundf(speed), h = (int) lroundf(hold);
+  if (s == 5 && h == 10) return "Small movements";
+  if (s == 10 && h == 5) return "Default";
+  if (s == 25 && h == 5) return "Walking only";
+  if (s == 10 && h == 30) return "Hold for lights";
+  return "Custom";
+}
+
+// 0 not started yet (70 s after boot), 1 serving, 2 httpd failed
+static volatile int rw_page = 0;
+static const char *radar_web_state() { return rw_page == 1 ? "Ready" : rw_page == 2 ? "Failed" : "Starting"; }
 
 static const char RADAR_WEB_HTML[] PROGMEM = R"ESPH(<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Radar map</title>
@@ -119,6 +148,7 @@ table{border-collapse:collapse;width:100%;font-size:13px}th{color:var(--mut);fon
 <div><div class="big" id="prN">&mdash;</div><div class="sub">people tracked</div></div>
 <div><div class="big" id="prS" style="font-size:22px;line-height:34px">&mdash;</div><div class="sub" id="prL">radar status</div></div>
 <label>Still hold s<input type="number" id="sth" min="30" max="3600" step="10"></label>
+<div><div class="big" id="phC" style="font-size:22px;line-height:34px">&mdash;</div><div class="sub">current preset</div></div>
 </div>
 <div class="row" style="margin-top:10px"><span class="sub">Presets:</span>
 <button id="ph0">Hallway 60 s</button><button id="ph1">Desk 300 s</button><button id="ph2">Couch or TV 900 s</button><button id="ph3">Bed 1800 s</button>
@@ -129,7 +159,7 @@ the moment they disappeared has walked out, and clears after <b>Clear delay</b> 
 <b>Still hold</b>: set it longer than the longest gap you see while sitting. 60 s suits a hallway; 300 s (default) a desk; 900 s a couch or TV; 1800 s a bed.
 Longer never affects someone who walks out normally, it only sets how long Occupied can stay on if they slip out unseen.<br>
 A target only counts once it has moved, so a grey dot on the map is a return that never moved: the radar reports it, Occupied ignores it. That also means
-that after a reboot a seated person is not counted until they move. <b>Moving speed</b> and <b>Moving range</b> below decide what counts as moving, so they
+that after a power cut a seated person is not counted until they move; a restart or a flash keeps them. <b>Moving speed</b> and <b>Moving range</b> below decide what counts as moving, so they
 affect Occupied too: a high Moving speed makes it slower to notice someone.</div>
 </div>
 
@@ -137,6 +167,7 @@ affect Occupied too: a high Moving speed makes it slower to notice someone.</div
 <div class="row">
 <div><div class="big" id="spdNow">&mdash;</div><div class="sub">fastest target now, cm/s</div></div>
 <div><div class="big" id="spdPk">&mdash;</div><div class="sub">peak, last 30 s</div></div>
+<div><div class="big" id="pmC" style="font-size:22px;line-height:34px">&mdash;</div><div class="sub">current preset</div></div>
 <div><span class="pill" id="pMv2">Moving target</span></div>
 </div>
 <div class="row" style="margin-top:10px">
@@ -157,7 +188,7 @@ about while watching the numbers above and set <b>speed</b> a little under what 
 <b>Speed</b>: 3&ndash;5 catches a hand reaching for a cup or typing; 10 (default) catches shifting in a seat and standing up;
 20&ndash;30 reacts to walking only; a slow walk towards the sensor is about 50.<br>
 <b>Range</b>: set it to the far wall (the presets use the room box above). Anything past it is ignored, which drops the
-ghost returns from the hallway or the next room that used to keep the radar's own moving flag on.<br>
+ghost returns from the hallway or the next room that used to keep the radar's own moving flag on. Current preset goes by speed and hold only, because a preset's range comes from the room box in your browser.<br>
 <b>Hold</b>: 2&ndash;3 s for a snappy LED, 5 s (default) for a calm one, 15&ndash;30 s if an automation keeps the lights on with Moving target.</div>
 </div>
 
@@ -218,6 +249,7 @@ sv.addEventListener('pointerup',()=>{if(!rub||!geo)return;const{sc,cx,cy,fl}=geo
 function render(){$('ttl').textContent=D.name+' - radar map';$('meta').textContent=`fw ${D.fw||'?'} · up ${Math.round((D.up||0)/60)} min · rssi ${D.rssi==null?'?':Math.round(D.rssi)} dBm`;
  $('cnt').textContent=D.count==null?'—':D.count;for(const[p,v]of[['pOcc',D.occ],['pMv',D.mv],['pMv2',D.mv],['pRaw',D.mvraw],['pRawO',D.occraw],['pSt',D.st],['pZ0',D.z[0]],['pZ1',D.z[1]],['pZ2',D.z[2]]])$(p).classList.toggle('on',!!v);
  {const k=D.trk||[],h=k.filter(q=>q[2]==1),l=k.filter(q=>q[2]==2);$('prN').textContent=k.length;$('prS').textContent=!k.length?'empty':h.length?mmss(Math.max(...h.map(q=>q[3]))):l.length?mmss(Math.max(...l.map(q=>q[3]))):'in view';$('prL').textContent=!k.length?'nobody tracked':h.length?'lost while still, holding':l.length?'walked out, clearing':'radar can see them';}
+ for(const[p,v]of[['ph',D.ps],['pr',D.pm]])for(let i=0;i<4;i++)$(p+i).classList.toggle('on',$(p+i).textContent===v);$('phC').textContent=D.ps||'—';$('pmC').textContent=D.pm||'—';
  {const now=Date.now();let f=null;D.t.forEach(t=>{if(t&&t[1]!=null&&t[2]!=null&&(D.n.mvr==null||t[1]<=D.n.mvr*1000)){const a=Math.abs(t[2]);if(f==null||a>f)f=a;}});if(f!=null)spk.push([now,f]);spk=spk.filter(x=>now-x[0]<30000);
   $('spdNow').textContent=f==null?'—':Math.round(f);$('spdPk').textContent=spk.length?Math.round(Math.max(...spk.map(x=>x[1]))):'—';
   const th=D.n.mvs;for(const id of ['spdNow','spdPk']){const v=+$(id).textContent;$(id).style.color=(th!=null&&v>=th)?'#4aa3ff':'';}}
@@ -265,6 +297,8 @@ static esp_err_t rw_data(httpd_req_t *req) {
       rw_num(o, age < k.limit ? (float) ((k.limit - age) / 1000) : 0.0f); o += "]"; }
     o += "],"; }
   o += "\"rst\":"; o += std::to_string(pr_restored); o += ",";   // tracks put back at boot, -1 = no snapshot
+  o += "\"ps\":\""; o += rw_still_preset((c.sth && c.sth->has_state()) ? c.sth->state : NAN); o += "\",";
+  o += "\"pm\":\""; o += rw_move_preset((c.mvs && c.mvs->has_state()) ? c.mvs->state : NAN, (c.mvh && c.mvh->has_state()) ? c.mvh->state : NAN); o += "\",";
   o += "\"multi\":"; o += (c.multi && c.multi->state) ? "1," : "0,";
   o += "\"zt\":"; o += std::to_string(rw_zt); o += ",";
   o += "\"fw\":\""; o += rw_fw; o += "\",";
@@ -334,12 +368,13 @@ static void radar_web_register() {
   cfg.server_port = 8080; cfg.ctrl_port = 0; cfg.stack_size = 8192; cfg.max_uri_handlers = 6; cfg.max_open_sockets = 5; cfg.lru_purge_enable = true;
   cfg.task_priority = 1;   // v1.1: same as ESPHome's loop task, so a spin here cannot starve it
   httpd_handle_t srv = nullptr; esp_err_t err = httpd_start(&srv, &cfg);
-  if (err != ESP_OK) { ESP_LOGE("radar_web", "httpd_start failed: %s - will retry", esp_err_to_name(err)); return; }
+  if (err != ESP_OK) { rw_page = 2; ESP_LOGE("radar_web", "httpd_start failed: %s - will retry", esp_err_to_name(err)); return; }
   registered = true;
   static const httpd_uri_t uris[] = {
     {"/", HTTP_GET, rw_html, nullptr}, {"/data.json", HTTP_GET, rw_data, nullptr}, {"/set", HTTP_GET, rw_set, nullptr},
     {"/sw", HTTP_GET, rw_sw, nullptr}, {"/healthz", HTTP_GET, rw_health, nullptr},
   };
-  for (const auto &u : uris) httpd_register_uri_handler(srv, &u);
+  int ok = 0; for (const auto &u : uris) if (httpd_register_uri_handler(srv, &u) == ESP_OK) ok++;
+  rw_page = ok == 5 ? 1 : 2;
   ESP_LOGI("radar_web", "radar map at http://<device-ip>:8080/");
 }

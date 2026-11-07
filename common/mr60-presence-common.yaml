@@ -1,5 +1,5 @@
 # =======================================================
-# MR60-PRESENCE-COMMON v1.15 - shared package for the Seeed MR60BHA2 mmWave kits
+# MR60-PRESENCE-COMMON v1.16 - shared package for the Seeed MR60BHA2 mmWave kits
 # (XIAO ESP32-C6 + MR60BHA2 60 GHz radar + BH1750 lux + 1x WS2812)
 #
 # Each device's yaml sets substitutions and includes this file:
@@ -46,6 +46,10 @@
 #     raw value stays bit-identical for 3 min (2026-10-30 21:38-21:56 the
 #     module froze repeating breath 22.33 / 65.5 cm on an empty loft) -> Occupied
 #     cleared, radar reset automatically, retried every 5 min while stuck.
+#   * v1.16: page on http://<device-ip>:8080/ (mr60_web.h, up 70 s after boot): live distance, vitals, trends and every
+#     setting with presets and examples. "Web page" says Starting / Ready / Failed, "Still preset" names the preset
+#     Still hold matches or Custom. HA's Visit link opens the page. captive_portal is gone: it holds LWIP sockets the
+#     httpd needs (same as the 24 GHz units), the fallback hotspot itself stays. Vitals text is in metres.
 #   * v1.15: LED stays blue for "LED blue hold" (default 10 s) after the last
 #     movement. LED only: Target moving stays 3 s, Occupied logic untouched.
 #   * v1.14: LED blue while moving, green while still (was green while occupied).
@@ -91,8 +95,14 @@
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
+  includes:
+    - mr60_web.h               # page on :8080
   platformio_options:
     board_upload.maximum_size: 4194304
+    # tells HA the page's port for the Visit link; only api and mdns read these, there is no web_server component
+    build_flags:
+      - "-DUSE_WEBSERVER"
+      - "-DUSE_WEBSERVER_PORT=8080"
   on_boot:
     # XIAO ESP32-C6: the antenna sits behind an RF switch that Seeed's Arduino
     # core drives at boot but ESP-IDF leaves floating. GPIO3 LOW powers the
@@ -116,6 +126,11 @@ esp32:
   flash_size: 4MB
   framework:
     type: esp-idf
+    advanced:
+      include_builtin_idf_components:   # mr60_web.h runs its own httpd; nothing else pulls esp_http_server in
+        - esp_http_server
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "16"     # API + OTA + mDNS + 5 httpd sockets
 
 logger:
   hardware_uart: USB_SERIAL_JTAG
@@ -139,8 +154,6 @@ wifi:
   ap:
     ssid: ${ap_ssid}
     password: ${ap_password}
-
-captive_portal:
 
 debug:
   update_interval: 60s
@@ -451,6 +464,41 @@ script:
                       transition_length: 300ms
 
 interval:
+  # v1.16: the page. Writes queued by the httpd task are performed here on the main loop, then a fresh snapshot is
+  # handed back; the httpd task never touches an entity.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          MwCmd c;
+          while (mw_pop(c)) {
+            if (strcmp(c.k, "led") == 0) { if (c.v > 0.5f) id(presence_led).turn_on(); else id(presence_led).turn_off(); continue; }
+            esphome::number::Number *n = strcmp(c.k, "cd") == 0 ? (esphome::number::Number *) id(clear_delay) : strcmp(c.k, "sh") == 0 ? (esphome::number::Number *) id(still_hold) :
+              strcmp(c.k, "mr") == 0 ? (esphome::number::Number *) id(max_range) : strcmp(c.k, "lb") == 0 ? (esphome::number::Number *) id(led_blue_hold) : (esphome::number::Number *) id(dark_threshold);
+            ESP_LOGI("mr60_web", "set %s = %g", c.k, c.v);
+            n->make_call().set_value(c.v).perform();
+          }
+          uint32_t now = millis();
+          int32_t gap = (int32_t) (id(last_seen_ms) - id(last_move_ms));
+          MwState s{};
+          s.name = App.get_friendly_name().c_str(); s.st = id(radar_status).state.c_str(); s.vit = id(vitals).state.c_str(); s.ps = mw_still_preset(id(still_hold).state);
+          s.occ = id(occupied).state; s.mv = id(target_moving).state; s.raw = id(radar_target).state; s.brd = id(breathing).state; s.hung = id(hung); s.stat = id(stuck);
+          s.off = id(radar_offline).state; s.dark = id(dark).state; s.led = id(presence_led).state; s.ledmv = id(led_moving).state;
+          s.wm = id(last_move_ms) != 0 && gap >= 0 && gap < 5000;
+          s.d = id(radar_distance).get_raw_state(); s.t = id(radar_targets).get_raw_state(); s.br = id(breath_rate_raw).get_raw_state(); s.hr = id(heart_rate_raw).get_raw_state();
+          s.lux = id(lux).state;
+          s.seen = id(last_seen_ms) ? (now - id(last_seen_ms)) / 1000.0f : NAN; s.since = id(last_seen_ms) ? s.seen : now / 1000.0f;
+          s.fps = id(radar_fps).state; s.pps = id(phase_fps).state; s.rs = id(reset_count); s.up = now / 1000.0f; s.rssi = id(s_rssi).state;
+          s.cd = id(clear_delay).state; s.sh = id(still_hold).state; s.mr = id(max_range).state; s.lb = id(led_blue_hold).state; s.dt = id(dark_threshold).state;
+          mw_publish(s);
+  - interval: 1s
+    then:
+      - lambda: |-
+          const char *wp = mw_web_state(), *sp = mw_still_preset(id(still_hold).state);
+          if (id(web_page).state != wp) id(web_page).publish_state(wp);
+          if (id(still_preset).state != sp) id(still_preset).publish_state(sp);
+  - interval: 10s
+    then:
+      - lambda: mw_start();
   # v1.3: Occupied clears here, not from a timer - no stale timeouts to cancel
   - interval: 1s
     then:
@@ -518,16 +566,16 @@ interval:
     then:
       - lambda: |-
           float br = id(breath_rate_raw).get_raw_state(), hr = id(heart_rate_raw).get_raw_state();
-          float d_ft = id(radar_distance).get_raw_state() / 30.48f;
+          float d_m = id(radar_distance).get_raw_state() / 100.0f;
           char buf[64]; std::string st;
           if (!id(occupied).state) {
             st = "No target";
           } else if (br > 0.0f && hr > 0.0f) {
             st = "Breathing + heart";
           } else if (br > 0.0f) {
-            st = "Breathing only (heart needs <= 5 ft)";
-          } else if (d_ft > 5.0f) {
-            snprintf(buf, sizeof(buf), "Too far - %.1f ft (vitals need <= 5 ft)", d_ft);
+            st = "Breathing only (heart needs <= 1.5 m)";
+          } else if (d_m > 1.5f) {
+            snprintf(buf, sizeof(buf), "Too far - %.1f m (vitals need <= 1.5 m)", d_m);
             st = buf;
           } else {
             st = "Settling - hold still ~60 s";
@@ -544,6 +592,18 @@ text_sensor:
     id: radar_status
     name: "Radar status"
     icon: mdi:radar
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: web_page
+    name: "Web page"
+    icon: mdi:web
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: still_preset
+    name: "Still preset"
+    icon: mdi:sofa
     entity_category: diagnostic
     update_interval: never
 
@@ -752,6 +812,7 @@ sensor:
       return (millis() - id(last_seen_ms)) / 1000.0f;   // v1.7: nobody since boot counts from boot
 
   - platform: wifi_signal
+    id: s_rssi
     name: "WiFi RSSI"
     update_interval: 60s
     entity_category: diagnostic

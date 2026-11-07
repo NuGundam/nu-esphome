@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Presence-24GHz-2  v1.9 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# NU-Presence-24GHz-2  v1.10 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
 # ESP32-C3-MINI, LD2450 on UART 20/21, WS2812 on GPIO3, buzzer on GPIO10. Pins from
 # github.com/ApolloAutomation/MTR-1 (Integrations/ESPHome/Core.yaml).
 # v1.1: motion only, at the user's request. The LTR-390 / DPS310 I2C sensors are gone (they failed on this unit:
@@ -15,6 +15,9 @@
 #     countdowns carry on); after a power cut nobody is tracked until they move. Radar silent for 2 s (last_rx_ms) =
 #     slots read as empty, because the driver leaves its sensors at their last values.
 #   * Target count, Target N distance in metres; an empty slot reads 0.0 (v1.2, the driver sends unknown).
+#     v1.10: the driver sends that unknown ONCE, and throttle_average then averaged the single 0 into the last real
+#     readings and heard nothing more, so the slot stuck on the old distance until the next target. heartbeat keeps
+#     feeding it the current value, so the next 2 s window is all zeros.
 #     Target N X / Y are on the device but disabled in HA by default (they change constantly); the tuning page
 #     shows them live anyway. device_class is blanked on these so HA
 #     does not convert them to feet on a US unit system: they stay metres with no registry override.
@@ -24,6 +27,8 @@
 #     Filter = it ignores targets inside them (a fan, a curtain, the TV wall).
 #   * Tuning page http://<device-ip>:8080/ (radar_web_2450.h, up 70 s after boot): live targets with trails on a top-down room map,
 #     drag a rectangle to set a zone, all in metres. The raw zone numbers are millimetres, so they stay internal.
+#     v1.10 "Web page" says Starting / Ready / Failed. "Still preset" and "Moving preset" name the preset the current
+#     numbers match, or Custom (radar_web_2450.h v1.5). Moving preset ignores range: the page takes that from its room box.
 #   * v1.4 Zone N X1 / Y1 / X2 / Y2: the same zone edges as metre boxes in HA. Each one reads the radar's stored
 #     value every 5 s and writes through to the internal mm number, so HA and the page stay in step. X = sideways
 #     (0 = straight ahead), Y = forward from the sensor; X1 / Y1 is one corner, X2 / Y2 the opposite one. All four 0 =
@@ -173,6 +178,16 @@ interval:
       - lambda: |-
           id(radar_bps).publish_state(id(rx_bytes) / 5.0f);
           id(rx_bytes) = 0;
+  # v1.10: published only when they change
+  - interval: 1s
+    then:
+      - lambda: |-
+          const char *sp = rw_still_preset(id(still_hold).state);
+          const char *mp = rw_move_preset(id(mv_speed).state, id(mv_hold).state);
+          const char *wp = radar_web_state();
+          if (id(still_preset).state != sp) id(still_preset).publish_state(sp);
+          if (id(moving_preset).state != mp) id(moving_preset).publish_state(mp);
+          if (id(web_page).state != wp) id(web_page).publish_state(wp);
   # writes that came in over :8080 are performed here, on the main loop (doing them on the httpd task crashed 24GHz-1)
   - interval: 100ms
     then:
@@ -280,19 +295,19 @@ sensor:
         - delta: 0.5
     # the driver publishes mm at ~10 Hz and NaN for an empty slot (page reads raw); HA gets metres, empty = 0.0
     target_1:
-      x: {id: t1x, name: "Target 1 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
-      y: {id: t1y, name: "Target 1 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
-      distance: {name: "Target 1 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      x: {id: t1x, name: "Target 1 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
+      y: {id: t1y, name: "Target 1 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
+      distance: {name: "Target 1 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
       speed: {id: t1s, internal: true}
     target_2:
-      x: {id: t2x, name: "Target 2 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
-      y: {id: t2y, name: "Target 2 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
-      distance: {name: "Target 2 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      x: {id: t2x, name: "Target 2 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
+      y: {id: t2y, name: "Target 2 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
+      distance: {name: "Target 2 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
       speed: {id: t2s, internal: true}
     target_3:
-      x: {id: t3x, name: "Target 3 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
-      y: {id: t3y, name: "Target 3 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
-      distance: {name: "Target 3 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {throttle_average: 2s}, {delta: 0.1}]}
+      x: {id: t3x, name: "Target 3 X", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
+      y: {id: t3y, name: "Target 3 Y", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, disabled_by_default: true, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
+      distance: {name: "Target 3 distance", unit_of_measurement: "m", device_class: "", accuracy_decimals: 2, filters: [{lambda: 'return std::isnan(x) ? 0.0f : x;'}, {multiply: 0.001}, {heartbeat: 500ms}, {throttle_average: 2s}, {delta: 0.1}]}
       speed: {id: t3s, internal: true}
 
   - platform: template
@@ -694,6 +709,24 @@ text_sensor:
     id: led_state
     name: "Presence LED state"
     icon: mdi:led-on
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: web_page
+    name: "Web page"
+    icon: mdi:web
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: still_preset
+    name: "Still preset"
+    icon: mdi:seat-recline-normal
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: moving_preset
+    name: "Moving preset"
+    icon: mdi:speedometer
     entity_category: diagnostic
     update_interval: never
 

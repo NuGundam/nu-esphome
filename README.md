@@ -22,7 +22,7 @@ and failsafes for when Home Assistant goes away.
 | [`nu-aqi-1`, `2`, `4`, `5`, `6`](#nu-aqi-1-2-4-5-6) | Room air quality | ESP32-S3, SHT40, SGP41, SCD40 | Loft, Office 3, Bedroom 2, Master Bedroom, Office 2 |
 | [`nu-aqi-3`](#nu-aqi-3) | Room air quality with a web dashboard | Arduino Nano ESP32, SEN66 | Office 1 |
 | [`airgradient-loft`, `airgradient-kitchen`](#airgradient-loft-airgradient-kitchen) | AirGradient ONE on local firmware | AirGradient I-9PSL | Loft, Kitchen |
-| [`nu-presence-1`, `2`](#nu-presence-1-2) | 60 GHz presence, breathing and light | Seeed MR60BHA2 kit | Loft, not installed yet |
+| [`nu-presence-1`, `2`](#nu-presence-1-2) | 60 GHz presence, breathing and light, with a web page | Seeed MR60BHA2 kit | Loft, not installed yet |
 | [`nu-presence-24ghz-1`](#nu-presence-24ghz-1) | 24 GHz presence with a tuning page | Arduino Nano ESP32, LD2410C | Family Room |
 | [`nu-presence-24ghz-2`](#nu-presence-24ghz-2) | 24 GHz multi-person tracking with a room map | Apollo MTR-1, LD2450 | Upper Hallway |
 | [`nu-range-hood`](#nu-range-hood) | Three-speed kitchen hood | ESP32-S3, relays | Kitchen |
@@ -122,6 +122,7 @@ in [`common/mr60-presence-common.yaml`](common/mr60-presence-common.yaml).
 - `Breathing detected` is the strongest sign of a still person, within about 1.5 m.
 - Detects a stuck radar and resets it through the module's reset line.
 - `Dark` sensor with its own threshold, for light automations.
+- Page on port 8080 ([`mr60_web.h`](mr60_web.h)) with live distance, vitals, trends and every setting, with presets and examples.
 - Fixes the XIAO's RF switch at boot, which took Wi-Fi from -83 dBm to -39 dBm.
 
 `nu-presence-2` is written but not flashed yet.
@@ -150,6 +151,7 @@ they have to move.**
 - Tracks survive a restart or flash. A silent radar reads as an empty room instead of a stuck one.
 - `Zone 1-3` rectangles, drawn on the page or typed into Home Assistant.
 - Tuning page on port 8080 ([`radar_web_2450.h`](radar_web_2450.h)) with a live top-down map.
+- `Web page`, `Still preset` and `Moving preset` show the page's status and the current presets in Home Assistant.
 
 ---
 
