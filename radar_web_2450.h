@@ -1,6 +1,6 @@
 #pragma once
 // ─────────────────────────────────────────────────
-//  NU-Presence-24GHz-2  LD2450 tuning page  v1.5  (radar_web_2450.h)  2026-11-06
+//  NU-Presence-24GHz-2  LD2450 tuning page  v1.6  (radar_web_2450.h)  2026-11-06
 //
 //  Same structure as radar_web.h (24GHz-1): an IDF httpd on port 8080, one embedded page, small JSON endpoints.
 //
@@ -365,7 +365,10 @@ static void radar_web_register() {
     if (c.zt) { c.zt->add_on_state_callback([](size_t i) { rw_zt = (int) i; }); auto a = c.zt->active_index(); if (a.has_value()) rw_zt = (int) *a; }
   }
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.server_port = 8080; cfg.ctrl_port = 0; cfg.stack_size = 8192; cfg.max_uri_handlers = 6; cfg.max_open_sockets = 5; cfg.lru_purge_enable = true;
+  // ctrl_port must be a real port: 0 binds an ephemeral one but httpd still sends its work queue to port 0, so the LRU
+  // close never runs. With all 5 slots taken it then refuses every client and spins on the listen socket.
+  cfg.server_port = 8080; cfg.ctrl_port = 32769; cfg.stack_size = 8192; cfg.max_uri_handlers = 6; cfg.max_open_sockets = 5; cfg.lru_purge_enable = true;
+  cfg.keep_alive_enable = true; cfg.keep_alive_idle = 10; cfg.keep_alive_interval = 5; cfg.keep_alive_count = 3;   // a vanished browser frees its slot
   cfg.task_priority = 1;   // v1.1: same as ESPHome's loop task, so a spin here cannot starve it
   httpd_handle_t srv = nullptr; esp_err_t err = httpd_start(&srv, &cfg);
   if (err != ESP_OK) { rw_page = 2; ESP_LOGE("radar_web", "httpd_start failed: %s - will retry", esp_err_to_name(err)); return; }
