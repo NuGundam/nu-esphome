@@ -1,6 +1,8 @@
 #pragma once
 // ──────────────────────────────────────────────────────────────────
-//  NU-Presence-24GHz  radar tuning page  v1.8  (radar_web.h)  2026-11-05
+//  NU-Presence-24GHz  radar tuning page  v1.9  (radar_web.h)  2026-11-11
+//  v1.9: edit lock - the page opens locked (no writes, bars not draggable, chart scrolls);
+//        'Locked - tap to edit' unlocks for 2 min after the last edit. Used by NU-Presence-24GHz-1 + NU-Garage-1.
 //
 //  Same idea as NU-AQI-3's custom_web.h: an IDF httpd on port 8080 serving one
 //  embedded page plus small JSON endpoints, reading the ESPHome entities
@@ -89,6 +91,8 @@ html,body{overflow-x:hidden}.wrap{min-width:0}
 .gates b{display:block;color:var(--tx);font-size:12px}.gates div input{margin:2px 1px 0}
 .leg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--mut);margin-top:6px}.leg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 .help{color:var(--mut);font-size:12px;margin-top:8px;line-height:1.5}
+#lock{position:sticky;top:6px;z-index:5;margin:8px 0 2px;font-weight:700}#lock.un{background:#5a3a12;border-color:#a8721f;color:#ffd79a}
+input:disabled,select:disabled,button:disabled{opacity:.45;cursor:not-allowed}
 @media (max-width:640px){
  body{padding:8px 8px 24px;font-size:13px}h1{font-size:16px}h2{margin:14px 2px 6px}
  .card{padding:10px;border-radius:12px}.big{font-size:28px}.row{gap:8px 10px}
@@ -100,6 +104,7 @@ html,body{overflow-x:hidden}.wrap{min-width:0}
 }
 </style></head><body><div class="wrap">
 <h1 id="ttl">Radar tuning</h1><div class="sub" id="meta">connecting&hellip;</div>
+<button id="lock">&#128274; Locked &ndash; tap to edit</button>
 
 <h2>Live</h2><div class="card"><div class="row">
 <div><div class="big" id="dist">&mdash;</div><div class="sub">target distance</div></div>
@@ -163,9 +168,17 @@ $('room_w').value=room.w/100; $('room_d').value=room.d/100; $('mount').value=roo
 const saveRoom=()=>{ room.w=Math.round(+$('room_w').value*100)||400; room.d=Math.round(+$('room_d').value*100)||400; room.mount=$('mount').value; try{ localStorage.setItem('radarRoom',JSON.stringify(room)); }catch(e){} if(D) fan(); };
 for (const k of ['room_w','room_d','mount']) $(k).addEventListener('change',saveRoom);
 let suggMax=8; $('applyMax').onclick=async()=>{ await setv('maxm',suggMax); await new Promise(r=>setTimeout(r,200)); await setv('maxs',suggMax); };
-const setv=async(k,v)=>{ busy++; try{ await fetch('/set?k='+k+'&v='+encodeURIComponent(v),{signal:AbortSignal.timeout(4000)});}catch(e){} busy--; };
+/* v1.9 edit lock: opens locked; unlocked for 2 min after the last edit */
+let unlocked=false, relockT=0;
+const lockIds=()=>numKeys.concat(['maxm','maxs','eng','apply','applyMax']).concat([...Array(N).keys()].flatMap(i=>['gm'+i,'gs'+i]));
+function applyLock(){ for(const id of lockIds()){ const el=$(id); if(el) el.disabled=!unlocked; }
+  $('gates').style.touchAction=unlocked?'none':'auto'; $('gates').style.cursor=unlocked?'':'default';
+  const b=$('lock'); b.classList.toggle('un',unlocked); b.innerHTML=unlocked?'&#128275; Editing &ndash; locks again 2 min after the last change (tap to lock)':'&#128274; Locked &ndash; tap to edit'; }
+function setLock(u){ unlocked=u; clearTimeout(relockT); if(u) relockT=setTimeout(()=>{ drag=null; setLock(false); },120000); applyLock(); }
+$('lock').onclick=()=>setLock(!unlocked);
+const setv=async(k,v)=>{ if(!unlocked) return; setLock(true); busy++; try{ await fetch('/set?k='+k+'&v='+encodeURIComponent(v),{signal:AbortSignal.timeout(4000)});}catch(e){} busy--; };
 for (const k of numKeys.concat(['maxm','maxs'])) $(k).addEventListener('change',e=>setv(k,e.target.value));
-$('eng').addEventListener('change',e=>fetch('/sw?k=eng&v='+(e.target.checked?1:0)));
+$('eng').addEventListener('change',e=>{ if(!unlocked){ e.target.checked=!e.target.checked; return; } setLock(true); fetch('/sw?k=eng&v='+(e.target.checked?1:0)); });
 $('rst').onclick=()=>{peakM.fill(0);peakS.fill(0);};
 $('apply').onclick=async()=>{ const m=+$('margin').value||0; for(let i=0;i<N;i++){ await setv('gm'+i,Math.min(100,Math.round(peakM[i]+m))); await new Promise(r=>setTimeout(r,150)); await setv('gs'+i,Math.min(100,Math.round(peakS[i]+m))); await new Promise(r=>setTimeout(r,150)); } };
 const fmt=v=>v==null||isNaN(v)?'—':(v/100).toFixed(2)+' m';
@@ -219,10 +232,11 @@ function gates(){ const el=$('gates'), W=Math.max(280,Math.round(el.clientWidth|
     s+=`<rect data-i="${i}" data-k="gm" x="${x0}" y="${T}" width="${iw/2}" height="${B-T}" fill="transparent" style="cursor:ns-resize"/><rect data-i="${i}" data-k="gs" x="${x0+iw/2}" y="${T}" width="${iw/2}" height="${B-T}" fill="transparent" style="cursor:ns-resize"/>`; }
   $('gates').innerHTML=s; }
 let tabGl=0; function gtab(){ if($('gtab').children.length&&tabGl===gl) return; tabGl=gl; let s=''; for(let i=0;i<N;i++) s+=`<div><b>g${i}</b><span class="rg">${(i*gl/100).toFixed(2)}&ndash;${((i+1)*gl/100).toFixed(2)} m</span><span class="rs">&le;${((i+1)*gl/100).toFixed(2)}</span><input class="g" type="number" id="gm${i}" min="0" max="100" title="move threshold"><input class="g" type="number" id="gs${i}" min="0" max="100" title="still threshold"></div>`; $('gtab').innerHTML=s;
-  for(let i=0;i<N;i++) for(const k of ['gm','gs']) $(k+i).addEventListener('change',e=>setv(k+i,e.target.value)); }
+  for(let i=0;i<N;i++) for(const k of ['gm','gs']) $(k+i).addEventListener('change',e=>setv(k+i,e.target.value)); applyLock(); }
 const sv=$('gates'); const yv=e=>{ const p=sv.createSVGPoint(); p.x=e.clientX; p.y=e.clientY; const y=p.matrixTransform(sv.getScreenCTM().inverse()).y; return Math.round(Math.max(0,Math.min(100,(196-y)/(196-12)*100))); };
-sv.addEventListener('pointerdown',e=>{ const t=e.target; if(!t.dataset.k) return; drag={i:+t.dataset.i,k:t.dataset.k,v:yv(e)}; sv.setPointerCapture(e.pointerId); gates(); });
+sv.addEventListener('pointerdown',e=>{ const t=e.target; if(!unlocked||!t.dataset.k) return; drag={i:+t.dataset.i,k:t.dataset.k,v:yv(e)}; sv.setPointerCapture(e.pointerId); gates(); });
 sv.addEventListener('pointermove',e=>{ if(!drag) return; drag.v=yv(e); gates(); });
+sv.addEventListener('pointercancel',()=>{ drag=null; if(D) gates(); });
 sv.addEventListener('pointerup',async e=>{ if(!drag) return; const d=drag; drag=null; $(d.k+d.i).value=d.v; await setv(d.k+d.i,d.v); });
 function fill(id,v){ const el=$(id); if(document.activeElement===el||busy) return; if(el.type==='checkbox') el.checked=!!v; else el.value=v==null?'':cmKeys.includes(id)?+(v/100).toFixed(2):Math.round(v); }
 function render(){ gl=(D.res||'').startsWith('0.2')?20:75; gtab(); buildMax();
@@ -236,7 +250,7 @@ function render(){ gl=(D.res||'').startsWith('0.2')?20:75; gtab(); buildMax();
 async function poll(){ try{ const r=await fetch('/data.json',{cache:'no-store',signal:AbortSignal.timeout(3000)}); D=await r.json(); render(); }catch(e){ $('meta').textContent='no answer from the device'; } }
 $('rq').onclick=()=>fetch('/sw?k=query&v=1');
 let rzT=0; addEventListener('resize',()=>{ clearTimeout(rzT); rzT=setTimeout(()=>{ if(D){ fan(); axis(); gates(); } },120); });
-poll(); setInterval(poll,1000);
+applyLock(); poll(); setInterval(poll,1000);
 </script></div></body></html>
 )ESPH";
 

@@ -1,5 +1,5 @@
 # =======================================================
-# MR60-PRESENCE-COMMON v1.18 - shared package for the Seeed MR60BHA2 mmWave kits
+# MR60-PRESENCE-COMMON v1.20 - shared package for the Seeed MR60BHA2 mmWave kits
 # (XIAO ESP32-C6 + MR60BHA2 60 GHz radar + BH1750 lux + 1x WS2812)
 #
 # Each device's yaml sets substitutions and includes this file:
@@ -46,6 +46,21 @@
 #     raw value stays bit-identical for 3 min (2026-10-30 21:38-21:56 the
 #     module froze repeating breath 22.33 / 65.5 cm on an empty loft) -> Occupied
 #     cleared, radar reset automatically, retried every 5 min while stuck.
+#   * v1.20 (2026-11-09): an exit track now also RESETS the radar module (at most once per 5 min). The frozen track
+#     blinds the module: the 11-08 23:54 exit track held bit-for-bit for 17 h, a person in the TV loft 16:57-17:21 on
+#     11-09 (Meross) was never reported, and when they left the track jumped 5.7 cm (1.49 -> 1.55 m, no movement
+#     flag), which ended the exit track, turned Occupied on and froze again for 100+ min. A manual reset at 19:04
+#     dropped that phantom in 5 s (no target, phase frames back at 10/s). After the reset the module starts clean, so
+#     the next person is acquired normally instead of having to disturb a stale track. Not a reset on a mere static
+#     target (v1.10: a still person is lost for ~17 min after a reset) - only once the exit rule has already cleared
+#     Occupied. "Exit track" is published off at boot (was unknown). "Dark" lost device_class light (HA showed
+#     "Light detected" while dark); its on/off state is unchanged.
+#   * v1.19: exit tracks. The module keeps reporting a target, frozen bit-for-bit, after someone walks out (2026-11-07
+#     23:11 the user left the couch, track froze at 1.49 m, Occupied stayed on; 11-03, 11-05 and 11-06 it held 9-11 h
+#     overnight). People sit at ~1.66 m and leave past the sensor, so a track that freezes right after moving toward
+#     the sensor short of "Exit zone" (default 1.6 m), or anywhere under 1 m, is ignored once frozen for "Exit hold"
+#     (default 60 s): Occupied clears, "Exit track" turns on, and any change from the radar ends it. Exit zone 0.5 m
+#     turns the rule off. Page: movement trend (cm per second vs the 15 cm Moving line) and both settings.
 #   * v1.18: mdns_web_slot, so _esphomelib survives beside the USE_WEBSERVER _http service (Device Builder sees the hash).
 #   * v1.17: LED blue 15 -> 40 % so it reads as bright as the green (blue at 15 % looked off), movement
 #     threshold 25 -> 15 cm over 1 s (2026-11-06 seated test: user never saw blue; radial moves rarely passed 25 cm).
@@ -128,6 +143,7 @@ esphome:
     - priority: 600            # outputs are ready; radar reset before Wi-Fi comes up
       then:
         - lambda: id(occupied).publish_state(false);   # v1.7 known state from boot
+        - lambda: id(exit_track).publish_state(false);  # v1.20 known state from boot
         - script.execute: radar_reset
     - priority: -100
       then:
@@ -272,6 +288,26 @@ globals:
     type: float
     restore_value: no
     initial_value: '-1'
+  - id: burst_from_d          # v1.19: distance (cm) where the current movement burst started
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: exit_ghost            # v1.19: frozen track judged to be someone who walked out - ignored until it changes
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: ghost_d               # v1.19: distance (cm) the exit track froze at
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: mv_peak               # v1.19: biggest move (cm vs the 1 s reference) in the current second, for the page
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: mv_last               # v1.19: same, last completed second
+    type: float
+    restore_value: no
+    initial_value: '0'
   - id: last_change_ms        # last moment any raw radar value differed from the previous one
     type: uint32_t
     restore_value: no
@@ -320,6 +356,30 @@ globals:
 # TUNING (numbers survive reboots; set them from HA)
 # -------------------------------------------------------
 number:
+  - platform: template
+    id: exit_hold
+    name: "Exit hold"
+    icon: mdi:exit-run
+    unit_of_measurement: s
+    min_value: 10
+    max_value: 600
+    step: 10
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: exit_zone
+    name: "Exit zone"
+    icon: mdi:map-marker-distance
+    unit_of_measurement: m
+    min_value: 0.5
+    max_value: 6
+    step: 0.05
+    initial_value: 1.6
+    restore_value: true
+    optimistic: true
+    entity_category: config
   - platform: template
     id: led_blue_hold
     name: "LED blue hold"
@@ -431,6 +491,7 @@ script:
     then:
       - lambda: |-
           if (id(hung)) return;                        // v1.11: a dead DSP reports a stale target
+          if (id(exit_ghost)) return;                  // v1.19: frozen track of someone who walked out
           bool tgt = id(radar_raw).state;
           float d = id(radar_distance).get_raw_state(); // cm; 0 = no target
           float max_cm = id(max_range).state * 100.0f;
@@ -485,6 +546,8 @@ interval:
           MwCmd c;
           while (mw_pop(c)) {
             if (strcmp(c.k, "led") == 0) { if (c.v > 0.5f) id(presence_led).turn_on(); else id(presence_led).turn_off(); continue; }
+            if (strcmp(c.k, "eh") == 0) { id(exit_hold).make_call().set_value(c.v).perform(); continue; }
+            if (strcmp(c.k, "ez") == 0) { id(exit_zone).make_call().set_value(c.v).perform(); continue; }
             esphome::number::Number *n = strcmp(c.k, "cd") == 0 ? (esphome::number::Number *) id(clear_delay) : strcmp(c.k, "sh") == 0 ? (esphome::number::Number *) id(still_hold) :
               strcmp(c.k, "mr") == 0 ? (esphome::number::Number *) id(max_range) : strcmp(c.k, "lb") == 0 ? (esphome::number::Number *) id(led_blue_hold) : (esphome::number::Number *) id(dark_threshold);
             ESP_LOGI("mr60_web", "set %s = %g", c.k, c.v);
@@ -502,6 +565,7 @@ interval:
           s.seen = id(last_seen_ms) ? (now - id(last_seen_ms)) / 1000.0f : NAN; s.since = id(last_seen_ms) ? s.seen : now / 1000.0f;
           s.fps = id(radar_fps).state; s.pps = id(phase_fps).state; s.rs = id(reset_count); s.up = now / 1000.0f; s.rssi = id(s_rssi).state;
           s.cd = id(clear_delay).state; s.sh = id(still_hold).state; s.mr = id(max_range).state; s.lb = id(led_blue_hold).state; s.dt = id(dark_threshold).state;
+          s.gh = id(exit_ghost); s.eh = id(exit_hold).state; s.ez = id(exit_zone).state; s.mvc = id(mv_last);
           mw_publish(s);
   - interval: 1s
     then:
@@ -512,6 +576,35 @@ interval:
   - interval: 10s
     then:
       - lambda: mw_start();
+  # v1.19: exit track - a target frozen right after walking toward the sensor (short of Exit zone) or under 1 m
+  - interval: 1s
+    then:
+      - lambda: |-
+          id(mv_last) = id(mv_peak); id(mv_peak) = 0;
+          if (id(exit_ghost)) {
+            if (!id(radar_raw).state) { id(exit_ghost) = false; id(exit_track).publish_state(false); ESP_LOGI("radar", "exit track ended: radar dropped it"); }
+            return;
+          }
+          float latch = id(prev_raw_d);
+          if (!id(occupied).state || !id(radar_raw).state || id(last_change_ms) == 0 || latch <= 0.0f) return;
+          uint32_t now = millis(), frozen = now - id(last_change_ms);
+          if (frozen < (uint32_t) (id(exit_hold).state * 1000.0f)) return;
+          float zone = id(exit_zone).state * 100.0f;
+          int32_t after_move = (int32_t) (id(last_change_ms) - id(last_move_ms));
+          bool moved_in = id(last_move_ms) != 0 && after_move >= 0 && after_move <= 10000;
+          bool near = latch < fminf(100.0f, zone);
+          bool toward = moved_in && latch < zone && id(burst_from_d) - latch >= 10.0f;
+          if (!near && !toward) return;
+          id(exit_ghost) = true; id(ghost_d) = latch; id(exit_track).publish_state(true);
+          ESP_LOGI("radar", "exit track: frozen %lu s at %.0f cm (%s, burst from %.0f cm) - Occupied cleared until it changes",
+                   (unsigned long) (frozen / 1000), latch, near ? "under 1 m" : "moved toward the sensor", id(burst_from_d));
+          id(occupied).publish_state(false);
+          // v1.20: flush the frozen track so the module can see the next person (rate-limited: a reflection that
+          // comes straight back after a reset must not loop reset -> acquire -> exit track -> reset)
+          if ((now - id(last_reset_ms)) > 300000 && !id(radar_reset).is_running()) {
+            ESP_LOGI("radar", "exit track: resetting the radar to drop the frozen track");
+            id(radar_reset).execute();
+          }
   # v1.3: Occupied clears here, not from a timer - no stale timeouts to cancel
   - interval: 1s
     then:
@@ -649,6 +742,12 @@ binary_sensor:
       - script.execute: led_update
 
   - platform: template
+    id: exit_track
+    name: "Exit track"
+    icon: mdi:exit-run
+    entity_category: diagnostic
+
+  - platform: template
     id: target_moving
     name: "Target moving"
     device_class: motion
@@ -698,7 +797,7 @@ binary_sensor:
   - platform: template
     id: dark
     name: "Dark"
-    device_class: light
+    icon: mdi:weather-night
     lambda: |-
       float lx = id(lux).state, th = id(dark_threshold).state;
       if (std::isnan(lx)) return {};
@@ -724,8 +823,15 @@ sensor:
             id(last_frame_ms) = millis();
             id(frame_count) += 1;
             if (x != id(prev_raw_d)) { id(prev_raw_d) = x; id(last_change_ms) = millis(); }
+            // v1.19: an exit track ends as soon as the radar reports anything new
+            if (id(exit_ghost) && x > 0.0f && fabsf(x - id(ghost_d)) >= 1.0f) {
+              id(exit_ghost) = false; id(exit_track).publish_state(false);
+              ESP_LOGI("radar", "exit track ended: target moved to %.0f cm", x);
+            }
             if (x > 0.0f) {
+              if (id(ref_ms) != 0) { float dv = fabsf(x - id(ref_d)); if (dv > id(mv_peak)) id(mv_peak) = dv; }
               if (id(ref_ms) != 0 && fabsf(x - id(ref_d)) > 15.0f) {
+                if (id(last_move_ms) == 0 || millis() - id(last_move_ms) > 5000) id(burst_from_d) = id(ref_d);   // v1.19
                 id(last_move_ms) = millis(); id(ref_d) = x; id(ref_ms) = millis();
               } else if (id(ref_ms) == 0 || (millis() - id(ref_ms)) > 1000) {
                 id(ref_d) = x; id(ref_ms) = millis();

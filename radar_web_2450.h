@@ -1,12 +1,12 @@
 #pragma once
 // ─────────────────────────────────────────────────
-//  NU-Presence-24GHz-2  LD2450 tuning page  v1.6  (radar_web_2450.h)  2026-11-06
+//  NU-Presence-24GHz-2  LD2450 tuning page  v1.7  (radar_web_2450.h)  2026-11-08
 //
 //  Same structure as radar_web.h (24GHz-1): an IDF httpd on port 8080, one embedded page, small JSON endpoints.
 //
 //    /            live top-down map: up to 3 targets with trails, room box, zones you drag out with the mouse
 //    /data.json   live state + settings, polled twice a second
-//    /set?k=..&v= write a number (z1x1..z3y2 in mm, timeout, hold, mvs = Moving speed cm/s, mvr = Moving range m, mvh = Moving hold s, sth = Still hold s)
+//    /set?k=..&v= write a number (z1x1..z3y2 in mm, timeout, hold, mvs = Moving speed cm/s, mvr = Moving range m, mvh = Moving hold s, sth = Still hold s, igf / igt = Ignore from / to m)
 //    /sw?k=multi|zt&v=  multi target on/off, zone type 0/1/2
 //    /healthz     "OK"
 //
@@ -46,7 +46,7 @@
 struct RadarWebCfg {
   esphome::binary_sensor::BinarySensor *occ = nullptr, *mv = nullptr, *st = nullptr, *zn[3] = {};
   esphome::sensor::Sensor *tx[3] = {}, *ty[3] = {}, *ts[3] = {}, *count = nullptr, *uptime = nullptr, *rssi = nullptr;
-  esphome::number::Number *zc[3][4] = {}, *timeout = nullptr, *hold = nullptr, *mvs = nullptr, *mvr = nullptr, *mvh = nullptr, *sth = nullptr;
+  esphome::number::Number *zc[3][4] = {}, *timeout = nullptr, *hold = nullptr, *mvs = nullptr, *mvr = nullptr, *mvh = nullptr, *sth = nullptr, *igf = nullptr, *igt = nullptr;
   esphome::binary_sensor::BinarySensor *mvraw = nullptr, *occraw = nullptr;
   esphome::switch_::Switch *multi = nullptr;
   esphome::select::Select *zt = nullptr;
@@ -148,6 +148,8 @@ table{border-collapse:collapse;width:100%;font-size:13px}th{color:var(--mut);fon
 <div><div class="big" id="prN">&mdash;</div><div class="sub">people tracked</div></div>
 <div><div class="big" id="prS" style="font-size:22px;line-height:34px">&mdash;</div><div class="sub" id="prL">radar status</div></div>
 <label>Still hold s<input type="number" id="sth" min="30" max="3600" step="10"></label>
+<label>Ignore from m<input type="number" id="igf" min="0" max="7.5" step="0.05"></label>
+<label>Ignore to m<input type="number" id="igt" min="0" max="7.5" step="0.05"></label>
 <div><div class="big" id="phC" style="font-size:22px;line-height:34px">&mdash;</div><div class="sub">current preset</div></div>
 </div>
 <div class="row" style="margin-top:10px"><span class="sub">Presets:</span>
@@ -160,7 +162,10 @@ the moment they disappeared has walked out, and clears after <b>Clear delay</b> 
 Longer never affects someone who walks out normally, it only sets how long Occupied can stay on if they slip out unseen.<br>
 A target only counts once it has moved, so a grey dot on the map is a return that never moved: the radar reports it, Occupied ignores it. That also means
 that after a power cut a seated person is not counted until they move; a restart or a flash keeps them. <b>Moving speed</b> and <b>Moving range</b> below decide what counts as moving, so they
-affect Occupied too: a high Moving speed makes it slower to notice someone.</div>
+affect Occupied too: a high Moving speed makes it slower to notice someone.<br>
+<b>Ignore from / to</b>: targets this far from the sensor (the red band on the map) are not counted at all, so a reflection that sits there cannot
+hold Occupied on. The office has one at about 4.4 m, so the default is 3.75 to 5.05 m. Anyone in the band is picked up again as soon as they step out of it.
+Set both to 0 to turn it off.</div>
 </div>
 
 <h2>Moving target</h2><div class="card">
@@ -220,7 +225,7 @@ for(let i=0;i<3;i++){$('d'+i).addEventListener('click',()=>{draw=draw===i?-1:i;f
 let tb='';for(let i=0;i<3;i++){tb+=`<tr><td><span class="dot" style="background:${ZC[i]}"></span>Zone ${i+1}</td>`;for(let j=0;j<4;j++)tb+=`<td><input type="number" id="z${i}${j}" step="0.05" min="-6" max="8"></td>`;tb+=`<td><button id="zc${i}">Clear</button></td></tr>`;}$('zt').innerHTML=tb;
 for(let i=0;i<3;i++){for(let j=0;j<4;j++)$('z'+i+j).addEventListener('change',e=>setv('z'+(i+1)+'xyxy'[j]+(j<2?1:2),Math.round(e.target.value*1000)));$('zc'+i).addEventListener('click',()=>setZone(i,[0,0,0,0]));}
 $('ztype').addEventListener('change',e=>setw('zt',e.target.value));$('multi').addEventListener('change',e=>setw('multi',e.target.checked?1:0));
-for(const k of ['timeout','hold','mvs','mvr','mvh','sth'])$(k).addEventListener('change',e=>setv(k,e.target.value));
+for(const k of ['timeout','hold','mvs','mvr','mvh','sth','igf','igt'])$(k).addEventListener('change',e=>setv(k,e.target.value));
 [60,300,900,1800].forEach((v,i)=>$('ph'+i).addEventListener('click',()=>setv('sth',v)));
 const owned=t=>D&&(D.trk||[]).some(k=>Math.hypot(k[0]-t[0],k[1]-t[1])<1000);const mmss=s=>Math.floor(s/60)+':'+String(Math.round(s%60)).padStart(2,'0');
 const roomRange=()=>Math.min(7.5,Math.max(0.5,Math.round((store.mount==='corner'?Math.hypot(store.w,store.d):store.d)*10)/10));
@@ -232,6 +237,7 @@ function map(){const el=$('map'),pts=roomPts(),W=Math.max(280,Math.round(el.clie
  const pt=(r,a)=>[cx+r*sc*Math.sin(a),cy-r*sc*Math.cos(a)];
  const [ax,ay]=pt(R,-HALF),[bx,by]=pt(R,HALF);s+=`<path d="M ${cx} ${cy} L ${ax} ${ay} A ${R*sc} ${R*sc} 0 0 1 ${bx} ${by} Z" fill="#ffffff07" stroke="#ffffff22"/>`;
  for(let m=1;m<=6;m++){const r=m*1000,[p,q]=pt(r,-HALF),[u,v]=pt(r,HALF);s+=`<path d="M ${p} ${q} A ${r*sc} ${r*sc} 0 0 1 ${u} ${v}" fill="none" stroke="#ffffff18"/><text x="${u+4}" y="${v}" font-size="10" fill="#6d7d92">${m} m</text>`;}
+ if(D&&D.n.igf!=null&&D.n.igt!=null&&D.n.igt>D.n.igf){const r0=D.n.igf*1000,r1=Math.min(D.n.igt*1000,R),[a0,b0]=pt(r0,-HALF),[a1,b1]=pt(r0,HALF),[c0,d0]=pt(r1,HALF),[c1,d1]=pt(r1,-HALF);if(r1>r0)s+=`<path d="M ${a0} ${b0} A ${r0*sc} ${r0*sc} 0 0 1 ${a1} ${b1} L ${c0} ${d0} A ${r1*sc} ${r1*sc} 0 0 0 ${c1} ${d1} Z" fill="#f8717126" stroke="#f8717166"/><text x="${c0+4}" y="${d0+12}" font-size="10" fill="#f87171">ignored ${D.n.igf}-${D.n.igt} m</text>`;}
  if(D&&D.n.mvr!=null){const yr=Y(D.n.mvr*1000),x0=X(-R*Math.sin(HALF)),x1=X(R*Math.sin(HALF));s+=`<line x1="${Math.min(x0,x1)}" y1="${yr}" x2="${Math.max(x0,x1)}" y2="${yr}" stroke="#4aa3ff" stroke-dasharray="5 4" opacity=".7"/><text x="${Math.min(x0,x1)+4}" y="${yr-4}" font-size="10" fill="#4aa3ff">moving range ${D.n.mvr} m</text>`;}
  D&&D.zc.forEach((z,i)=>{if(!z||(!z[0]&&!z[1]&&!z[2]&&!z[3]))return;const x0=Math.min(X(z[0]),X(z[2])),x1=Math.max(X(z[0]),X(z[2])),y0=Math.min(Y(z[1]),Y(z[3])),y1=Math.max(Y(z[1]),Y(z[3]));s+=`<rect x="${x0}" y="${y0}" width="${x1-x0}" height="${y1-y0}" fill="${ZC[i]}" opacity="${D.z[i]?.35:.16}" stroke="${ZC[i]}"/><text x="${x0+4}" y="${y0+13}" font-size="11" fill="#fff">Zone ${i+1}</text>`;});
  s+=`<polygon points="${pts.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ')}" fill="none" stroke="#f0c060" stroke-width="2" stroke-dasharray="6 4"/>`;
@@ -256,7 +262,7 @@ function render(){$('ttl').textContent=D.name+' - radar map';$('meta').textConte
  let tb='';D.t.forEach((t,i)=>{const on=t&&t[1]!=null;if(on){trails[i].push([t[0],t[1]]);if(trails[i].length>40)trails[i].shift();}else trails[i]=[];
   tb+=`<tr><td><span class="dot" style="background:${TC[i]}"></span>${i+1}</td><td>${on?m2(t[0]):'—'}</td><td>${on?m2(t[1]):'—'}</td><td>${on?m2(Math.hypot(t[0],t[1])):'—'}</td><td>${on?Math.round(Math.atan2(t[0],t[1])*180/Math.PI)+'&deg;':'—'}</td><td style="${mvQual(t)?'color:#4aa3ff;font-weight:700':''}">${on&&t[2]!=null?Math.abs(t[2])+' cm/s':'—'}</td></tr>`;});$('tt').innerHTML=tb;
  for(let i=0;i<3;i++)for(let j=0;j<4;j++)fill('z'+i+j,D.zc[i]?D.zc[i][j]:null,v=>+(v/1000).toFixed(2));
- fill('timeout',D.n.timeout);fill('hold',D.n.hold);fill('mvs',D.n.mvs);fill('mvr',D.n.mvr);fill('mvh',D.n.mvh);fill('sth',D.n.sth);fill('multi',D.multi);if(D.zt>=0)fill('ztype',D.zt);if(!rub)map();}
+ fill('timeout',D.n.timeout);fill('hold',D.n.hold);fill('mvs',D.n.mvs);fill('mvr',D.n.mvr);fill('mvh',D.n.mvh);fill('sth',D.n.sth);fill('igf',D.n.igf);fill('igt',D.n.igt);fill('multi',D.multi);if(D.zt>=0)fill('ztype',D.zt);if(!rub)map();}
 async function poll(){try{const r=await fetch('/data.json',{cache:'no-store',signal:AbortSignal.timeout(3000)});D=await r.json();render();}catch(e){$('meta').textContent='no answer from the device';}}
 window.addEventListener('resize',()=>{if(D)map();});poll();setInterval(poll,500);
 </script></body></html>)ESPH";
@@ -288,7 +294,9 @@ static esp_err_t rw_data(httpd_req_t *req) {
   o += ",\"mvs\":"; rw_num(o, (c.mvs && c.mvs->has_state()) ? c.mvs->state : NAN);
   o += ",\"mvr\":"; rw_num(o, (c.mvr && c.mvr->has_state()) ? c.mvr->state : NAN);
   o += ",\"mvh\":"; rw_num(o, (c.mvh && c.mvh->has_state()) ? c.mvh->state : NAN);
-  o += ",\"sth\":"; rw_num(o, (c.sth && c.sth->has_state()) ? c.sth->state : NAN); o += "},";
+  o += ",\"sth\":"; rw_num(o, (c.sth && c.sth->has_state()) ? c.sth->state : NAN);
+  o += ",\"igf\":"; rw_num(o, (c.igf && c.igf->has_state()) ? c.igf->state : NAN);
+  o += ",\"igt\":"; rw_num(o, (c.igt && c.igt->has_state()) ? c.igt->state : NAN); o += "},";
   // presence tracks: x mm, y mm, state 0 in view / 1 held still / 2 walked out, seconds left
   { uint32_t now = millis(); o += "\"trk\":["; bool first = true;
     for (const auto &t : pr_t) { PrTrack k = t; if (!k.used) continue; uint32_t age = now - k.seen;
@@ -321,6 +329,8 @@ static esphome::number::Number *rw_find(const char *k) {
   if (strcmp(k, "mvr") == 0) return c.mvr;
   if (strcmp(k, "mvh") == 0) return c.mvh;
   if (strcmp(k, "sth") == 0) return c.sth;
+  if (strcmp(k, "igf") == 0) return c.igf;
+  if (strcmp(k, "igt") == 0) return c.igt;
   if (k[0] == 'z' && k[1] >= '1' && k[1] <= '3' && (k[2] == 'x' || k[2] == 'y') && (k[3] == '1' || k[3] == '2') && k[4] == 0)
     return c.zc[k[1] - '1'][(k[3] - '1') * 2 + (k[2] == 'y' ? 1 : 0)];
   return nullptr;

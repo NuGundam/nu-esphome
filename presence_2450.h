@@ -1,6 +1,6 @@
 #pragma once
 // ─────────────────────────────────────────────────
-//  NU-Presence-24GHz-2  still presence for the LD2450  v1.1  (presence_2450.h)  2026-11-06
+//  NU-Presence-24GHz-2  still presence for the LD2450  v1.2  (presence_2450.h)  2026-11-08
 //
 //  The LD2450 tracks motion and has no micro-motion (breathing) detection, so it behaves badly in two ways:
 //    * a person sitting still fades out: lost at 2.42 m, back at 2.32 m 89 s later, with nobody having moved
@@ -22,6 +22,11 @@
 //    reboot  tracks are copied to RTC memory every tick and put back at boot with their countdowns where they were
 //            (v1.1). Survives Restart, OTA, crashes; a power cut clears it (magic + checksum fail) and nobody is
 //            tracked until they move. A new build can move the block, which just reads as no snapshot.
+//
+//    ignore  (v1.2) a target whose distance from the sensor is inside Ignore from .. Ignore to is not read at all: it
+//            cannot start, follow or keep a track. Office 1 has a static ghost at 3.8-5.0 m that held Occupied for
+//            hours on 11-06, 11-07 and 11-08 (4,051 readings in the 4.5 m band with no office motion); a held track
+//            fed by it then never aged out. Both 0 = off.
 //
 //  Up to 3 tracks, one per person, so someone walking out does not clear someone still sitting there.
 //  Occupied = any track alive; Zone N = any track inside the zone.
@@ -87,10 +92,11 @@ static int pr_victim(const bool *taken, uint32_t now) {
 
 // x, y in mm and s in cm/s for the 3 radar slots, NaN when empty; ymax in mm; live = the radar is sending
 static void presence_tick(const float *x, const float *y, const float *s, bool live, float ymax, float smin,
-                          uint32_t clear_ms, uint32_t hold_ms, uint32_t now) {
+                          uint32_t clear_ms, uint32_t hold_ms, uint32_t now, float ign_lo = 0.0f, float ign_hi = 0.0f) {
   bool ok[3], moving[3], done[3] = {false, false, false}, taken[3] = {false, false, false};
   for (int i = 0; i < 3; i++) {
     ok[i] = live && !std::isnan(x[i]) && !std::isnan(y[i]) && y[i] > 0.0f && y[i] <= ymax;
+    if (ok[i] && ign_hi > ign_lo) { float r = hypotf(x[i], y[i]); if (r >= ign_lo && r <= ign_hi) ok[i] = false; }   // v1.2
     moving[i] = !std::isnan(s[i]) && fabsf(s[i]) >= smin;
   }
   for (int pass = 0; pass < 2; pass++) {         // 0 = tracks being followed, 1 = lost tracks

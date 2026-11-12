@@ -27,8 +27,8 @@
 #include <cmath>
 
 struct MwState {
-  bool occ, mv, raw, brd, hung, stat, off, dark, led, ledmv, wm;
-  float d, t, br, hr, lux, seen, since, fps, pps, rs, up, rssi, cd, sh, mr, lb, dt;
+  bool occ, mv, raw, brd, hung, stat, off, dark, led, ledmv, wm, gh;
+  float d, t, br, hr, lux, seen, since, fps, pps, rs, up, rssi, cd, sh, mr, lb, dt, eh, ez, mvc;
   const char *name, *st, *vit, *ps;
 };
 
@@ -62,13 +62,13 @@ static void mw_flag(std::string &o, const char *k, bool v) { o += "\""; o += k; 
 static void mw_str(std::string &o, const char *k, const char *v) { o += "\""; o += k; o += "\":\""; o += v; o += "\","; }
 
 static void mw_publish(const MwState &s) {
-  std::string o; o.reserve(640); o += "{";
+  std::string o; o.reserve(760); o += "{";
   mw_str(o, "name", s.name); mw_str(o, "ver", ESPHOME_VERSION); mw_str(o, "st", s.st); mw_str(o, "vit", s.vit); mw_str(o, "ps", s.ps);
   mw_flag(o, "occ", s.occ); mw_flag(o, "mv", s.mv); mw_flag(o, "raw", s.raw); mw_flag(o, "brd", s.brd); mw_flag(o, "hung", s.hung);
-  mw_flag(o, "stat", s.stat); mw_flag(o, "off", s.off); mw_flag(o, "dark", s.dark); mw_flag(o, "led", s.led); mw_flag(o, "ledmv", s.ledmv); mw_flag(o, "wm", s.wm);
+  mw_flag(o, "stat", s.stat); mw_flag(o, "off", s.off); mw_flag(o, "dark", s.dark); mw_flag(o, "led", s.led); mw_flag(o, "ledmv", s.ledmv); mw_flag(o, "wm", s.wm); mw_flag(o, "gh", s.gh);
   mw_num(o, "d", s.d); mw_num(o, "t", s.t); mw_num(o, "br", s.br); mw_num(o, "hr", s.hr); mw_num(o, "lux", s.lux); mw_num(o, "seen", s.seen); mw_num(o, "since", s.since);
   mw_num(o, "fps", s.fps); mw_num(o, "pps", s.pps); mw_num(o, "rs", s.rs); mw_num(o, "up", s.up); mw_num(o, "rssi", s.rssi);
-  mw_num(o, "cd", s.cd); mw_num(o, "sh", s.sh); mw_num(o, "mr", s.mr); mw_num(o, "lb", s.lb); mw_num(o, "dt", s.dt);
+  mw_num(o, "cd", s.cd); mw_num(o, "sh", s.sh); mw_num(o, "mr", s.mr); mw_num(o, "lb", s.lb); mw_num(o, "dt", s.dt); mw_num(o, "eh", s.eh); mw_num(o, "ez", s.ez); mw_num(o, "mvc", s.mvc);
   o.back() = '}';
   if (o.size() >= sizeof mw_snap) return;
   taskENTER_CRITICAL(&mw_mux);
@@ -122,7 +122,7 @@ svg{display:block;width:100%}
 <h2>Live</h2><div class="card"><div class="row">
 <div><div class="big" id="dist">&mdash;</div><div class="sub">distance, m</div></div>
 <div><div class="big" id="cnt">&mdash;</div><div class="sub">targets</div></div>
-<div><span class="pill" id="pOcc">Occupied</span> <span class="pill" id="pMv">Moving</span> <span class="pill" id="pSt">Still</span> <span class="pill" id="pBr">Breathing</span> <span class="pill" id="pRaw" title="the radar reports a target right now, held 2 s because the raw output blinks">radar raw target</span></div>
+<div><span class="pill" id="pOcc">Occupied</span> <span class="pill" id="pMv">Moving</span> <span class="pill" id="pSt">Still</span> <span class="pill" id="pBr">Breathing</span> <span class="pill" id="pGh" title="a frozen track left by someone who walked out past the sensor, ignored until it changes">exit track ignored</span> <span class="pill" id="pRaw" title="the radar reports a target right now, held 2 s because the raw output blinks">radar raw target</span></div>
 </div>
 <div class="sub" id="stat" style="margin-top:8px">&nbsp;</div>
 <svg id="strip" height="78" style="margin-top:8px"></svg>
@@ -140,9 +140,10 @@ svg{display:block;width:100%}
 
 <h2>Trends</h2><div class="card">
 <div class="tr"><div><b id="tD">&mdash;</b><span class="sub">distance, m</span></div><svg id="gD" height="64"></svg></div>
+<div class="tr"><div><b id="tM">&mdash;</b><span class="sub">movement, cm</span></div><svg id="gM" height="64"></svg></div>
 <div class="tr"><div><b id="tB">&mdash;</b><span class="sub">breaths</span></div><svg id="gB" height="64"></svg></div>
 <div class="tr"><div><b id="tH">&mdash;</b><span class="sub">heart</span></div><svg id="gH" height="64"></svg></div>
-<div class="help">The last 5 minutes since this page opened, kept in your browser only.</div>
+<div class="help">The last 5 minutes since this page opened, kept in your browser only. Movement is how far the target shifted each second; blue bars passed the 15 cm line that counts as Moving, and red shading is time an exit track was ignored.</div>
 </div>
 
 <h2>Occupied</h2><div class="card">
@@ -151,13 +152,16 @@ svg{display:block;width:100%}
 <div><div class="mid" id="phC">&mdash;</div><div class="sub">current preset</div></div>
 <label>Still hold s<input type="number" id="sh" min="10" max="900" step="10"></label>
 <label>Clear delay s<input type="number" id="cd" min="5" max="900" step="5"></label>
+<label>Exit hold s<input type="number" id="eh" min="10" max="600" step="10"></label>
+<label>Exit zone m<input type="number" id="ez" min="0.5" max="6" step="0.05"></label>
 </div>
 <div class="row" style="margin-top:10px"><span class="sub">Presets:</span>
 <button id="ph0">Hallway 30 s</button><button id="ph1">Room 60 s</button><button id="ph2">Couch or TV 300 s</button><button id="ph3">Bed 900 s</button>
 </div>
 <div class="help">Occupied turns on the moment the radar sees someone. When it loses them, how long it waits depends on what they were doing.<br>
 <b>Still hold</b>: they were still, so they probably just faded out. Set it longer than the longest gap you see while sitting: 30 s for a hallway, 60 s (default) for a room, 300 s for a couch or TV, 900 s for a bed. Longer never delays someone who walks out normally.<br>
-<b>Clear delay</b>: they moved in their last 5 seconds, so they probably left. 5 s (default) clears quickly, 30 s if lights go off too soon when you step out for a moment.</div>
+<b>Clear delay</b>: they moved in their last 5 seconds, so they probably left. 5 s (default) clears quickly, 30 s if lights go off too soon when you step out for a moment.<br>
+<b>Exit hold</b> and <b>Exit zone</b>: sometimes the radar keeps a frozen copy of someone who walked out, for hours. If the track stops changing right after they moved toward the sensor and it is closer than Exit zone, or anywhere under 1 m, Occupied clears after Exit hold seconds. Set Exit zone just short of where people sit (1.6 m default, the couch is about 1.66 m). Exit hold 60 s (default); longer if someone ever gets cleared while sitting forward. Exit zone 0.5 m turns this off.</div>
 </div>
 
 <h2>Range</h2><div class="card">
@@ -192,7 +196,7 @@ svg{display:block;width:100%}
 const $=id=>document.getElementById(id),MAXM=6,WIN=300;let D=null,busy=0,hist=[],lastS=0;
 const setv=async(k,v)=>{busy++;try{await fetch('/set?k='+k+'&v='+encodeURIComponent(v),{signal:AbortSignal.timeout(4000)});}catch(e){}busy--;};
 function fill(id,v){const el=$(id);if(document.activeElement===el||busy)return;if(el.type==='checkbox')el.checked=!!v;else el.value=v==null?'':v;}
-for(const k of ['sh','cd','mr','dt','lb'])$(k).addEventListener('change',e=>setv(k,e.target.value));
+for(const k of ['sh','cd','mr','dt','lb','eh','ez'])$(k).addEventListener('change',e=>setv(k,e.target.value));
 $('led').addEventListener('change',e=>setv('led',e.target.checked?1:0));
 [30,60,300,900].forEach((v,i)=>$('ph'+i).addEventListener('click',()=>setv('sh',v)));
 const mmss=s=>Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
@@ -208,18 +212,24 @@ function graph(id,key,c,lo,hi){const el=$(id),W=Math.max(200,Math.round(el.clien
  let a=lo,b=hi;for(const p of pts){a=Math.min(a,p[key]);b=Math.max(b,p[key]);}const Y=v=>H-5-(v-a)/((b-a)||1)*(H-10);let s=`<rect width="${W}" height="${H}" rx="4" fill="#ffffff07"/><text x="5" y="12" font-size="10" fill="#6d7d92">${Math.round(b*10)/10}</text><text x="5" y="${H-4}" font-size="10" fill="#6d7d92">${Math.round(a*10)/10}</text>`,seg=[],prev=0;
  const flush=()=>{if(seg.length>1)s+=`<polyline points="${seg.join(' ')}" fill="none" stroke="${c}" stroke-width="2"/>`;else if(seg.length)s+=`<circle cx="${seg[0].split(',')[0]}" cy="${seg[0].split(',')[1]}" r="2" fill="${c}"/>`;seg=[];};
  for(const p of hist){if(p[key]==null||p.t-prev>5000)flush();if(p[key]!=null)seg.push(X(p.t).toFixed(1)+','+Y(p[key]).toFixed(1));prev=p.t;}flush();el.setAttribute('viewBox',`0 0 ${W} ${H}`);el.innerHTML=s;}
+function mgraph(){const el=$('gM'),W=Math.max(200,Math.round(el.clientWidth||800)),H=64,now=Date.now(),X=t=>W-(now-t)/1000/WIN*W,TOP=60,Y=v=>H-5-Math.min(v,TOP)/TOP*(H-14),bw=Math.max(1.5,W/WIN-0.6);
+ let s=`<rect width="${W}" height="${H}" rx="4" fill="#ffffff07"/>`;
+ for(const p of hist)if(p.g)s+=`<rect x="${(X(p.t)-W/WIN).toFixed(1)}" y="0" width="${(W/WIN+0.6).toFixed(1)}" height="${H}" fill="#f8717122"/>`;
+ for(const p of hist)if(p.m!=null&&p.m>0.5){const y=Y(p.m);s+=`<rect x="${(X(p.t)-bw).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${(H-5-y).toFixed(1)}" fill="${p.m>=15?'#4aa3ff':'#6d7d92'}"/>`;}
+ const y15=Y(15);s+=`<line x1="0" y1="${y15}" x2="${W}" y2="${y15}" stroke="#4aa3ff" stroke-dasharray="4 3" stroke-width="1"/><text x="5" y="${y15-3}" font-size="10" fill="#4aa3ff">15 cm = Moving</text><text x="5" y="12" font-size="10" fill="#6d7d92">60+</text><text x="5" y="${H-4}" font-size="10" fill="#6d7d92">0</text>`;
+ el.setAttribute('viewBox',`0 0 ${W} ${H}`);el.innerHTML=s;}
 function render(){const d=dm(),br=pos(D.br),hr=pos(D.hr),now=Date.now();$('ttl').textContent=D.name+' - radar';
  $('meta').textContent=`ESPHome ${D.ver} · up ${Math.round((D.up||0)/60)} min · rssi ${D.rssi==null?'?':Math.round(D.rssi)} dBm`;
  $('dist').textContent=d==null?'—':d.toFixed(2);$('cnt').textContent=D.t==null?'—':Math.round(D.t);$('stat').textContent=D.st||'';
- for(const[p,v]of[['pOcc',D.occ],['pMv',D.occ&&D.mv],['pSt',D.occ&&!D.mv],['pBr',D.brd],['pRaw',D.raw],['pDk',D.dark]])$(p).classList.toggle('on',!!v);
+ for(const[p,v]of[['pOcc',D.occ],['pMv',D.occ&&D.mv],['pSt',D.occ&&!D.mv],['pBr',D.brd],['pRaw',D.raw],['pDk',D.dark]])$(p).classList.toggle('on',!!v);$('pGh').classList.toggle('bad',!!D.gh);
  for(const[p,v]of[['pOff',D.off],['pHung',D.hung]])$(p).classList.toggle('bad',!!v);$('pStat').classList.toggle('on',!!D.stat);
  $('brv').textContent=br==null?'—':Math.round(br);$('hrv').textContent=hr==null?'—':Math.round(hr);$('vit').textContent=D.vit||'—';
- {const hold=D.wm?D.cd:D.sh;if(!D.occ){$('prS').textContent='clear';$('prL').textContent=D.since==null?'nobody seen yet':'nobody for '+mmss(D.since);}else if(D.seen==null||D.seen<2){$('prS').textContent='in view';$('prL').textContent='radar can see them';}else{$('prS').textContent=mmss(Math.max(0,hold-D.seen));$('prL').textContent=D.wm?'moved then lost, clearing':'lost while still, holding';}}
+ {const hold=D.wm?D.cd:D.sh;if(D.gh){$('prS').textContent='clear';$('prL').textContent='exit track ignored';}else if(!D.occ){$('prS').textContent='clear';$('prL').textContent=D.since==null?'nobody seen yet':'nobody for '+mmss(D.since);}else if(D.seen==null||D.seen<2){$('prS').textContent='in view';$('prL').textContent='radar can see them';}else{$('prS').textContent=mmss(Math.max(0,hold-D.seen));$('prL').textContent=D.wm?'moved then lost, clearing':'lost while still, holding';}}
  for(let i=0;i<4;i++)$('ph'+i).classList.toggle('on',$('ph'+i).textContent===D.ps);$('phC').textContent=D.ps||'—';
  $('lux').textContent=D.lux==null?'—':Math.round(D.lux);{const p=$('pLed'),c=!D.led||!D.occ?'off':D.ledmv?'blue':'green';p.textContent='LED '+c;p.style.background=c==='blue'?'#1d3f66':c==='green'?'':'';p.style.color=c==='blue'?'#a8d2ff':'';p.classList.toggle('on',c==='green');}
  $('fps').textContent=D.fps==null?'—':Math.round(D.fps);$('pps').textContent=D.pps==null?'—':Math.round(D.pps);$('rs').textContent=D.rs==null?'—':D.rs;
- fill('sh',D.sh);fill('cd',D.cd);fill('mr',D.mr);fill('dt',D.dt);fill('lb',D.lb);fill('led',D.led);strip();
- if(now-lastS>=1000){lastS=now;hist.push({t:now,d,br,hr});hist=hist.filter(p=>now-p.t<WIN*1000);$('tD').textContent=d==null?'—':d.toFixed(2);$('tB').textContent=br==null?'—':Math.round(br);$('tH').textContent=hr==null?'—':Math.round(hr);graph('gD','d','#4aa3ff',0,3);graph('gB','br','#34d399',10,20);graph('gH','hr','#f0a0e0',60,80);}}
+ fill('sh',D.sh);fill('cd',D.cd);fill('mr',D.mr);fill('dt',D.dt);fill('lb',D.lb);fill('eh',D.eh);fill('ez',D.ez);fill('led',D.led);strip();
+ if(now-lastS>=1000){lastS=now;hist.push({t:now,d,br,hr,m:D.mvc,g:!!D.gh});hist=hist.filter(p=>now-p.t<WIN*1000);$('tD').textContent=d==null?'—':d.toFixed(2);$('tB').textContent=br==null?'—':Math.round(br);$('tH').textContent=hr==null?'—':Math.round(hr);graph('gD','d','#4aa3ff',0,3);$('tM').textContent=D.mvc==null?'—':Math.round(D.mvc);mgraph();graph('gB','br','#34d399',10,20);graph('gH','hr','#f0a0e0',60,80);}}
 async function poll(){try{const r=await fetch('/data.json',{cache:'no-store',signal:AbortSignal.timeout(3000)});D=await r.json();render();}catch(e){$('meta').textContent='no answer from the device';}}
 window.addEventListener('resize',()=>{if(D)strip();});poll();setInterval(poll,500);
 </script></body></html>)ESPH";

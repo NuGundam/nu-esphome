@@ -1,0 +1,963 @@
+# =======================================================
+# NU-Garage-1  v0.8 - garage air quality + motion
+# ESP32-S3 Super Mini + Sensirion SEN55 + HLK-LD2410C 24 GHz radar in the
+# garage_combo enclosure (SEN55 bay below, radar + ESP32 above).
+#
+# Built from two live configs so the logic matches what HA already uses:
+#   * SEN55 block, VOC/NOx tuning and the EPA PM AQI lambda: fresh-air-aqi
+#     (nu-esp32-s3-1.yaml), names without the fresh-air decorations.
+#   * Radar block: NU-Presence-24GHz-1 v1.13 - gate energies, two distance
+#     zones, tuning page on http://<ip>:8080/ (radar_web.h, same file).
+#
+# Wiring (ESP32-S3 Super Mini pin labels):
+#   SEN55 (JST GHR-06V cable, datasheet table 11)
+#     1 VDD  -> 5V           4.5-5.5 V, 63 mA running, 100 mA first minute
+#     2 GND  -> GND
+#     3 SDA  -> GPIO5        + 10 kOhm pull-up to 3V3 (datasheet section 6)
+#     4 SCL  -> GPIO4        + 10 kOhm pull-up to 3V3
+#     5 SEL  -> GND          must be low at power-up to select I2C
+#     6 NC   -> cut off
+#   LD2410C
+#     VCC -> 5V, GND -> GND
+#     RX  -> GPIO43 (board pin TX), TX -> GPIO44 (board pin RX), 256000 baud, 3.3 V logic
+#     (v0.3: the first build wired to the TX/RX pins, so the firmware moved; GPIO12/13 stay free)
+# v0.4 (2026-11-11): AQ-family entities as on fresh-air-aqi / NU-AQI - AQI AH / Dew Point / TVOC / NOx / PM
+#   status texts, WiFi Signal Quality, ESP32 Internal Temperature (F) + Unit Temperature Status; radar settings
+#   query retried at 60 s when the 20 s one got no answer.
+# v0.5 (2026-11-11): radar stall self-heal - 10 s with no radar bytes = module stuck in config mode (seen 15:06-15:33:
+#   it answered commands but sent no reports) -> send End-configuration; "Radar stall fixes" counts them.
+# v0.6 (2026-11-11): Engineering mode on by default (the module forgets it on a restart): turned on 25 s and 65 s
+#   after boot. Gate thresholds tuned the same day for the garage (stored in the module, see README "Radar tuning"):
+#   gate 1 move 100 = off (the unit sees itself there: constant 100 on the bench and in the garage), move 30/30/25/25/30/20
+#   on gates 3-8 (robot vac peaked at 18), still 50 on gate 3 and 100 = off on gates 4-8 (the vac reached 98).
+# v0.7 (2026-11-11): SEN55 temperature offset -3.6 C (self-heating in the enclosure: 72.5 F vs the garage THS 65.8 F with
+#   AH equal) - Temperature and Humidity are true readings now; AH / dew point unchanged.
+# v0.8 (2026-11-11): Moving target holds 5 s before off (it flipped every 1-3 s during a walk); gates 6/7 move 21.
+#     OUT -> not used
+#   GPIO48 = the board's WS2812 LED (presence colours, off by default)
+# Power: the 5V pin is the USB rail. SEN55 + radar + ESP32 draw about 0.3 A;
+# use a 5 V / 1 A supply and check the 5V pin stays at 4.6 V or more.
+#
+# Keys: same layout as nu-presence-24ghz-1.yaml. The live copy in
+# /config/esphome holds the real API key and hotspot password; this local
+# copy keeps placeholders. OTA reuses the API key (encryption: with no key).
+# =======================================================
+substitutions:
+  device_name: nu-garage-1
+  friendly_name: NU-Garage-1
+  api_key: !secret api_key
+  ap_ssid: "Nu-Garage-1 Hotspot"
+  ap_password: !secret ap_password
+
+packages:
+  wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power
+
+# Same as NU-Presence-24GHz-1: keeps _esphomelib in mDNS next to the _http
+# service from the USE_WEBSERVER flags, so the Device Builder sees the device.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mdns_web_slot]
+mdns_web_slot:
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - radar_web.h               # tuning page on :8080 (shared with NU-Presence-24GHz-1)
+  # HA's "Visit" link = http://<ip>:8080 (see esphome-visit-link note)
+  platformio_options:
+    build_flags:
+      - "-DUSE_WEBSERVER"
+      - "-DUSE_WEBSERVER_PORT=8080"
+  on_boot:
+    - priority: -100
+      then:
+        - script.execute: led_update
+        - lambda: 'id(radar_stall_fixes).publish_state(0);'
+        # the radar boots slower than the ESP; ask for its settings once it is surely up
+        - delay: 20s
+        - button.press: btn_query
+        - delay: 5s
+        - switch.turn_on: sw_eng        # v0.6: engineering mode on by default
+        # v0.4: the 20 s query got no answer on v0.3's first boot; ask once more if the firmware is still unknown
+        - delay: 35s
+        - if:
+            condition:
+              lambda: 'return !id(ts_fw).has_state() || id(ts_fw).state.empty();'
+            then:
+              - button.press: btn_query
+        - delay: 5s
+        - if:
+            condition:
+              switch.is_off: sw_eng
+            then:
+              - switch.turn_on: sw_eng  # v0.6: once more, in case the first one was lost
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  cpu_frequency: 80MHz          # one UART radar + one I2C sensor; runs cooler
+  framework:
+    type: esp-idf
+    advanced:
+      include_builtin_idf_components:   # radar_web.h runs its own httpd
+        - esp_http_server
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "16"     # API + OTA + mDNS + 5 httpd sockets
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: INFO
+  logs:
+    ld2410: WARN                   # the component logs every frame at DEBUG
+    sen5x: INFO
+
+api:
+  encryption:
+    key: ${api_key}
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 15min
+  ap:
+    ssid: ${ap_ssid}
+    password: ${ap_password}
+
+# no captive_portal: it holds LWIP sockets the :8080 page needs (as NU-Presence-24GHz-1)
+
+debug:
+  update_interval: 60s
+
+# -------------------------------------------------------
+# SEN55 on I2C (100 kHz max, datasheet section 6)
+# -------------------------------------------------------
+i2c:
+  sda: GPIO5
+  scl: GPIO4
+  frequency: 100kHz
+  scan: true
+  id: i2c0
+
+# -------------------------------------------------------
+# RADAR
+# -------------------------------------------------------
+uart:
+  id: uart_bus
+  tx_pin: GPIO43                # board pin TX -> radar RX
+  rx_pin: GPIO44                # board pin RX <- radar TX (frames seen here 2026-11-11)
+  baud_rate: 256000             # LD2410C factory default
+  parity: NONE
+  stop_bits: 1
+  debug:                        # v1.1: count RX bytes (the component still gets them); v1.3: hex dump removed
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 50ms
+    sequence:
+      - lambda: |-
+          id(rx_bytes) += bytes.size();
+
+globals:
+  - id: rx_bytes
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: raw_dist                  # v1.3: last target distance (cm) straight from the radar, before the recorder filters
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: stall_n                   # v0.5: consecutive silent 5-s windows
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: stall_fixes               # v0.5: End-configuration frames sent since boot
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          id(radar_bps).publish_state(id(rx_bytes) / 5.0f);
+          // v0.5 stall self-heal: the module reports ~10 frames/s unless it is in config mode
+          if (id(rx_bytes) == 0 && millis() > 30000) {
+            if (++id(stall_n) >= 2) {
+              static const uint8_t END_CFG[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFE, 0x00, 0x04, 0x03, 0x02, 0x01};
+              id(uart_bus).write_array(END_CFG, sizeof(END_CFG));
+              id(stall_fixes)++;
+              id(radar_stall_fixes).publish_state(id(stall_fixes));
+              ESP_LOGW("radar", "no radar bytes for 10 s - sent End-configuration (%d since boot)", id(stall_fixes));
+              id(stall_n) = 0;
+            }
+          } else {
+            id(stall_n) = 0;
+          }
+          id(rx_bytes) = 0;
+  # v1.6: writes that came in over :8080 are performed here, on the main loop (doing them on the httpd task crashed
+  # the ESP with a task watchdog - the ld2410 driver and its UART are not thread-safe)
+  - interval: 100ms
+    then:
+      - lambda: 'radar_web_pump();'
+  # v1.4: hand the entities to radar_web.h and start the httpd (returns at once when it is already running)
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto &c = radar_web_cfg();
+          c.dist = id(t_dist); c.mdist = id(m_dist); c.sdist = id(s_dist); c.men = id(m_en); c.sen = id(s_en);
+          c.occ = id(occupied); c.mv = id(bs_mv); c.st = id(bs_st); c.za = id(zone_a); c.zb = id(zone_b);
+          c.a_near = id(zone_a_near); c.a_far = id(zone_a_far); c.b_near = id(zone_b_near); c.b_far = id(zone_b_far);
+          c.edge = id(zone_edge); c.hold = id(zone_hold); c.maxm = id(n_maxm); c.maxs = id(n_maxs); c.timeout = id(n_timeout);
+          c.eng = id(sw_eng); c.res = id(sel_res); c.fw = id(ts_fw); c.uptime = id(s_uptime); c.rssi = id(s_rssi); c.query = id(btn_query);
+          esphome::sensor::Sensor *gm[9] = {id(gme0), id(gme1), id(gme2), id(gme3), id(gme4), id(gme5), id(gme6), id(gme7), id(gme8)};
+          esphome::sensor::Sensor *gs[9] = {id(gse0), id(gse1), id(gse2), id(gse3), id(gse4), id(gse5), id(gse6), id(gse7), id(gse8)};
+          esphome::number::Number *gmt[9] = {id(gmt0), id(gmt1), id(gmt2), id(gmt3), id(gmt4), id(gmt5), id(gmt6), id(gmt7), id(gmt8)};
+          esphome::number::Number *gst[9] = {id(gst0), id(gst1), id(gst2), id(gst3), id(gst4), id(gst5), id(gst6), id(gst7), id(gst8)};
+          for (int i = 0; i < 9; i++) { c.gm[i] = gm[i]; c.gs[i] = gs[i]; c.gmt[i] = gmt[i]; c.gst[i] = gst[i]; }
+          radar_web_register();
+
+ld2410:
+  id: radar
+  uart_id: uart_bus
+
+binary_sensor:
+  - platform: ld2410
+    has_target:
+      id: occupied
+      name: "Occupied"
+      device_class: occupancy
+      on_state:
+        - script.execute: led_update
+    has_moving_target:
+      id: bs_mv
+      name: "Moving target"
+      device_class: motion
+      filters:
+        - delayed_off: 5s          # v0.8: one clean on period per walk (raw flips every 1-3 s)
+      on_state:
+        - script.execute: led_update
+    has_still_target:
+      id: bs_st
+      name: "Still target"
+      icon: mdi:human-male
+
+  # v1.3 distance zones (see header). Evaluated every loop from raw_dist; hysteresis = Zone edge, hold = Zone hold.
+  - platform: template
+    id: zone_a
+    name: "Zone A"
+    device_class: occupancy
+    lambda: |-
+      if (!id(occupied).state) return false;
+      const float d = id(raw_dist) / 100.0f, h = id(zone_a).state ? id(zone_edge).state : 0.0f;
+      return d >= id(zone_a_near).state - h && d <= id(zone_a_far).state + h;
+    filters:
+      - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
+  - platform: template
+    id: zone_b
+    name: "Zone B"
+    device_class: occupancy
+    lambda: |-
+      if (!id(occupied).state) return false;
+      const float d = id(raw_dist) / 100.0f, h = id(zone_b).state ? id(zone_edge).state : 0.0f;
+      return d >= id(zone_b_near).state - h && d <= id(zone_b_far).state + h;
+    filters:
+      - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
+
+sensor:
+  # ---------------- SEN55 (copied from fresh-air-aqi, 2026-11-08) ----------------
+  - platform: sen5x
+    id: sen55
+    pm_1_0:
+      name: "PM 1.0"
+      id: pm_1_0
+      icon: "mdi:dots-circle"
+      filters:
+        - delta: 1.0
+    pm_2_5:
+      name: "PM 2.5"
+      id: pm_2_5
+      icon: "mdi:circle-medium"
+      filters:
+        - delta: 0.5     # 2026-10-10: was 1.0 (= 5.6 AQI steps in the Good band)
+    pm_4_0:
+      name: "PM 4.0"
+      id: pm_4_0
+      icon: "mdi:circle"
+      filters:
+        - delta: 1.0
+    pm_10_0:
+      name: "PM 10"
+      id: pm_10_0
+      icon: "mdi:circle-outline"
+      filters:
+        - delta: 1.0
+    temperature:
+      name: "Temperature"
+      id: sen55_temp
+      icon: "mdi:thermometer"
+      filters:
+        - delta: 0.3
+    humidity:
+      name: "Humidity"
+      id: sen55_humid
+      icon: "mdi:water-percent"
+      filters:
+        - delta: 1.0
+    voc_index:
+      name: "VOC Index"
+      id: voc
+      icon: "mdi:flask-outline"
+      algorithm_tuning:
+        index_offset: 100
+        learning_time_offset_hours: 240
+        learning_time_gain_hours: 240
+        gating_max_duration_minutes: 360
+        std_initial: 150
+        gain_factor: 120
+      filters:
+        - exponential_moving_average:
+            alpha: 0.05
+            send_every: 10
+        - delta: 3.0
+    nox_index:
+      name: "NOx Index"
+      id: nox
+      icon: "mdi:smog"
+      algorithm_tuning:
+        learning_time_offset_hours: 72      # 2026-10-10: was 12 - baseline = clean daytime air over ~3 days, not last night
+        gating_max_duration_minutes: 1440  # 2026-10-10: was 240 - an overnight plume (6-8 h) must stay high, not be learned as normal (SEN55 default 720)
+        std_initial: 50                     # no effect on NOx; Sensirion: must be 50
+        gain_factor: 230
+    update_interval: 5s
+    temperature_compensation:
+      # v0.7: -3.6 C = the enclosure's self-heating (ESP32 ~145 F next to it), measured against the
+      # garage THS 2026-11-11 16:30 (72.5 vs 65.8 F, AH equal). Re-check against the THS after a day.
+      offset: -3.6
+      normalized_offset_slope: 0
+      time_constant: 0
+    store_baseline: true
+    address: 0x69
+  - platform: absolute_humidity
+    name: "Absolute Humidity"
+    id: a_h
+    temperature: sen55_temp
+    humidity: sen55_humid
+    icon: "mdi:water-opacity"
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 2
+  - platform: template
+    name: "Dew Point"
+    id: dew_point
+    icon: "mdi:water-thermometer"
+    unit_of_measurement: "°F"
+    device_class: "temperature"
+    state_class: "measurement"
+    accuracy_decimals: 1
+    update_interval: 5.1s
+    lambda: |-
+      float Tc = id(sen55_temp).state;
+      float RH = id(sen55_humid).state;
+      if (isnan(Tc) || isnan(RH) || RH <= 0.0f) return NAN;
+      // Magnus formula
+      float gamma = logf(RH / 100.0f) + (17.62f * Tc) / (243.12f + Tc);
+      float td_c = (243.12f * gamma) / (17.62f - gamma);
+      return (td_c * 9.0f / 5.0f) + 32.0f;
+    filters:
+      - delta: 0.3
+  - platform: template
+    name: "PM AQI"
+    filters:
+        - delta: 1
+    icon: "mdi:chart-bar"
+    unit_of_measurement: "AQI"
+    accuracy_decimals: 0
+    id: avg_pm_aqi
+    update_interval: 5.3s
+    lambda: |-
+      // US EPA PM AQI (AQI Technical Assistance Document, 2024 PM2.5 breakpoints) - 2026-10-10:
+      //  - one sub-index per pollutant: PM2.5 truncated to 0.1 ug/m3, PM10 truncated to 1 ug/m3
+      //  - reported AQI = the HIGHER sub-index. EPA never averages them, and PM1 / PM4 have no AQI
+      //    breakpoints (the SEN55 mass bins are cumulative, so they also double-counted PM2.5)
+      //  - concentrations are a 2-min rolling mean (23 x 5.3 s) so a 5-s dust puff cannot move it.
+      //    The official AQI uses 24-h / NowCast means; this is the real-time version used for control.
+      // Name kept as "Average PM AQI" so automations, statistics and the dashboard keep working.
+      float pm25 = id(pm_2_5).state;
+      float pm10 = id(pm_10_0).state;
+      // no reading yet / read failed: publish nothing (was 500 = "Hazardous")
+      if (isnan(pm25) || isnan(pm10)) return {};
+      static const int N = 23;
+      static float b25[N], b10[N];
+      static int n = 0, k = 0;
+      b25[k] = pm25; b10[k] = pm10; k = (k + 1) % N; if (n < N) n++;
+      float s25 = 0, s10 = 0;
+      for (int i = 0; i < n; i++) { s25 += b25[i]; s10 += b10[i]; }
+      float c25 = floorf(s25 / n * 10.0f) / 10.0f;   // EPA: truncate PM2.5 to 0.1
+      float c10 = floorf(s10 / n);                   // EPA: truncate PM10 to an integer
+      struct Bp { float c_lo; float c_hi; float i_lo; float i_hi; };
+      static const Bp T25[] = {
+        {0.0f, 9.0f, 0, 50}, {9.1f, 35.4f, 51, 100}, {35.5f, 55.4f, 101, 150},
+        {55.5f, 125.4f, 151, 200}, {125.5f, 225.4f, 201, 300}, {225.5f, 325.4f, 301, 500}};
+      static const Bp T10[] = {
+        {0, 54, 0, 50}, {55, 154, 51, 100}, {155, 254, 101, 150},
+        {255, 354, 151, 200}, {355, 424, 201, 300}, {425, 604, 301, 500}};
+      auto sub = [](float c, const Bp *t, int m) -> float {
+        if (c < 0) c = 0;
+        for (int i = 0; i < m; i++)
+          if (c <= t[i].c_hi)
+            return roundf((t[i].i_hi - t[i].i_lo) / (t[i].c_hi - t[i].c_lo) * (c - t[i].c_lo) + t[i].i_lo);
+        return 500;   // beyond the top breakpoint
+      };
+      float a25 = sub(c25, T25, 6), a10 = sub(c10, T10, 6);
+      return a25 > a10 ? a25 : a10;
+
+  # ---------------- RADAR ----------------
+  - platform: ld2410
+    # distances in cm; the radar reports every ~100 ms, so average and dead-band them for the recorder
+    detection_distance:
+      id: t_dist
+      name: "Target distance"
+      on_raw_value:
+        - lambda: 'id(raw_dist) = x;'
+      filters:
+        - throttle_average: 2s
+        - delta: 10
+    moving_distance:
+      id: m_dist
+      name: "Moving distance"
+      filters:
+        - throttle_average: 2s
+        - delta: 10
+    still_distance:
+      id: s_dist
+      name: "Still distance"
+      filters:
+        - throttle_average: 2s
+        - delta: 10
+    # energies 0-100: how sure the radar is; useful for setting gate thresholds
+    moving_energy:
+      id: m_en
+      name: "Moving energy"
+      filters:
+        - throttle_average: 5s
+        - delta: 5
+    still_energy:
+      id: s_en
+      name: "Still energy"
+      filters:
+        - throttle_average: 5s
+        - delta: 5
+    light:
+      name: "Light level"
+      icon: mdi:brightness-5
+      filters:
+        - throttle_average: 10s
+        - delta: 5
+    # v1.3 per-gate energies (0-100), only reported while Engineering mode is on; the raw data behind the thresholds below
+    g0:
+      move_energy:
+        id: gme0
+        name: "Gate 0 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse0
+        name: "Gate 0 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g1:
+      move_energy:
+        id: gme1
+        name: "Gate 1 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse1
+        name: "Gate 1 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g2:
+      move_energy:
+        id: gme2
+        name: "Gate 2 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse2
+        name: "Gate 2 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g3:
+      move_energy:
+        id: gme3
+        name: "Gate 3 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse3
+        name: "Gate 3 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g4:
+      move_energy:
+        id: gme4
+        name: "Gate 4 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse4
+        name: "Gate 4 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g5:
+      move_energy:
+        id: gme5
+        name: "Gate 5 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse5
+        name: "Gate 5 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g6:
+      move_energy:
+        id: gme6
+        name: "Gate 6 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse6
+        name: "Gate 6 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g7:
+      move_energy:
+        id: gme7
+        name: "Gate 7 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse7
+        name: "Gate 7 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+    g8:
+      move_energy:
+        id: gme8
+        name: "Gate 8 move energy"
+        filters: [throttle_average: 2s, delta: 2]
+      still_energy:
+        id: gse8
+        name: "Gate 8 still energy"
+        filters: [throttle_average: 2s, delta: 2]
+
+  - platform: template
+    id: radar_bps
+    name: "Radar byte rate"
+    icon: mdi:serial-port
+    unit_of_measurement: "B/s"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - delta: 5
+
+  - platform: template            # v0.5
+    id: radar_stall_fixes
+    name: "Radar stall fixes"
+    icon: mdi:restart-alert
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+  - platform: wifi_signal
+    id: s_rssi
+    name: "WiFi RSSI"
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: template            # v0.4: same as fresh-air-aqi / NU-AQI
+    name: "WiFi Signal Quality"
+    id: wifi_quality
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:wifi"
+    update_interval: 60s
+    lambda: |-
+      if (isnan(id(s_rssi).state)) return {};
+      int quality = 2 * (100 + (int) id(s_rssi).state);
+      return quality > 100 ? 100 : (quality < 0 ? 0 : quality);
+    filters:
+      - delta: 1
+    entity_category: diagnostic
+  - platform: uptime
+    id: s_uptime
+    name: "Uptime"
+    entity_category: diagnostic
+  - platform: internal_temperature  # v0.4: AQ-family name and unit (was "MCU temperature", C)
+    name: "ESP32 Internal Temperature (F)"
+    id: esp_temp
+    icon: "mdi:chip"
+    update_interval: 60s
+    filters:
+      - lambda: return (x * 1.8) + 32;
+      - delta: 1
+    unit_of_measurement: "°F"
+    entity_category: diagnostic
+
+# -------------------------------------------------------
+# TUNING (written to the module, survive its reboots)
+# -------------------------------------------------------
+number:
+  - platform: ld2410
+    timeout:
+      id: n_timeout
+      name: "Clear delay"           # unoccupied duration 0-65535 s; the module's own hold
+      icon: mdi:timer-sand
+    light_threshold:
+      name: "Light threshold"
+    max_move_distance_gate:
+      id: n_maxm
+      name: "Max moving gate"       # 0.75 m per gate
+      icon: mdi:ruler
+    max_still_distance_gate:
+      id: n_maxs
+      name: "Max still gate"
+      icon: mdi:ruler
+    # per-gate sensitivity: energy (0-100) a gate needs before it counts. Higher = less sensitive.
+    g0:
+      move_threshold:
+        id: gmt0
+        name: "Gate 0 (0-0.75 m) move"
+      still_threshold:
+        id: gst0
+        name: "Gate 0 (0-0.75 m) still"
+    g1:
+      move_threshold:
+        id: gmt1
+        name: "Gate 1 (0.75-1.5 m) move"
+      still_threshold:
+        id: gst1
+        name: "Gate 1 (0.75-1.5 m) still"
+    g2:
+      move_threshold:
+        id: gmt2
+        name: "Gate 2 (1.5-2.25 m) move"
+      still_threshold:
+        id: gst2
+        name: "Gate 2 (1.5-2.25 m) still"
+    g3:
+      move_threshold:
+        id: gmt3
+        name: "Gate 3 (2.25-3 m) move"
+      still_threshold:
+        id: gst3
+        name: "Gate 3 (2.25-3 m) still"
+    g4:
+      move_threshold:
+        id: gmt4
+        name: "Gate 4 (3-3.75 m) move"
+      still_threshold:
+        id: gst4
+        name: "Gate 4 (3-3.75 m) still"
+    g5:
+      move_threshold:
+        id: gmt5
+        name: "Gate 5 (3.75-4.5 m) move"
+      still_threshold:
+        id: gst5
+        name: "Gate 5 (3.75-4.5 m) still"
+    g6:
+      move_threshold:
+        id: gmt6
+        name: "Gate 6 (4.5-5.25 m) move"
+      still_threshold:
+        id: gst6
+        name: "Gate 6 (4.5-5.25 m) still"
+    g7:
+      move_threshold:
+        id: gmt7
+        name: "Gate 7 (5.25-6 m) move"
+      still_threshold:
+        id: gst7
+        name: "Gate 7 (5.25-6 m) still"
+    g8:
+      move_threshold:
+        id: gmt8
+        name: "Gate 8 (6-6.75 m) move"
+      still_threshold:
+        id: gst8
+        name: "Gate 8 (6-6.75 m) still"
+
+  # v1.3 zone edges, hysteresis and hold - saved on the ESP. v1.12: metres (raw_dist stays cm)
+  - platform: template
+    id: zone_a_near
+    name: "Zone A near"
+    icon: mdi:arrow-collapse-left
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_a_far
+    name: "Zone A far"
+    icon: mdi:arrow-collapse-right
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_b_near
+    name: "Zone B near"
+    icon: mdi:arrow-collapse-left
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_b_far
+    name: "Zone B far"
+    icon: mdi:arrow-collapse-right
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 6.75
+    step: 0.05
+    initial_value: 4
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_edge
+    name: "Zone edge"
+    icon: mdi:arrow-expand-horizontal
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 1
+    step: 0.05
+    initial_value: 0.15
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: zone_hold
+    name: "Zone hold"
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 600
+    step: 5
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+
+switch:
+  - platform: ld2410
+    engineering_mode:
+      id: sw_eng
+      name: "Engineering mode"
+      entity_category: config
+    bluetooth:
+      name: "Radar Bluetooth"
+      entity_category: config
+  - platform: template
+    id: presence_led
+    name: "Presence LED"
+    icon: mdi:led-on
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - script.execute: led_update
+    on_turn_off:
+      - script.execute: led_update
+
+select:
+  - platform: ld2410
+    distance_resolution:
+      id: sel_res
+      name: "Distance resolution"     # 0.75 m (default) or 0.2 m per gate
+      entity_category: config
+    light_function:
+      name: "Light function"
+      entity_category: config
+    out_pin_level:
+      name: "OUT pin level"
+      entity_category: config
+
+button:
+  - platform: template
+    name: "SEN55 clean fan"
+    icon: mdi:fan-alert
+    entity_category: diagnostic
+    on_press:
+      - sen5x.start_fan_autoclean: sen55
+  - platform: ld2410
+    factory_reset:
+      name: "Radar factory reset"
+      entity_category: diagnostic
+    restart:
+      name: "Radar restart"
+      entity_category: diagnostic
+    query_params:
+      id: btn_query
+      name: "Radar query settings"
+      entity_category: diagnostic
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+text_sensor:
+  # v0.4 status texts - bands and wording copied from fresh-air-aqi (nu-esp32-s3-1.yaml)
+  - platform: template
+    name: "AQI AH"
+    icon: "mdi:water-opacity"
+    update_interval: 5.3s
+    lambda: |-
+      float ah = id(a_h).state;
+      if (isnan(ah)) return {"Warming up"};
+      char buf[48];
+      if      (ah <= 6.0f)  snprintf(buf, sizeof(buf), "Very Dry (%.1f g/m³)", ah);
+      else if (ah <= 8.0f)  snprintf(buf, sizeof(buf), "Dry (%.1f g/m³)", ah);
+      else if (ah <= 10.5f) snprintf(buf, sizeof(buf), "Comfortable (%.1f g/m³)", ah);
+      else if (ah <= 12.0f) snprintf(buf, sizeof(buf), "Humid (%.1f g/m³)", ah);
+      else if (ah <= 15.0f) snprintf(buf, sizeof(buf), "Very Humid (%.1f g/m³)", ah);
+      else                  snprintf(buf, sizeof(buf), "Excessive (%.1f g/m³)", ah);
+      return {buf};
+  - platform: template
+    name: "AQI Dew Point"
+    icon: "mdi:water-thermometer"
+    update_interval: 5.2s
+    lambda: |-
+      float dp = id(dew_point).state;
+      if (isnan(dp)) return {"Warming up"};
+      char buf[48];
+      if      (dp < 40.0f)  snprintf(buf, sizeof(buf), "Very Dry (%.1f °F)", dp);
+      else if (dp < 50.0f)  snprintf(buf, sizeof(buf), "Dry (%.1f °F)", dp);
+      else if (dp < 55.0f)  snprintf(buf, sizeof(buf), "Pleasant (%.1f °F)", dp);
+      else if (dp < 60.0f)  snprintf(buf, sizeof(buf), "Comfortable (%.1f °F)", dp);
+      else if (dp < 65.0f)  snprintf(buf, sizeof(buf), "Muggy (%.1f °F)", dp);
+      else if (dp < 70.0f)  snprintf(buf, sizeof(buf), "Uncomfortable (%.1f °F)", dp);
+      else                  snprintf(buf, sizeof(buf), "Oppressive (%.1f °F)", dp);
+      return {buf};
+  - platform: template
+    name: "AQI TVOC"
+    icon: "mdi:flask-outline"
+    update_interval: 5.4s
+    lambda: |-
+      float v = id(voc).state;
+      if (isnan(v) || v <= 0) return {"Warming up"};
+      char buf[64];
+      if      (v <= 150) snprintf(buf, sizeof(buf), "Excellent (%.0f index)", v);
+      else if (v <= 250) snprintf(buf, sizeof(buf), "Good (%.0f index)", v);
+      else if (v <= 350) snprintf(buf, sizeof(buf), "Moderate (%.0f index)", v);
+      else if (v <= 450) snprintf(buf, sizeof(buf), "Unhealthy for Sensitive Groups (%.0f index)", v);
+      else if (v <= 500) snprintf(buf, sizeof(buf), "Unhealthy (%.0f index)", v);
+      else               snprintf(buf, sizeof(buf), "Warming up");
+      return {buf};
+  - platform: template
+    name: "AQI NOx"
+    icon: "mdi:smog"
+    update_interval: 5.5s
+    lambda: |-
+      float n = id(nox).state;
+      if (isnan(n) || n <= 0) return {"Warming up"};
+      char buf[64];
+      if      (n <= 50)  snprintf(buf, sizeof(buf), "Excellent (%.0f index)", n);
+      else if (n <= 100) snprintf(buf, sizeof(buf), "Good (%.0f index)", n);
+      else if (n <= 200) snprintf(buf, sizeof(buf), "Moderate (%.0f index)", n);
+      else if (n <= 300) snprintf(buf, sizeof(buf), "Poor (%.0f index)", n);
+      else if (n <= 400) snprintf(buf, sizeof(buf), "Very Poor (%.0f index)", n);
+      else if (n <= 500) snprintf(buf, sizeof(buf), "Hazardous (%.0f index)", n);
+      else               snprintf(buf, sizeof(buf), "Warming up");
+      return {buf};
+  - platform: template
+    name: "AQI PM"
+    icon: "mdi:air-filter"
+    update_interval: 5.6s
+    lambda: |-
+      // the "PM AQI" sensor's value in words (one calculation, so the two always agree)
+      float a = id(avg_pm_aqi).state;
+      if (isnan(a)) return std::string("Warming up");
+      int v = (int) lroundf(a);
+      const char *w = v <= 10 ? "Excellent" : v <= 50 ? "Good" : v <= 100 ? "Moderate" :
+                      v <= 150 ? "Unhealthy for Sensitive Groups" : v <= 200 ? "Unhealthy" :
+                      v <= 300 ? "Very Unhealthy" : "Hazardous";
+      char buf[64];
+      snprintf(buf, sizeof(buf), "%s (%d index)", w, v);
+      return std::string(buf);
+  - platform: template
+    name: "Unit Temperature Status"
+    icon: "mdi:chip"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      float t = id(esp_temp).state;
+      if (isnan(t)) return {};
+      return {t >= 185 ? "Overheating" : t >= 140 ? "Warm" : "Normal"};
+  - platform: ld2410
+    version:
+      id: ts_fw
+      name: "Radar firmware"
+      entity_category: diagnostic
+    mac_address:
+      name: "Radar MAC"
+      entity_category: diagnostic
+
+# -------------------------------------------------------
+# LED - the Super Mini's WS2812 on GPIO48. Shows through the radome's dot grid.
+# Blue = moving target, green = still target only, off = clear.
+# -------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: led
+    name: "LED"
+    chipset: WS2812
+    pin: GPIO48
+    num_leds: 1
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 300ms
+
+script:
+  - id: led_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: presence_led
+              - binary_sensor.is_on: bs_mv
+          then:
+            - light.turn_on:          # moving target -> blue
+                id: led
+                brightness: 40%
+                red: 0
+                green: 0.1
+                blue: 1
+          else:
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: presence_led
+                    - binary_sensor.is_on: occupied
+                then:
+                  - light.turn_on:    # occupied, still only -> green
+                      id: led
+                      brightness: 30%
+                      red: 0
+                      green: 1
+                      blue: 0
+                else:
+                  - light.turn_off:
+                      id: led

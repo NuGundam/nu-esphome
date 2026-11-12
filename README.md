@@ -4,7 +4,7 @@
 [![licence](https://img.shields.io/github/license/NuGundam/nu-esphome?label=licence&color=6fb0ff)](LICENSE)
 [![esphome](https://img.shields.io/badge/ESPHome-2026.10-6fb0ff)](https://esphome.io)
 
-**The ESPHome firmware behind one Home Assistant house: 20 devices for air quality, HVAC zoning, presence and more.**
+**The ESPHome firmware behind one Home Assistant house: 21 devices for air quality, HVAC zoning, presence and more.**
 
 Everything here is a real config from a working house, not an example. Most of these started
 from stock firmware or a sensor on a breadboard and grew whatever the house turned out to need:
@@ -25,6 +25,7 @@ and failsafes for when Home Assistant goes away.
 | [`nu-presence-1`, `2`](#nu-presence-1-2) | 60 GHz presence, breathing and light, with a web page | Seeed MR60BHA2 kit | Loft, not installed yet |
 | [`nu-presence-24ghz-1`](#nu-presence-24ghz-1) | 24 GHz presence with a tuning page | Arduino Nano ESP32, LD2410C | Family Room |
 | [`nu-presence-24ghz-2`](#nu-presence-24ghz-2) | 24 GHz multi-person tracking with a room map | Apollo MTR-1, LD2450 | Upper Hallway |
+| [`nu-garage-1`](#nu-garage-1) | Garage air quality and 24 GHz presence | ESP32-S3 Super Mini, SEN55, LD2410C | Garage |
 | [`nu-range-hood`](#nu-range-hood) | Three-speed kitchen hood | ESP32-S3, relays | Kitchen |
 | [`nu-esp32-2432s028r`](#nu-esp32-2432s028r) | Wall touch panel for a light | ESP32-2432S028R display | Office 1 |
 | [`nu-esp32-s3-lcd-1`](#nu-esp32-s3-lcd-1) | Small status screen | SpotPear ESP32-S3-LCD-1.47 | Office 1 |
@@ -109,7 +110,7 @@ AirGradient ONE units moved from stock firmware to ESPHome with no cloud posting
 
 ## Presence
 
-Three radars, because each is good at something different.
+Three kinds of radar, because each is good at something different.
 
 ### nu-presence-1, 2
 
@@ -134,6 +135,8 @@ distance gates, so it can see someone sitting on a couch.
 
 - Per-gate sensitivity, two distance zones and a `Moving target` tuned separately from `Occupied`.
 - Tuning page on port 8080 ([`radar_web.h`](radar_web.h)) with live gate energies and a room view.
+  The page opens locked, so a stray tap or scroll on a phone can't drag a threshold; unlock it to
+  edit, and it locks again two minutes after the last change.
 - Wiring is at the top of the yaml.
 
 ### nu-presence-24ghz-2
@@ -152,6 +155,23 @@ they have to move.**
 - `Zone 1-3` rectangles, drawn on the page or typed into Home Assistant.
 - Tuning page on port 8080 ([`radar_web_2450.h`](radar_web_2450.h)) with a live top-down map.
 - `Web page`, `Still preset` and `Moving preset` show the page's status and the current presets in Home Assistant.
+
+### nu-garage-1
+
+A garage unit in one printed case: a Sensirion SEN55 for the air and an HLK-LD2410C radar for
+presence, on an ESP32-S3 Super Mini. The SEN55 part follows `nu-esp32-s3-1`, the radar part
+`nu-presence-24ghz-1` (same [`radar_web.h`](radar_web.h) tuning page).
+
+- PM, VOC, NOx, temperature and humidity, with the same EPA PM AQI and status texts as the other
+  air quality units. The SEN55 has no carbon monoxide sensor, so this is not a CO alarm.
+- The ESP32 heats the case, so the SEN55 temperature carries a fixed offset measured against a
+  separate garage sensor. Sensirion's compensation adjusts humidity with it, so absolute humidity
+  and dew point are unaffected.
+- `Moving target` holds for 5 seconds, so a walk through the garage is one clean event for lights.
+- Engineering mode turns itself on after every boot, so the per-gate energies are always there.
+- If the radar goes quiet for 10 seconds it gets an end-configuration command, and
+  `Radar stall fixes` counts how often that happened. Keep the radar's Bluetooth off: with it on,
+  this module stopped sending presence data.
 
 ---
 
@@ -211,7 +231,7 @@ esphome run nu-aqi-1.yaml
 Some things to know first:
 
 - **Secrets:** every key and password is a `!secret` reference, listed in
-  [`secrets.example.yaml`](secrets.example.yaml). All 20 configs validate on ESPHome 2026.10 with it filled in.
+  [`secrets.example.yaml`](secrets.example.yaml). All 21 configs validate on ESPHome 2026.10 with it filled in.
 - **Room names:** rooms here are generic (Office 1, Bedroom 2), so they differ slightly from what
   runs in the house. Any `light.` or `sensor.` entity a config reads needs to match your own.
 - **Home Assistant:** several devices depend on automations that live in Home Assistant and aren't

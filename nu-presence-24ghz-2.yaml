@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Presence-24GHz-2  v1.10 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# NU-Presence-24GHz-2  v1.11 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
 # ESP32-C3-MINI, LD2450 on UART 20/21, WS2812 on GPIO3, buzzer on GPIO10. Pins from
 # github.com/ApolloAutomation/MTR-1 (Integrations/ESPHome/Core.yaml).
 # v1.1: motion only, at the user's request. The LTR-390 / DPS310 I2C sensors are gone (they failed on this unit:
@@ -15,6 +15,9 @@
 #     countdowns carry on); after a power cut nobody is tracked until they move. Radar silent for 2 s (last_rx_ms) =
 #     slots read as empty, because the driver leaves its sensors at their last values.
 #   * Target count, Target N distance in metres; an empty slot reads 0.0 (v1.2, the driver sends unknown).
+#     v1.11 (2026-11-08): numbers "Ignore from" / "Ignore to" (m, defaults 3.75 / 5.05 for Office 1): targets at
+#     that distance from the sensor are ignored by the presence tracks (presence_2450.h v1.2), fencing off the static
+#     ghost at 3.8-5.0 m that held Occupied for hours. Raw target sensors still report it. Both 0 = off.
 #     v1.10: the driver sends that unknown ONCE, and throttle_average then averaged the single 0 into the last real
 #     readings and heard nothing more, so the slot stuck on the old distance until the next target. heartbeat keeps
 #     feeding it the current value, so the next 2 s window is all zeros.
@@ -211,8 +214,10 @@ interval:
           float y[3] = {id(t1y).get_raw_state(), id(t2y).get_raw_state(), id(t3y).get_raw_state()};
           float s[3] = {id(t1s).get_raw_state(), id(t2s).get_raw_state(), id(t3s).get_raw_state()};
           float cd = id(n_timeout).state, sh = id(still_hold).state;
+          float igl = id(ign_from).state, igh = id(ign_to).state;
           presence_tick(x, y, s, millis() - id(last_rx_ms) < PR_SILENT_MS, id(mv_range).state * 1000.0f, id(mv_speed).state,
-                        (uint32_t) ((std::isnan(cd) ? 30.0f : cd) * 1000.0f), (uint32_t) ((std::isnan(sh) ? 300.0f : sh) * 1000.0f), millis());
+                        (uint32_t) ((std::isnan(cd) ? 30.0f : cd) * 1000.0f), (uint32_t) ((std::isnan(sh) ? 300.0f : sh) * 1000.0f), millis(),
+                        std::isnan(igl) ? 0.0f : igl * 1000.0f, std::isnan(igh) ? 0.0f : igh * 1000.0f);
   # hand the entities to radar_web_2450.h and start the httpd (returns at once when it is already running)
   - interval: 10s
     then:
@@ -229,7 +234,7 @@ interval:
           c.zc[2][0] = id(z3x1); c.zc[2][1] = id(z3y1); c.zc[2][2] = id(z3x2); c.zc[2][3] = id(z3y2);
           c.timeout = id(n_timeout); c.hold = id(zone_hold);
           c.mvs = id(mv_speed); c.mvr = id(mv_range); c.mvh = id(mv_hold); c.mvraw = id(bs_mv_raw);
-          c.sth = id(still_hold); c.occraw = id(occ_raw);
+          c.sth = id(still_hold); c.occraw = id(occ_raw); c.igf = id(ign_from); c.igt = id(ign_to);
           c.multi = id(sw_multi); c.zt = id(sel_zt); c.fw = id(ts_fw); c.uptime = id(s_uptime); c.rssi = id(s_rssi);
           radar_web_register();
 
@@ -608,6 +613,33 @@ number:
     max_value: 3600
     step: 10
     initial_value: 300
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  # v1.11: distance band the presence tracks ignore (static ghost at 3.8-5.0 m in Office 1)
+  - platform: template
+    id: ign_from
+    name: "Ignore from"
+    icon: mdi:cancel
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.5
+    step: 0.05
+    initial_value: 3.75
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: ign_to
+    name: "Ignore to"
+    icon: mdi:cancel
+    unit_of_measurement: "m"
+    min_value: 0
+    max_value: 7.5
+    step: 0.05
+    initial_value: 5.05
     optimistic: true
     restore_value: true
     mode: box
