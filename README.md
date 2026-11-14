@@ -93,8 +93,12 @@ in one sensor.
 - The main loop builds the page's JSON every 2 s and the web task only hands it out, so no state
   is read across threads. The unit keeps 2 h of one-minute history, which gives the page
   sparklines, a 10-minute change and a 2 h low/high as soon as it opens.
-- The page is 14 KB, is sent with an ETag (a reload costs a 304), polls every 4 s and stops while
+- The page is 18 KB, is sent with an ETag (a reload costs a 304), polls every 4 s and stops while
   the tab is hidden.
+- The page's Settings panel can change the two switches, the status light and the two
+  temperature-offset numbers. It opens locked and locks again 2 min after the last change. The
+  web task only queues a change (`POST /set`, which needs a custom header so another website
+  cannot send one); the main loop performs it and values are clamped to each number's limits.
 - Tuned for heat: 80 MHz CPU and low Wi-Fi power, because a warm board reads the air wrong.
 - Two VOC sensors: "VOC" is smoothed for trends, "VOC Fast" is the same index before smoothing,
   so a short event such as a spray shows up within seconds.

@@ -18,8 +18,13 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────
-//  NU-AQI-3  Custom Web Dashboard  v4.1  (custom_web.h)
+//  NU-AQI-3  Custom Web Dashboard  v4.2  (custom_web.h)
 //
+//  v4.2: the Settings panel can change things. It opens locked; Unlock allows changes for
+//        2 min after the last one. POST /set (k=<key>&v=<value>, header X-NU-AQI) puts one
+//        change in a slot; nuaqi_dash_pump() (100 ms yaml interval, main loop) performs it
+//        and the reply is the fresh /data.json. Keys: night, adapt, led (0/1), offB, offK.
+//        The custom header keeps other websites from posting to the unit through a browser.
 //  v4.1: a card shows only its level until the unit has enough history for a change.
 //  v4.0: new page in the nuarr look (dark panels, cards, tables), every
 //        entity of the unit on it, laid out for desktop and phone.
@@ -39,6 +44,7 @@
 //    /  /dash    → dashboard HTML
 //    /data.json  → every current value, one small document
 //    /hist.json  → 2 h history, one sample a minute
+//    /set        → POST, change one setting (see v4.2)
 //    /healthz    → "OK"
 //
 //  Levels (same as the Room AQI card in Home Assistant):
@@ -47,7 +53,7 @@
 //    NOx >5 / 10 / 20 / 50; PM AQI 25 / 50 / 100 / 150.
 // ─────────────────────────────────────────────────────────────────
 
-#define NUAQI_PAGE_VERSION "4.1"
+#define NUAQI_PAGE_VERSION "4.2"
 #define NUAQI_SNAP_CAP 2048
 #define NUAQI_HS 11        // history series (the first NUAQI_HS rows of NUAQI_NUMS)
 #define NUAQI_HN 120       // samples kept per series
@@ -124,6 +130,13 @@ static uint16_t nuaqi_hist_count = 0;     // samples stored (max NUAQI_HN)
 static uint16_t nuaqi_hist_head  = 0;     // next slot to write
 static uint32_t nuaqi_hist_ms    = 0;     // millis() of the latest sample
 
+// One change waiting for the main loop (web task -> main loop).
+struct NuaqiCmd { char key[8]; float val; };
+static NuaqiCmd nuaqi_cmd;
+static volatile bool nuaqi_cmd_pending = false;
+static volatile bool nuaqi_cmd_ok = false;
+static SemaphoreHandle_t nuaqi_done = nullptr;   // given by the main loop when the change is performed
+
 // Looks every entity up by name, once. Runs in the main loop.
 static void nuaqi_resolve() {
   for (auto *s : esphome::App.get_sensors()) {
@@ -186,6 +199,16 @@ struct NuaqiBuf {
   void end() { if (n > 0 && p[n - 1] == ',') n--; if (n + 1 < cap) p[n++] = '}'; p[n] = 0; }
 };
 
+// min, max and step of a number, so the page does not hard-code them
+static void nuaqi_put_lim(NuaqiBuf &b, const char *k, esphome::number::Number *n) {
+  if (n == nullptr) return;
+  char t[56];
+  snprintf(t, sizeof(t), "[%g,%g,%g],", (double) n->traits.get_min_value(), (double) n->traits.get_max_value(),
+           (double) n->traits.get_step());
+  b.key(k);
+  b.raw(t);
+}
+
 static float nuaqi_value(const NuaqiNum &e) {
   return (e.s != nullptr && e.s->has_state()) ? e.s->state : NAN;
 }
@@ -213,6 +236,12 @@ static size_t nuaqi_build(char *out, size_t cap) {
   b.boolean("adapt", nuaqi_sw_adapt != nullptr, nuaqi_sw_adapt != nullptr && nuaqi_sw_adapt->state);
   b.num("offB", (nuaqi_num_base != nullptr && nuaqi_num_base->has_state()) ? nuaqi_num_base->state : NAN, 2);
   b.num("offK", (nuaqi_num_coef != nullptr && nuaqi_num_coef->has_state()) ? nuaqi_num_coef->state : NAN, 2);
+  b.key("lim");
+  b.raw("{");
+  nuaqi_put_lim(b, "offB", nuaqi_num_base);
+  nuaqi_put_lim(b, "offK", nuaqi_num_coef);
+  if (b.n > 0 && b.p[b.n - 1] == ',') b.n--;
+  b.raw("},");
   if (nuaqi_led != nullptr) {
     const auto &v = nuaqi_led->remote_values;
     float br = v.get_brightness();
@@ -286,10 +315,21 @@ td b{font-weight:600}
 .kv span{color:var(--dim);white-space:nowrap}
 .kv b{font-weight:500;text-align:right;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
 .on{color:var(--ok)}
+button{background:var(--panel);color:var(--fg);border:1px solid var(--line);padding:5px 12px;border-radius:6px;cursor:pointer;font:inherit;font-size:13px}
+button:disabled{opacity:.5;cursor:default}
+.tg{min-width:54px}.tg.on{border-color:#1f4429}
+.pm{padding:5px 0;width:30px}
+.hb{display:flex;align-items:center;justify-content:space-between;padding-top:6px!important;padding-bottom:6px!important}
+#lk{text-transform:none;letter-spacing:0;font-weight:400}#lk.un{background:#5a3a12;border-color:#a8721f;color:#ffd79a}
+.kv>div{align-items:center;flex-wrap:wrap}.kv b{margin-left:auto}
+.st{display:flex;align-items:center;gap:6px}
+input{background:#0b0e12;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;width:64px;font:inherit;font-size:13px;text-align:right}
+input:disabled{opacity:.5}
+.err{color:var(--bad)}
 .sw{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;border:1px solid var(--line);vertical-align:-1px}
-@media(hover:hover){tr:hover td{background:#1c2129}}
+@media(hover:hover){tr:hover td{background:#1c2129}button:not(:disabled):hover{border-color:var(--acc)}}
 @media(max-width:1100px){.cards{grid-template-columns:repeat(4,1fr)}}
-@media(max-width:640px){.cards{grid-template-columns:repeat(2,1fr);gap:10px}header{padding:10px 14px}h1 span{display:none}.wrap{padding:12px 12px calc(12px + env(safe-area-inset-bottom));gap:12px}.card{padding:10px 12px}.v{font-size:21px}td,th{padding:7px 10px}.hm{display:none}}
+@media(max-width:640px){.cards{grid-template-columns:repeat(2,1fr);gap:10px}header{padding:10px 14px}h1 span{display:none}.wrap{padding:12px 12px calc(12px + env(safe-area-inset-bottom));gap:12px}.card{padding:10px 12px}.v{font-size:21px}td,th{padding:7px 10px}.hm{display:none}button{min-height:36px}input{min-height:36px}}
 @media(prefers-reduced-motion:reduce){.dot{animation:none}}
 </style></head><body>
 <header><h1><b id="nm">NU-AQI</b><span>air quality</span></h1><div class="sp"></div><span class="pill tn" id="lvl">connecting</span><span class="dot"></span><span class="dim" id="upd"></span></header>
@@ -302,7 +342,13 @@ td b{font-weight:600}
 <div class="panel"><h2>Comfort</h2><div class="kv" id="p0"></div></div>
 <div class="panel"><h2>Wi-Fi</h2><div class="kv" id="p1"></div></div>
 <div class="panel"><h2>Device</h2><div class="kv" id="p2"></div></div>
-<div class="panel"><h2>Settings</h2><div class="kv" id="p3"></div><div class="foot">Shown only. Change them in Home Assistant.</div></div>
+<div class="panel"><h2 class="hb">Settings<button id="lk">Unlock</button></h2><div class="kv">
+<div><span>Auto night mode</span><b><button class="tg" data-k="night" id="b-night">—</button></b></div>
+<div><span>Adaptive transmit power</span><b><button class="tg" data-k="adapt" id="b-adapt">—</button></b></div>
+<div><span>AQI light</span><b class="st"><i class="sw" id="ledc"></i><span id="ledb"></span><button class="tg" data-k="led" id="b-led">—</button></b></div>
+<div><span>Offset base (°C)</span><b class="st"><button class="pm" data-k="offB" data-d="-1">−</button><input id="i-offB" data-k="offB" type="number" inputmode="decimal"><button class="pm" data-k="offB" data-d="1">+</button></b></div>
+<div><span>Heat coefficient</span><b class="st"><button class="pm" data-k="offK" data-d="-1">−</button><input id="i-offK" data-k="offK" type="number" inputmode="decimal"><button class="pm" data-k="offK" data-d="1">+</button></b></div>
+</div><div class="foot" id="sf"></div></div>
 </div></div>
 <script>
 (()=>{
@@ -324,9 +370,8 @@ const CARDS=['co2','voc','vocf','nox','pma','pm25','t','rh'],ROWS=['co2','voc','
 const KV=[
 [['tF','Temperature'],['rh2','Humidity'],['fl','Feels like'],['ah','Absolute humidity'],['ahT','Humidity status'],['off','Temperature offset applied']],
 [['ssid','Network'],['ap','Access point'],['bssid','BSSID'],['ip','IP address'],['wq','Signal quality'],['rssi','Signal strength'],['tx','Transmit power'],['rc','Reconnects'],['dc','Disconnects']],
-[['ready','Sensor ready'],['lvlT','Combined level'],['up','Uptime'],['fw','Firmware'],['built','Built'],['page','Page'],['cpu','CPU speed'],['esp','Chip temperature'],['unitT','Chip temperature status'],['heap','Free memory']],
-[['night','Auto night mode'],['adapt','Adaptive transmit power'],['led','AQI light'],['offB','Temperature offset base'],['offK','Heat coefficient']]];
-let D={},H={},bad=0,tmr=0,hNext=0;
+[['ready','Sensor ready'],['lvlT','Combined level'],['up','Uptime'],['fw','Firmware'],['built','Built'],['page','Page'],['cpu','CPU speed'],['esp','Chip temperature'],['unitT','Chip temperature status'],['heap','Free memory']]];
+let D={},H={},bad=0,tmr=0,hNext=0,un=false,rl=0,ft=0;const dirty={},st={};
 
 // build the fixed parts once
 let h='';
@@ -355,7 +400,6 @@ let lo=Math.min(...a),hi=Math.max(...a),r=Math.max(hi-lo,M[k][4][1]),m=(lo+hi)/2
 for(let i=0;i<n;i++)s+=(i*120/(n-1)).toFixed(1)+','+(13-(a[i]-m)/r*22).toFixed(1)+' ';
 if(p.getAttribute('points')!==s)p.setAttribute('points',s)}
 function upTxt(s){if(s==null)return'—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+' d '+h+' h':h?h+' h '+m+' min':m?m+' min':s+' s'}
-const onoff=(id,v)=>tx('k-'+id,v==null?'—':v?'On':'Off',v?'on':'');
 const txt=(id,v)=>tx('k-'+id,v==null||v===''?'—':String(v));
 const num=(id,v,d,u)=>tx('k-'+id,v==null?'—':fmt(v,d)+u);
 
@@ -390,11 +434,31 @@ txt('ssid',D.ssid);txt('ap',D.ap);txt('bssid',D.bssid);txt('ip',D.ip);num('wq',D
 tx('k-ready',D.ready==null?'—':D.ready?'Yes':'Warming up',D.ready?'on':'');txt('lvlT',D.lvlT);tx('k-up',upTxt(D.up));
 txt('fw',(D.proj?'v'+D.proj+' · ':'')+(D.ver?'ESPHome '+D.ver:''));txt('built',D.built);txt('page',D.page?'v'+D.page:null);
 num('cpu',D.cpu,0,' MHz');num('esp',D.esp,0,' °F');txt('unitT',D.unitT);num('heap',D.heap==null?null:D.heap/1024,0,' KB');
-onoff('night',D.night);onoff('adapt',D.adapt);
-const e=$('k-led'),ls=D.led==null?'—':D.led?'On · '+fmt(D.ledB,0)+' %':'Off';
-if(e.dataset.s!==ls+D.ledC){e.dataset.s=ls+D.ledC;e.textContent=ls;if(D.led&&D.ledC){const i=document.createElement('i');i.className='sw';i.style.background=D.ledC;e.prepend(i)}}
-num('offB',D.offB,2,' °C');num('offK',D.offK,2,'');
+['night','adapt','led'].forEach(k=>{const v=D[k];tx('b-'+k,v==null?'—':v?'On':'Off','tg'+(v?' on':''))});
+const lc=$('ledc'),show=D.led&&D.ledC?'':'none';if(lc.style.display!==show)lc.style.display=show;if(D.ledC&&lc.dataset.c!==D.ledC){lc.dataset.c=D.ledC;lc.style.background=D.ledC}
+tx('ledb',D.led&&D.ledB!=null?fmt(D.ledB,0)+' %':'');
+['offB','offK'].forEach(k=>{const e=$('i-'+k),L=(D.lim||{})[k];if(L&&e.step!=L[2]){e.min=L[0];e.max=L[1];e.step=L[2]}
+if(!dirty[k]&&document.activeElement!==e&&D[k]!=null){const s=D[k].toFixed(L?dec(L[2]):2);if(e.value!==s)e.value=s}});
 }
+
+// settings: locked until Unlock, then open for 2 min after the last change
+const dec=s=>(String(s).split('.')[1]||'').length;
+function foot(m,bad){clearTimeout(ft);const t=typeof m==='string'?m:(un?'Unlocked. Locks again 2 min after the last change. The unit turns the AQI light back on when the level changes.':'Locked. Tap Unlock to change a setting.');
+tx('sf',t,'foot'+(bad?' err':''));if(typeof m==='string')ft=setTimeout(foot,5000)}
+function setLock(u){un=u;clearTimeout(rl);if(u)rl=setTimeout(()=>setLock(false),120000);
+tx('lk',u?'Lock':'Unlock',u?'un':'');document.querySelectorAll('.tg,.pm,.kv input').forEach(e=>{e.disabled=!u});foot()}
+async function send(k,v){if(!un)return;setLock(true);const c=new AbortController(),t=setTimeout(()=>c.abort(),5000);
+try{const r=await fetch('/set',{method:'POST',signal:c.signal,headers:{'X-NU-AQI':'1','Content-Type':'application/x-www-form-urlencoded'},body:'k='+k+'&v='+v});
+if(!r.ok)throw new Error((await r.text())||r.status);D=await r.json();delete dirty[k];render();foot('Saved.')}
+catch(e){delete dirty[k];render();foot('Could not change it: '+(e.name==='AbortError'?'no answer':e.message),1)}finally{clearTimeout(t)}}
+function later(k){dirty[k]=1;clearTimeout(st[k]);st[k]=setTimeout(()=>{const L=(D.lim||{})[k],e=$('i-'+k);let v=parseFloat(e.value);
+if(!L||isNaN(v)){delete dirty[k];render();return}v=Math.min(L[1],Math.max(L[0],v));send(k,v.toFixed(dec(L[2])))},700)}
+$('lk').onclick=()=>setLock(!un);
+document.querySelectorAll('.tg').forEach(b=>{b.onclick=()=>send(b.dataset.k,D[b.dataset.k]?0:1)});
+document.querySelectorAll('.pm').forEach(b=>{b.onclick=()=>{const k=b.dataset.k,L=(D.lim||{})[k],e=$('i-'+k);if(!L)return;let v=parseFloat(e.value);if(isNaN(v))v=D[k]||0;
+v=Math.min(L[1],Math.max(L[0],v+b.dataset.d*L[2]));e.value=v.toFixed(dec(L[2]));setLock(true);later(k)}});
+document.querySelectorAll('.kv input').forEach(e=>{e.oninput=()=>{dirty[e.dataset.k]=1};e.onchange=()=>later(e.dataset.k)});
+setLock(false);
 
 async function get(u){const c=new AbortController(),t=setTimeout(()=>c.abort(),4000);
 try{const r=await fetch(u,{signal:c.signal,cache:'no-store'});if(!r.ok)throw new Error(r.status);return await r.json()}finally{clearTimeout(t)}}
@@ -449,6 +513,49 @@ static esp_err_t nuaqi_data_handler(httpd_req_t *req) {
   return httpd_resp_send(req, out, n);
 }
 
+static esp_err_t nuaqi_fail(httpd_req_t *req, const char *status, const char *msg) {
+  httpd_resp_set_status(req, status);
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_sendstr(req, msg);
+}
+
+// POST /set, body k=<key>&v=<number>. Hands the change to the main loop, waits for it, replies with
+// the fresh snapshot. The X-NU-AQI header is required: a browser will not send a custom header to
+// another origin without a preflight this server never answers, so other sites cannot post here.
+static esp_err_t nuaqi_set_handler(httpd_req_t *req) {
+  char hv[8], body[64], k[8], v[20];
+  if (httpd_req_get_hdr_value_str(req, "X-NU-AQI", hv, sizeof(hv)) != ESP_OK)
+    return nuaqi_fail(req, "403 Forbidden", "missing header");
+  if (req->content_len == 0 || req->content_len >= sizeof(body)) return nuaqi_fail(req, "400 Bad Request", "bad length");
+  int got = httpd_req_recv(req, body, req->content_len);
+  if (got <= 0) return nuaqi_fail(req, "400 Bad Request", "no body");
+  body[got] = 0;
+  if (httpd_query_key_value(body, "k", k, sizeof(k)) != ESP_OK || httpd_query_key_value(body, "v", v, sizeof(v)) != ESP_OK)
+    return nuaqi_fail(req, "400 Bad Request", "need k and v");
+  if (strcmp(k, "night") && strcmp(k, "adapt") && strcmp(k, "led") && strcmp(k, "offB") && strcmp(k, "offK"))
+    return nuaqi_fail(req, "400 Bad Request", "unknown setting");
+  char *end = nullptr;
+  float f = strtof(v, &end);
+  if (end == v || isnan(f) || isinf(f)) return nuaqi_fail(req, "400 Bad Request", "not a number");
+
+  if (nuaqi_lock == nullptr || nuaqi_done == nullptr || xSemaphoreTake(nuaqi_lock, pdMS_TO_TICKS(300)) != pdTRUE)
+    return nuaqi_fail(req, "503 Service Unavailable", "busy");
+  if (nuaqi_cmd_pending) {
+    xSemaphoreGive(nuaqi_lock);
+    return nuaqi_fail(req, "409 Conflict", "another change is in progress");
+  }
+  strlcpy(nuaqi_cmd.key, k, sizeof(nuaqi_cmd.key));
+  nuaqi_cmd.val = f;
+  xSemaphoreTake(nuaqi_done, 0);      // drop a stale signal
+  nuaqi_cmd_pending = true;
+  xSemaphoreGive(nuaqi_lock);
+
+  if (xSemaphoreTake(nuaqi_done, pdMS_TO_TICKS(2000)) != pdTRUE)
+    return nuaqi_fail(req, "504 Gateway Timeout", "the unit did not apply it in time");
+  if (!nuaqi_cmd_ok) return nuaqi_fail(req, "400 Bad Request", "setting not available");
+  return nuaqi_data_handler(req);
+}
+
 // 2 h of history: copied out under the lock, then written one series per chunk.
 static esp_err_t nuaqi_hist_handler(httpd_req_t *req) {
   static float copy[NUAQI_HS][NUAQI_HN];
@@ -498,7 +605,8 @@ void nuaqi_dash_register() {
   static bool registered = false;
   if (registered) return;
   if (nuaqi_lock == nullptr) nuaqi_lock = xSemaphoreCreateMutex();
-  if (nuaqi_lock == nullptr) return;
+  if (nuaqi_done == nullptr) nuaqi_done = xSemaphoreCreateBinary();
+  if (nuaqi_lock == nullptr || nuaqi_done == nullptr) return;
 
   httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
   config.server_port      = 8080;
@@ -506,7 +614,7 @@ void nuaqi_dash_register() {
   // port 0, so the LRU purge never closes a socket and the server stops answering once they are all taken.
   config.ctrl_port        = 32769;
   config.stack_size       = 10240;
-  config.max_uri_handlers = 6;
+  config.max_uri_handlers = 8;
   config.max_open_sockets = 4;
   config.lru_purge_enable = true;
   config.keep_alive_enable   = true;    // a browser that vanished frees its socket
@@ -528,6 +636,7 @@ void nuaqi_dash_register() {
     { "/data.json", HTTP_GET, nuaqi_data_handler,    nullptr },
     { "/hist.json", HTTP_GET, nuaqi_hist_handler,    nullptr },
     { "/healthz",   HTTP_GET, nuaqi_healthz_handler, nullptr },
+    { "/set",       HTTP_POST, nuaqi_set_handler,    nullptr },
   };
   for (const auto &u : uris) httpd_register_uri_handler(server, &u);
 
@@ -538,10 +647,52 @@ void nuaqi_dash_register() {
 // Call from the main loop every 2 s (interval: in the yaml). Builds the JSON the web task serves
 // and adds one history sample a minute. Never blocks: when the web task holds the lock, this
 // round is skipped and the next one catches up.
+static bool nuaqi_resolved = false;
+static char nuaqi_work[NUAQI_SNAP_CAP];
+
+// Performs the change the web task left in the slot. Call from the main loop every 100 ms
+// (interval: in the yaml); it returns at once when nothing is waiting.
+void nuaqi_dash_pump() {
+  if (!nuaqi_cmd_pending || nuaqi_lock == nullptr || nuaqi_done == nullptr || !nuaqi_resolved) return;
+  NuaqiCmd c;
+  if (xSemaphoreTake(nuaqi_lock, 0) != pdTRUE) return;
+  c = nuaqi_cmd;
+  xSemaphoreGive(nuaqi_lock);
+
+  bool ok = true, on = c.val >= 0.5f;
+  if (strcmp(c.key, "night") == 0 && nuaqi_sw_night != nullptr) {
+    if (on) nuaqi_sw_night->turn_on(); else nuaqi_sw_night->turn_off();
+  } else if (strcmp(c.key, "adapt") == 0 && nuaqi_sw_adapt != nullptr) {
+    if (on) nuaqi_sw_adapt->turn_on(); else nuaqi_sw_adapt->turn_off();
+  } else if (strcmp(c.key, "led") == 0 && nuaqi_led != nullptr) {
+    auto call = on ? nuaqi_led->turn_on() : nuaqi_led->turn_off();
+    call.perform();
+  } else if ((strcmp(c.key, "offB") == 0 && nuaqi_num_base != nullptr) || (strcmp(c.key, "offK") == 0 && nuaqi_num_coef != nullptr)) {
+    auto *n = strcmp(c.key, "offB") == 0 ? nuaqi_num_base : nuaqi_num_coef;
+    float lo = n->traits.get_min_value(), hi = n->traits.get_max_value();
+    float val = c.val < lo ? lo : c.val > hi ? hi : c.val;
+    auto call = n->make_call();
+    call.set_value(val);
+    call.perform();
+  } else {
+    ok = false;
+  }
+  ESP_LOGI(NUAQI_TAG, "page set %s = %.2f%s", c.key, c.val, ok ? "" : " (not available)");
+
+  // fresh snapshot for the reply; the web task is waiting on nuaqi_done, so the lock is free
+  size_t n = nuaqi_build(nuaqi_work, sizeof(nuaqi_work));
+  if (xSemaphoreTake(nuaqi_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+    memcpy(nuaqi_snap, nuaqi_work, n + 1);
+    nuaqi_snap_len = n;
+    xSemaphoreGive(nuaqi_lock);
+  }
+  nuaqi_cmd_ok = ok;
+  nuaqi_cmd_pending = false;
+  xSemaphoreGive(nuaqi_done);
+}
+
 void nuaqi_dash_tick() {
-  static bool resolved = false;
   static uint32_t last_try = 0;
-  static char work[NUAQI_SNAP_CAP];
   uint32_t now = esphome::millis();
 
   if (nuaqi_lock == nullptr || now - last_try >= 10000 || last_try == 0) {
@@ -549,13 +700,13 @@ void nuaqi_dash_tick() {
     nuaqi_dash_register();
   }
   if (nuaqi_lock == nullptr) return;
-  if (!resolved) { resolved = true; nuaqi_resolve(); }
+  if (!nuaqi_resolved) { nuaqi_resolve(); nuaqi_resolved = true; }
 
-  size_t n = nuaqi_build(work, sizeof(work));
+  size_t n = nuaqi_build(nuaqi_work, sizeof(nuaqi_work));
   bool sample = nuaqi_hist_count == 0 || now - nuaqi_hist_ms >= NUAQI_HIST_STEP_MS;
 
   if (xSemaphoreTake(nuaqi_lock, 0) != pdTRUE) return;
-  memcpy(nuaqi_snap, work, n + 1);
+  memcpy(nuaqi_snap, nuaqi_work, n + 1);
   nuaqi_snap_len = n;
   if (sample) {
     for (int s = 0; s < NUAQI_HS; s++) nuaqi_hist[s][nuaqi_hist_head] = nuaqi_value(NUAQI_NUMS[s]);
