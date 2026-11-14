@@ -91,6 +91,8 @@ in one sensor.
 - Runs its own web dashboard on port 8080 ([`custom_web.h`](custom_web.h)), reading sensor state
   directly in C++ instead of using the ESPHome `web_server`.
 - Tuned for heat: 80 MHz CPU and low Wi-Fi power, because a warm board reads the air wrong.
+- Two VOC sensors: "VOC" is smoothed for trends, "VOC Fast" is the same index before smoothing,
+  so a short event such as a spray shows up within seconds.
 
 ### airgradient-loft, airgradient-kitchen
 
@@ -191,6 +193,8 @@ A "Cheap Yellow Display" used as a wall touch panel for a light, built with LVGL
 
 - Resistive panels report phantom touches, so a touch on a sleeping screen only wakes it. The
   controls arm a moment after release, and they disarm when the screen dims.
+- Presses shorter than "Min Touch Time" (default 100 ms, set from Home Assistant) are dropped as
+  panel noise, and "Last Touch Event" shows how long each press lasted.
 - The header comment explains how each guard came about.
 - Change the `light.` entity in the yaml to your own.
 

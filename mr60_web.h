@@ -218,7 +218,7 @@ function mgraph(){const el=$('gM'),W=Math.max(200,Math.round(el.clientWidth||800
  for(const p of hist)if(p.m!=null&&p.m>0.5){const y=Y(p.m);s+=`<rect x="${(X(p.t)-bw).toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${(H-5-y).toFixed(1)}" fill="${p.m>=15?'#4aa3ff':'#6d7d92'}"/>`;}
  const y15=Y(15);s+=`<line x1="0" y1="${y15}" x2="${W}" y2="${y15}" stroke="#4aa3ff" stroke-dasharray="4 3" stroke-width="1"/><text x="5" y="${y15-3}" font-size="10" fill="#4aa3ff">15 cm = Moving</text><text x="5" y="12" font-size="10" fill="#6d7d92">60+</text><text x="5" y="${H-4}" font-size="10" fill="#6d7d92">0</text>`;
  el.setAttribute('viewBox',`0 0 ${W} ${H}`);el.innerHTML=s;}
-function render(){const d=dm(),br=pos(D.br),hr=pos(D.hr),now=Date.now();$('ttl').textContent=D.name+' - radar';
+function render(){const d=dm(),br=pos(D.br),hr=pos(D.hr),now=Date.now();$('ttl').textContent=D.name+' - radar';document.title=D.name+' - radar';
  $('meta').textContent=`ESPHome ${D.ver} · up ${Math.round((D.up||0)/60)} min · rssi ${D.rssi==null?'?':Math.round(D.rssi)} dBm`;
  $('dist').textContent=d==null?'—':d.toFixed(2);$('cnt').textContent=D.t==null?'—':Math.round(D.t);$('stat').textContent=D.st||'';
  for(const[p,v]of[['pOcc',D.occ],['pMv',D.occ&&D.mv],['pSt',D.occ&&!D.mv],['pBr',D.brd],['pRaw',D.raw],['pDk',D.dark]])$(p).classList.toggle('on',!!v);$('pGh').classList.toggle('bad',!!D.gh);

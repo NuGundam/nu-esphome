@@ -1,5 +1,8 @@
 # =======================================================
-# NU-AQI-3  v5.2
+# NU-AQI-3  v5.3
+# Changes from v5.2:
+#   - "VOC Fast": the SEN66 VOC index before the smoothing on "VOC", for short odor events
+#     (a spray, a door opening). "VOC" itself is unchanged.
 # Changes from v5.1:
 #   - mdns_web_slot, so _esphomelib survives beside the USE_WEBSERVER _http service
 # Changes from v5.0:
@@ -422,6 +425,24 @@ sensor:
     update_interval: 5s
     address: 0x6b
     type: SEN66
+  # v5.3: fast VOC. "VOC" above is smoothed (EMA 0.05) and reaches HA about every 50 s,
+  # which flattens short events. This reads the same VOC index before that smoothing,
+  # every 5 s, and sends any move of 5 points at once, plus one value every 5 minutes.
+  - platform: template
+    name: "VOC Fast"
+    id: sen66_voc_fast
+    icon: "mdi:flask-outline"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      float v = id(sen66_voc).get_raw_state();
+      if (isnan(v)) return {};
+      return v;
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 5.0
   - platform: absolute_humidity
     name: "Absolute Humidity"
     id: sen66_absolute_humidity

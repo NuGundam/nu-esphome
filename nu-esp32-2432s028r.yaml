@@ -16,6 +16,14 @@
 #   3. Touch pressure threshold raised 400 -> 600.
 # v2.1: guard no longer uses the touchscreen on_touch event or touch duration
 #      (that version rejected every touch). Adds text_sensor "Last Touch Event".
+# v2.2 (2026-11-13): 12:26 the screen phantom-woke, then a second phantom 29 s
+#      later landed on the armed ring and turned the light on at 50%. A noise
+#      blip is one or two 50 ms samples; a finger is longer. Each widget now
+#      times its own press (LVGL on_press -> on_click/on_release, not the
+#      touchscreen on_touch that failed in v2.1) and ignores presses shorter
+#      than the "Min Touch Time" number (default 100 ms, tunable from HA).
+#      Every event in "Last Touch Event" now ends with the press length.
+#      Touch pressure threshold 600 -> 750.
 # ══════════════════════════════════════════════════════════════════════════
 
 packages:
@@ -115,6 +123,27 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  - id: press_ms             # millis() when the current widget press began (v2.2)
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+number:
+  # v2.2: presses shorter than this are treated as panel noise. Lower it if real taps
+  # show "ignored short" in Last Touch Event; raise it if phantoms still act.
+  - platform: template
+    id: min_press
+    name: "Min Touch Time"
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: ms
+    min_value: 0
+    max_value: 500
+    step: 10
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    mode: box
 
 time:
   - platform: homeassistant
@@ -133,9 +162,9 @@ touchscreen:
     cs_pin: 33
     interrupt_pin: 36
     update_interval: 50ms
-    # Pressure needed to count as a touch. Was 400 (the default); noise crossed it.
+    # Pressure needed to count as a touch. Was 400 (the default), then 600 (v2); 750 since v2.2.
     # If real taps start getting missed, lower toward 500; if phantoms persist, raise toward 900.
-    threshold: 600
+    threshold: 750
     calibration:
       x_min: 220
       x_max: 3760
@@ -388,11 +417,13 @@ lvgl:
               bg_color: 0x4B5263
               pad_all: 5
             on_press:
-              - lambda: id(user_dragging) = id(ui_armed);
+              - lambda: |-
+                  id(press_ms) = millis();
+                  id(user_dragging) = id(ui_armed);
             on_value:
               - if:
                   condition:
-                    lambda: return id(user_dragging);
+                    lambda: return id(user_dragging) && (millis() - id(press_ms)) >= (uint32_t) id(min_press).state;
                   then:
                     - lambda: |-
                         int v = (int) x;
@@ -410,11 +441,21 @@ lvgl:
             on_release:
               - if:
                   condition:
+                    lambda: return id(user_dragging) && (millis() - id(press_ms)) < (uint32_t) id(min_press).state;
+                  then:
+                    # v2.2: too short for a finger - panel noise. Snap the dial back, send nothing.
+                    - lambda: |-
+                        id(user_dragging) = false;
+                        id(panel_event).publish_state("ignored short dial (" + to_string(millis() - id(press_ms)) + " ms)");
+                    - script.stop: send_brightness
+                    - script.execute: sync_ui_state
+              - if:
+                  condition:
                     lambda: return id(user_dragging);
                   then:
                     - lambda: |-
                         id(user_dragging) = false;
-                        id(panel_event).publish_state("dial " + to_string((int) (id(desired_brightness) / 2.55f + 0.5f)) + "%");
+                        id(panel_event).publish_state("dial " + to_string((int) (id(desired_brightness) / 2.55f + 0.5f)) + "% (" + to_string(millis() - id(press_ms)) + " ms)");
                     - script.stop: send_brightness
                     - homeassistant.action:
                         action: light.turn_on
@@ -423,9 +464,13 @@ lvgl:
                           brightness: !lambda return to_string(id(desired_brightness));
                   else:
                     # ignored touch (screen was dim or asleep): snap the dial back
-                    - lambda: |-
-                        id(user_dragging) = false;
-                        id(panel_event).publish_state("ignored dial (screen was dim)");
+                    - if:
+                        condition:
+                          lambda: return !id(ui_armed);
+                        then:
+                          - lambda: |-
+                              id(panel_event).publish_state("ignored dial (screen was dim)");
+                    - lambda: id(user_dragging) = false;
                     - script.execute: sync_ui_state
 
         # ── power button in the middle of the dial ───────────────
@@ -441,18 +486,29 @@ lvgl:
             bg_opa: COVER
             border_width: 0
             shadow_width: 0
+            on_press:
+              - lambda: id(press_ms) = millis();
             on_click:
               - if:
                   condition:
-                    lambda: return id(ui_armed);
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) < (uint32_t) id(min_press).state;
                   then:
-                    - lambda: id(panel_event).publish_state("power toggle");
+                    - lambda: id(panel_event).publish_state("ignored short tap (" + to_string(millis() - id(press_ms)) + " ms)");
+              - if:
+                  condition:
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) >= (uint32_t) id(min_press).state;
+                  then:
+                    - lambda: id(panel_event).publish_state(std::string("power toggle (") + to_string(millis() - id(press_ms)) + " ms)");
                     - homeassistant.action:
                         action: light.toggle
                         data:
                           entity_id: light.office_1_light_2
                   else:
-                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+                    - if:
+                        condition:
+                          lambda: return !id(ui_armed);
+                        then:
+                          - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
             widgets:
               - label:
                   id: power_icon
@@ -479,19 +535,30 @@ lvgl:
             styles: preset_style
             pressed:
               styles: preset_pressed
+            on_press:
+              - lambda: id(press_ms) = millis();
             on_click:
               - if:
                   condition:
-                    lambda: return id(ui_armed);
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) < (uint32_t) id(min_press).state;
                   then:
-                    - lambda: id(panel_event).publish_state("preset 100%");
+                    - lambda: id(panel_event).publish_state("ignored short tap (" + to_string(millis() - id(press_ms)) + " ms)");
+              - if:
+                  condition:
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) >= (uint32_t) id(min_press).state;
+                  then:
+                    - lambda: id(panel_event).publish_state(std::string("preset 100% (") + to_string(millis() - id(press_ms)) + " ms)");
                     - homeassistant.action:
                         action: light.turn_on
                         data:
                           entity_id: light.office_1_light_2
                           brightness_pct: "100"
                   else:
-                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+                    - if:
+                        condition:
+                          lambda: return !id(ui_armed);
+                        then:
+                          - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
             widgets:
               - label:
                   text: "100%"
@@ -505,19 +572,30 @@ lvgl:
             styles: preset_style
             pressed:
               styles: preset_pressed
+            on_press:
+              - lambda: id(press_ms) = millis();
             on_click:
               - if:
                   condition:
-                    lambda: return id(ui_armed);
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) < (uint32_t) id(min_press).state;
                   then:
-                    - lambda: id(panel_event).publish_state("preset 75%");
+                    - lambda: id(panel_event).publish_state("ignored short tap (" + to_string(millis() - id(press_ms)) + " ms)");
+              - if:
+                  condition:
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) >= (uint32_t) id(min_press).state;
+                  then:
+                    - lambda: id(panel_event).publish_state(std::string("preset 75% (") + to_string(millis() - id(press_ms)) + " ms)");
                     - homeassistant.action:
                         action: light.turn_on
                         data:
                           entity_id: light.office_1_light_2
                           brightness_pct: "75"
                   else:
-                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+                    - if:
+                        condition:
+                          lambda: return !id(ui_armed);
+                        then:
+                          - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
             widgets:
               - label:
                   text: "75%"
@@ -531,19 +609,30 @@ lvgl:
             styles: preset_style
             pressed:
               styles: preset_pressed
+            on_press:
+              - lambda: id(press_ms) = millis();
             on_click:
               - if:
                   condition:
-                    lambda: return id(ui_armed);
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) < (uint32_t) id(min_press).state;
                   then:
-                    - lambda: id(panel_event).publish_state("preset 50%");
+                    - lambda: id(panel_event).publish_state("ignored short tap (" + to_string(millis() - id(press_ms)) + " ms)");
+              - if:
+                  condition:
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) >= (uint32_t) id(min_press).state;
+                  then:
+                    - lambda: id(panel_event).publish_state(std::string("preset 50% (") + to_string(millis() - id(press_ms)) + " ms)");
                     - homeassistant.action:
                         action: light.turn_on
                         data:
                           entity_id: light.office_1_light_2
                           brightness_pct: "50"
                   else:
-                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+                    - if:
+                        condition:
+                          lambda: return !id(ui_armed);
+                        then:
+                          - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
             widgets:
               - label:
                   text: "50%"
@@ -557,19 +646,30 @@ lvgl:
             styles: preset_style
             pressed:
               styles: preset_pressed
+            on_press:
+              - lambda: id(press_ms) = millis();
             on_click:
               - if:
                   condition:
-                    lambda: return id(ui_armed);
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) < (uint32_t) id(min_press).state;
                   then:
-                    - lambda: id(panel_event).publish_state("preset 25%");
+                    - lambda: id(panel_event).publish_state("ignored short tap (" + to_string(millis() - id(press_ms)) + " ms)");
+              - if:
+                  condition:
+                    lambda: return id(ui_armed) && (millis() - id(press_ms)) >= (uint32_t) id(min_press).state;
+                  then:
+                    - lambda: id(panel_event).publish_state(std::string("preset 25% (") + to_string(millis() - id(press_ms)) + " ms)");
                     - homeassistant.action:
                         action: light.turn_on
                         data:
                           entity_id: light.office_1_light_2
                           brightness_pct: "25"
                   else:
-                    - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
+                    - if:
+                        condition:
+                          lambda: return !id(ui_armed);
+                        then:
+                          - lambda: id(panel_event).publish_state("ignored tap (screen was dim)");
             widgets:
               - label:
                   text: "25%"

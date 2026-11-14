@@ -1,6 +1,7 @@
 #pragma once
 // ──────────────────────────────────────────────────────────────────
-//  NU-Presence-24GHz  radar tuning page  v1.9  (radar_web.h)  2026-11-11
+//  NU-Presence-24GHz  radar tuning page  v1.10  (radar_web.h)  2026-11-11
+//  v1.10: the browser tab title carries the device name (document.title, set every render).
 //  v1.9: edit lock - the page opens locked (no writes, bars not draggable, chart scrolls);
 //        'Locked - tap to edit' unlocks for 2 min after the last edit. Used by NU-Presence-24GHz-1 + NU-Garage-1.
 //
@@ -240,7 +241,7 @@ sv.addEventListener('pointercancel',()=>{ drag=null; if(D) gates(); });
 sv.addEventListener('pointerup',async e=>{ if(!drag) return; const d=drag; drag=null; $(d.k+d.i).value=d.v; await setv(d.k+d.i,d.v); });
 function fill(id,v){ const el=$(id); if(document.activeElement===el||busy) return; if(el.type==='checkbox') el.checked=!!v; else el.value=v==null?'':cmKeys.includes(id)?+(v/100).toFixed(2):Math.round(v); }
 function render(){ gl=(D.res||'').startsWith('0.2')?20:75; gtab(); buildMax();
-  $('ttl').textContent=D.name+' - radar tuning'; $('meta').textContent=`fw ${D.fw||'?'} · up ${Math.round((D.up||0)/60)} min · rssi ${D.rssi==null?'?':Math.round(D.rssi)} dBm`;
+  $('ttl').textContent=D.name+' - radar tuning'; document.title=D.name+' - radar tuning'; $('meta').textContent=`fw ${D.fw||'?'} · up ${Math.round((D.up||0)/60)} min · rssi ${D.rssi==null?'?':Math.round(D.rssi)} dBm`;
   $('dist').textContent=D.occ?fmt(D.dist):'no target'; $('men').textContent=D.men==null?'—':Math.round(D.men); $('sen').textContent=D.sen==null?'—':Math.round(D.sen);
   $('mdist').textContent=fmt(D.mdist); $('sdist').textContent=fmt(D.sdist);
   for(const [p,v] of [['pOcc',D.occ],['pMv',D.mv],['pSt',D.st],['pZa',D.za],['pZb',D.zb]]) $(p).classList.toggle('on',!!v);
