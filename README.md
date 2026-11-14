@@ -99,6 +99,8 @@ in one sensor.
   temperature-offset numbers. It opens locked and locks again 2 min after the last change. The
   web task only queues a change (`POST /set`, which needs a custom header so another website
   cannot send one); the main loop performs it and values are clamped to each number's limits.
+- The same panel has a Restart button: it needs Unlock and a second tap within 5 s. The unit
+  answers the page first and restarts 1.5 s later; the page reconnects by itself.
 - Tuned for heat: 80 MHz CPU and low Wi-Fi power, because a warm board reads the air wrong.
 - Two VOC sensors: "VOC" is smoothed for trends, "VOC Fast" is the same index before smoothing,
   so a short event such as a spray shows up within seconds.

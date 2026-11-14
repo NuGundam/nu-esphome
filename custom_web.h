@@ -18,8 +18,10 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────────────
-//  NU-AQI-3  Custom Web Dashboard  v4.2  (custom_web.h)
+//  NU-AQI-3  Custom Web Dashboard  v4.3  (custom_web.h)
 //
+//  v4.3: Restart button in the Settings panel. It needs Unlock and a second tap within 5 s.
+//        POST /set k=reboot&v=1: the main loop answers first and restarts 1.5 s later.
 //  v4.2: the Settings panel can change things. It opens locked; Unlock allows changes for
 //        2 min after the last one. POST /set (k=<key>&v=<value>, header X-NU-AQI) puts one
 //        change in a slot; nuaqi_dash_pump() (100 ms yaml interval, main loop) performs it
@@ -44,7 +46,7 @@
 //    /  /dash    → dashboard HTML
 //    /data.json  → every current value, one small document
 //    /hist.json  → 2 h history, one sample a minute
-//    /set        → POST, change one setting (see v4.2)
+//    /set        → POST, change one setting or restart (see v4.2, v4.3)
 //    /healthz    → "OK"
 //
 //  Levels (same as the Room AQI card in Home Assistant):
@@ -53,7 +55,7 @@
 //    NOx >5 / 10 / 20 / 50; PM AQI 25 / 50 / 100 / 150.
 // ─────────────────────────────────────────────────────────────────
 
-#define NUAQI_PAGE_VERSION "4.2"
+#define NUAQI_PAGE_VERSION "4.3"
 #define NUAQI_SNAP_CAP 2048
 #define NUAQI_HS 11        // history series (the first NUAQI_HS rows of NUAQI_NUMS)
 #define NUAQI_HN 120       // samples kept per series
@@ -135,6 +137,8 @@ struct NuaqiCmd { char key[8]; float val; };
 static NuaqiCmd nuaqi_cmd;
 static volatile bool nuaqi_cmd_pending = false;
 static volatile bool nuaqi_cmd_ok = false;
+static bool nuaqi_reboot_due = false;      // main loop only: a restart the page asked for
+static uint32_t nuaqi_reboot_ms = 0;
 static SemaphoreHandle_t nuaqi_done = nullptr;   // given by the main loop when the change is performed
 
 // Looks every entity up by name, once. Runs in the main loop.
@@ -319,6 +323,7 @@ button{background:var(--panel);color:var(--fg);border:1px solid var(--line);padd
 button:disabled{opacity:.5;cursor:default}
 .tg{min-width:54px}.tg.on{border-color:#1f4429}
 .pm{padding:5px 0;width:30px}
+.rb.arm{background:#4a1512;border-color:var(--bad);color:#ffb3ad}
 .hb{display:flex;align-items:center;justify-content:space-between;padding-top:6px!important;padding-bottom:6px!important}
 #lk{text-transform:none;letter-spacing:0;font-weight:400}#lk.un{background:#5a3a12;border-color:#a8721f;color:#ffd79a}
 .kv>div{align-items:center;flex-wrap:wrap}.kv b{margin-left:auto}
@@ -348,6 +353,7 @@ input:disabled{opacity:.5}
 <div><span>AQI light</span><b class="st"><i class="sw" id="ledc"></i><span id="ledb"></span><button class="tg" data-k="led" id="b-led">—</button></b></div>
 <div><span>Offset base (°C)</span><b class="st"><button class="pm" data-k="offB" data-d="-1">−</button><input id="i-offB" data-k="offB" type="number" inputmode="decimal"><button class="pm" data-k="offB" data-d="1">+</button></b></div>
 <div><span>Heat coefficient</span><b class="st"><button class="pm" data-k="offK" data-d="-1">−</button><input id="i-offK" data-k="offK" type="number" inputmode="decimal"><button class="pm" data-k="offK" data-d="1">+</button></b></div>
+<div><span>Restart the unit</span><b><button class="rb" id="b-rb">Restart</button></b></div>
 </div><div class="foot" id="sf"></div></div>
 </div></div>
 <script>
@@ -371,7 +377,7 @@ const KV=[
 [['tF','Temperature'],['rh2','Humidity'],['fl','Feels like'],['ah','Absolute humidity'],['ahT','Humidity status'],['off','Temperature offset applied']],
 [['ssid','Network'],['ap','Access point'],['bssid','BSSID'],['ip','IP address'],['wq','Signal quality'],['rssi','Signal strength'],['tx','Transmit power'],['rc','Reconnects'],['dc','Disconnects']],
 [['ready','Sensor ready'],['lvlT','Combined level'],['up','Uptime'],['fw','Firmware'],['built','Built'],['page','Page'],['cpu','CPU speed'],['esp','Chip temperature'],['unitT','Chip temperature status'],['heap','Free memory']]];
-let D={},H={},bad=0,tmr=0,hNext=0,un=false,rl=0,ft=0;const dirty={},st={};
+let D={},H={},bad=0,tmr=0,hNext=0,un=false,rl=0,ft=0,ra=0,rat=0,rbw=0,pu=null;const dirty={},st={};
 
 // build the fixed parts once
 let h='';
@@ -443,16 +449,22 @@ if(!dirty[k]&&document.activeElement!==e&&D[k]!=null){const s=D[k].toFixed(L?dec
 
 // settings: locked until Unlock, then open for 2 min after the last change
 const dec=s=>(String(s).split('.')[1]||'').length;
-function foot(m,bad){clearTimeout(ft);const t=typeof m==='string'?m:(un?'Unlocked. Locks again 2 min after the last change. The unit turns the AQI light back on when the level changes.':'Locked. Tap Unlock to change a setting.');
+function foot(m,bad){clearTimeout(ft);const t=typeof m==='string'?m:rbw?RW:(un?'Unlocked. Locks again 2 min after the last change. The unit turns the AQI light back on when the level changes.':'Locked. Tap Unlock to change a setting.');
 tx('sf',t,'foot'+(bad?' err':''));if(typeof m==='string')ft=setTimeout(foot,5000)}
 function setLock(u){un=u;clearTimeout(rl);if(u)rl=setTimeout(()=>setLock(false),120000);
-tx('lk',u?'Lock':'Unlock',u?'un':'');document.querySelectorAll('.tg,.pm,.kv input').forEach(e=>{e.disabled=!u});foot()}
-async function send(k,v){if(!un)return;setLock(true);const c=new AbortController(),t=setTimeout(()=>c.abort(),5000);
+tx('lk',u?'Lock':'Unlock',u?'un':'');document.querySelectorAll('.tg,.pm,.rb,.kv input').forEach(e=>{e.disabled=!u});if(!u)disarm();foot()}
+async function send(k,v,m){if(!un)return;setLock(true);const c=new AbortController(),t=setTimeout(()=>c.abort(),5000);
 try{const r=await fetch('/set',{method:'POST',signal:c.signal,headers:{'X-NU-AQI':'1','Content-Type':'application/x-www-form-urlencoded'},body:'k='+k+'&v='+v});
-if(!r.ok)throw new Error((await r.text())||r.status);D=await r.json();delete dirty[k];render();foot('Saved.')}
+if(!r.ok)throw new Error((await r.text())||r.status);D=await r.json();delete dirty[k];render();foot(m||'Saved.');return 1}
 catch(e){delete dirty[k];render();foot('Could not change it: '+(e.name==='AbortError'?'no answer':e.message),1)}finally{clearTimeout(t)}}
 function later(k){dirty[k]=1;clearTimeout(st[k]);st[k]=setTimeout(()=>{const L=(D.lim||{})[k],e=$('i-'+k);let v=parseFloat(e.value);
 if(!L||isNaN(v)){delete dirty[k];render();return}v=Math.min(L[1],Math.max(L[0],v));send(k,v.toFixed(dec(L[2])))},700)}
+// restart: a second tap within 5 s; the unit answers, then restarts
+const RW='Restarting. The page reconnects by itself.';
+function disarm(){ra=0;clearTimeout(rat);tx('b-rb','Restart','rb')}
+$('b-rb').onclick=async()=>{if(!un)return;
+if(!ra){setLock(true);ra=1;tx('b-rb','Tap again to restart','rb arm');foot('A restart clears the 2 h history and restarts VOC learning.');rat=setTimeout(disarm,5000);return}
+disarm();if(await send('reboot',1,RW)){rbw=1;setLock(false);setTimeout(()=>{if(rbw){rbw=0;foot()}},60000)}};
 $('lk').onclick=()=>setLock(!un);
 document.querySelectorAll('.tg').forEach(b=>{b.onclick=()=>send(b.dataset.k,D[b.dataset.k]?0:1)});
 document.querySelectorAll('.pm').forEach(b=>{b.onclick=()=>{const k=b.dataset.k,L=(D.lim||{})[k],e=$('i-'+k);if(!L)return;let v=parseFloat(e.value);if(isNaN(v))v=D[k]||0;
@@ -465,8 +477,8 @@ try{const r=await fetch(u,{signal:c.signal,cache:'no-store'});if(!r.ok)throw new
 async function tick(){
 clearTimeout(tmr);if(document.hidden)return;
 if(Date.now()>=hNext){try{const j=await get('/hist.json'),o={};j.k.forEach((k,i)=>o[k]=j.d[i]);H=o;hNext=Date.now()+(62-Math.min(j.age,60))*1000}catch(e){hNext=Date.now()+15000}}
-try{D=await get('/data.json');bad=0;if(document.body.className)document.body.className='';render();tx('upd',new Date().toLocaleTimeString())}
-catch(e){if(++bad>1){document.body.className='off';tx('lvl','Offline','pill t3');tx('upd','no answer × '+bad)}}
+try{D=await get('/data.json');bad=0;if(pu!=null&&D.up<pu){hNext=0;if(rbw){rbw=0;foot('The unit has restarted.')}}pu=D.up;if(document.body.className)document.body.className='';render();tx('upd',new Date().toLocaleTimeString())}
+catch(e){if(++bad>1){document.body.className='off';tx('lvl',rbw?'Restarting':'Offline','pill '+(rbw?'tw':'t3'));tx('upd','no answer × '+bad)}}
 tmr=setTimeout(tick,4000)}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)tick()});
 tick();
@@ -532,11 +544,13 @@ static esp_err_t nuaqi_set_handler(httpd_req_t *req) {
   body[got] = 0;
   if (httpd_query_key_value(body, "k", k, sizeof(k)) != ESP_OK || httpd_query_key_value(body, "v", v, sizeof(v)) != ESP_OK)
     return nuaqi_fail(req, "400 Bad Request", "need k and v");
-  if (strcmp(k, "night") && strcmp(k, "adapt") && strcmp(k, "led") && strcmp(k, "offB") && strcmp(k, "offK"))
+  if (strcmp(k, "night") && strcmp(k, "adapt") && strcmp(k, "led") && strcmp(k, "offB") && strcmp(k, "offK") &&
+      strcmp(k, "reboot"))
     return nuaqi_fail(req, "400 Bad Request", "unknown setting");
   char *end = nullptr;
   float f = strtof(v, &end);
   if (end == v || isnan(f) || isinf(f)) return nuaqi_fail(req, "400 Bad Request", "not a number");
+  if (strcmp(k, "reboot") == 0 && f != 1.0f) return nuaqi_fail(req, "400 Bad Request", "reboot needs v=1");
 
   if (nuaqi_lock == nullptr || nuaqi_done == nullptr || xSemaphoreTake(nuaqi_lock, pdMS_TO_TICKS(300)) != pdTRUE)
     return nuaqi_fail(req, "503 Service Unavailable", "busy");
@@ -653,6 +667,13 @@ static char nuaqi_work[NUAQI_SNAP_CAP];
 // Performs the change the web task left in the slot. Call from the main loop every 100 ms
 // (interval: in the yaml); it returns at once when nothing is waiting.
 void nuaqi_dash_pump() {
+  // a restart the page asked for: the reply went out first, now restart cleanly
+  if (nuaqi_reboot_due && esphome::millis() - nuaqi_reboot_ms >= 1500) {
+    nuaqi_reboot_due = false;
+    ESP_LOGW(NUAQI_TAG, "restarting (asked from the web page)");
+    esphome::App.safe_reboot();
+    return;
+  }
   if (!nuaqi_cmd_pending || nuaqi_lock == nullptr || nuaqi_done == nullptr || !nuaqi_resolved) return;
   NuaqiCmd c;
   if (xSemaphoreTake(nuaqi_lock, 0) != pdTRUE) return;
@@ -674,6 +695,9 @@ void nuaqi_dash_pump() {
     auto call = n->make_call();
     call.set_value(val);
     call.perform();
+  } else if (strcmp(c.key, "reboot") == 0) {
+    nuaqi_reboot_due = true;
+    nuaqi_reboot_ms = esphome::millis();
   } else {
     ok = false;
   }

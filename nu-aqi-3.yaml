@@ -1,5 +1,8 @@
 # =======================================================
-# NU-AQI-3  v5.6
+# NU-AQI-3  v5.7
+# Changes from v5.6:
+#   - Restart button on the web page (custom_web.h v4.3): Unlock, then two taps. The page's
+#     request is answered first; nuaqi_dash_pump() restarts the unit 1.5 s later.
 # Changes from v5.5:
 #   - The web page's Settings panel can change the two switches, the AQI light and the two
 #     temperature-offset numbers (custom_web.h v4.2). A 100 ms interval runs nuaqi_dash_pump(),
@@ -62,7 +65,7 @@ esphome:
   friendly_name: NU-AQI-3
   project:
     name: "my.nu-aqi-3"
-    version: "5.6"
+    version: "5.7"
   includes:
     - custom_web.h          # embedded dashboard → http://<device-ip>:8080/
     - nuaqi_helpers.h       # WiFi TX power readback helper
