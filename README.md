@@ -115,6 +115,8 @@ AirGradient ONE units moved from stock firmware to ESPHome with no cloud posting
 
 - Uses the same scoring as `nu-aqi-3`: the worst of VOC, CO2, NOx and NowCast PM.
 - PM2.5 keeps the EPA 2021 correction the stock firmware uses.
+- "VOC Fast" reports the VOC index every 10 s when it moves, for short events such as cooking;
+  "VOC index" and "NOx index" still send one value a minute.
 - The 11-LED bar works like the stock one: it starts with one LED at the far left and adds more
   as the air gets worse, moving through the AQI colours.
 - The OLED stays, a blue LED sweeps during warm-up, and a test button walks the bar through every level.
