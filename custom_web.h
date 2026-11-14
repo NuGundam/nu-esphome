@@ -1,35 +1,59 @@
 #pragma once
 #include "esphome.h"
 #include "esp_http_server.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esphome/core/application.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/switch/switch.h"
+#include "esphome/components/number/number.h"
+#include "esphome/components/light/light_state.h"
+#include "esphome/components/wifi/wifi_component.h"
 #include <math.h>
+#include <string.h>
 #include <string>
 
-// ──────────────────────────────────────────────────────────────────
-//  NU-AQI-3  Custom Web Dashboard  v3.3  (custom_web.h)
+// ─────────────────────────────────────────────────────────────────
+//  NU-AQI-3  Custom Web Dashboard  v4.1  (custom_web.h)
 //
-//  Architecture:
-//    1. Port 8080 serves the dashboard HTML + a single /data.json endpoint.
-//    2. /data.json reads sensor values DIRECTLY from C++ globals via
-//       App.get_sensors() — no HTTP loopback, no proxy, no CORS issues.
-//    3. JS makes ONE fetch every 8 seconds.
-//
-//  CO₂ tier thresholds (aligned to standard ventilation guidelines):
-//    Tier 0 Excellent: < 600 ppm
-//    Tier 1 Good:      600–800 ppm
-//    Tier 2 Monitor:   800–1000 ppm  (ASHRAE upper bound, slight stuffiness)
-//    Tier 3 Circulate: 1000–1400 ppm (noticeable fatigue, recirculate air)
-//    Tier 4 Fresh air: ≥ 1400 ppm    (significant impairment, open window/ERV)
+//  v4.1: a card shows only its level until the unit has enough history for a change.
+//  v4.0: new page in the nuarr look (dark panels, cards, tables), every
+//        entity of the unit on it, laid out for desktop and phone.
+//    - The main loop builds the JSON (nuaqi_dash_tick(), every 2 s) and the
+//      web task only copies it out under a mutex. Before, the web task read
+//      sensor and text states itself while the main loop could be writing them.
+//    - Entities are looked up by name once, not on every request.
+//    - The unit keeps 2 h of one-minute history for 11 readings, so the page
+//      has sparklines, a 10-minute change and a 2 h low/high the moment it opens.
+//    - The page is sent with an ETag: a reload costs a 304 with no body.
+//    - The browser polls every 4 s, stops while the tab is hidden, and only
+//      touches the text nodes whose value changed.
+//    - httpd: real ctrl_port + TCP keep-alive (ctrl_port 0 with LRU purge
+//      wedges the server once its sockets fill).
 //
 //  Endpoints on port 8080:
-//    /          → dashboard HTML
-//    /dash      → alias
-//    /data.json → all sensor values in one JSON document
-//    /healthz   → "OK" liveness ping
-// ──────────────────────────────────────────────────────────────────
+//    /  /dash    → dashboard HTML
+//    /data.json  → every current value, one small document
+//    /hist.json  → 2 h history, one sample a minute
+//    /healthz    → "OK"
+//
+//  Levels (same as the Room AQI card in Home Assistant):
+//    0 Excellent · 1 Good · 2 Monitor · 3 Circulate · 4 Fresh air
+//    CO2 600 / 800 / 1000 / 1400 ppm; VOC >150 / 250 / 350 / 450;
+//    NOx >5 / 10 / 20 / 50; PM AQI 25 / 50 / 100 / 150.
+// ─────────────────────────────────────────────────────────────────
+
+#define NUAQI_PAGE_VERSION "4.1"
+#define NUAQI_SNAP_CAP 2048
+#define NUAQI_HS 11        // history series (the first NUAQI_HS rows of NUAQI_NUMS)
+#define NUAQI_HN 120       // samples kept per series
+#define NUAQI_HIST_STEP_MS 60000UL
+
+static const char *const NUAQI_TAG = "nuaqi_dash";
 
 static std::string sanitize_id(const std::string &s) {
   std::string out;
@@ -42,627 +66,367 @@ static std::string sanitize_id(const std::string &s) {
   return out;
 }
 
-static esphome::sensor::Sensor *find_sensor(const char *oid) {
-  std::string t = sanitize_id(oid);
-  for (auto *s : esphome::App.get_sensors())
-    if (sanitize_id(s->get_name()) == t) return s;
-  return nullptr;
-}
-static esphome::text_sensor::TextSensor *find_text_sensor(const char *oid) {
-  std::string t = sanitize_id(oid);
-  for (auto *s : esphome::App.get_text_sensors())
-    if (sanitize_id(s->get_name()) == t) return s;
-  return nullptr;
-}
-static esphome::binary_sensor::BinarySensor *find_binary_sensor(const char *oid) {
-  std::string t = sanitize_id(oid);
+// key = JSON key, name = entity name run through sanitize_id()
+struct NuaqiNum  { const char *key; const char *name; uint8_t dec; esphome::sensor::Sensor *s; };
+struct NuaqiText { const char *key; const char *name; esphome::text_sensor::TextSensor *s; };
+
+// The first NUAQI_HS rows are also the history series, in this order.
+static NuaqiNum NUAQI_NUMS[] = {
+  {"co2",  "co2",                 0, nullptr},
+  {"voc",  "voc",                 1, nullptr},
+  {"vocf", "voc_fast",            0, nullptr},
+  {"nox",  "nox",                 0, nullptr},
+  {"pm1",  "pm__1__m",            1, nullptr},
+  {"pm25", "pm__2_5__m",          1, nullptr},
+  {"pm4",  "pm__4__m",            1, nullptr},
+  {"pm10", "pm__10__m",           1, nullptr},
+  {"pma",  "average_pm_aqi",      0, nullptr},
+  {"t",    "temperature",         2, nullptr},
+  {"rh",   "humidity",            1, nullptr},
+  {"ah",   "absolute_humidity",   2, nullptr},
+  {"fl",   "aqi_feels_like_temp", 1, nullptr},
+  {"off",  "temp_offset_applied", 1, nullptr},
+  {"esp",  "esp32_internal_temperature__f_", 0, nullptr},
+  {"cpu",  "esp32_cpu_frequency", 0, nullptr},
+  {"wq",   "wifi_signal_quality", 0, nullptr},
+  {"tx",   "wifi_tx_power",       1, nullptr},
+  {"rc",   "wifi_reconnects",     0, nullptr},
+  {"dc",   "wifi_disconnects",    0, nullptr},
+};
+static NuaqiText NUAQI_TEXTS[] = {
+  {"co2T",  "aqi_co2",                 nullptr},
+  {"vocT",  "aqi_tvoc",                nullptr},
+  {"noxT",  "aqi_nox",                 nullptr},
+  {"pmT",   "pm_aqi",                  nullptr},
+  {"ahT",   "aqi_ah",                  nullptr},
+  {"lvlT",  "aqi_combined_level",      nullptr},
+  {"unitT", "unit_temperature_status", nullptr},
+  {"ip",    "esp32_ip_address",        nullptr},
+  {"ssid",  "ssid",                    nullptr},
+  {"bssid", "bssid",                   nullptr},
+  {"ap",    "access_point",            nullptr},
+};
+static const size_t NUAQI_NUM_COUNT  = sizeof(NUAQI_NUMS) / sizeof(NUAQI_NUMS[0]);
+static const size_t NUAQI_TEXT_COUNT = sizeof(NUAQI_TEXTS) / sizeof(NUAQI_TEXTS[0]);
+
+static esphome::binary_sensor::BinarySensor *nuaqi_ready_bs = nullptr;
+static esphome::switch_::Switch *nuaqi_sw_night = nullptr;
+static esphome::switch_::Switch *nuaqi_sw_adapt = nullptr;
+static esphome::number::Number  *nuaqi_num_base = nullptr;
+static esphome::number::Number  *nuaqi_num_coef = nullptr;
+static esphome::light::LightState *nuaqi_led = nullptr;
+
+static SemaphoreHandle_t nuaqi_lock = nullptr;
+static char   nuaqi_snap[NUAQI_SNAP_CAP];
+static size_t nuaqi_snap_len = 0;
+static float    nuaqi_hist[NUAQI_HS][NUAQI_HN];
+static uint16_t nuaqi_hist_count = 0;     // samples stored (max NUAQI_HN)
+static uint16_t nuaqi_hist_head  = 0;     // next slot to write
+static uint32_t nuaqi_hist_ms    = 0;     // millis() of the latest sample
+
+// Looks every entity up by name, once. Runs in the main loop.
+static void nuaqi_resolve() {
+  for (auto *s : esphome::App.get_sensors()) {
+    std::string n = sanitize_id(s->get_name());
+    for (size_t i = 0; i < NUAQI_NUM_COUNT; i++)
+      if (NUAQI_NUMS[i].s == nullptr && n == NUAQI_NUMS[i].name) NUAQI_NUMS[i].s = s;
+  }
+  for (auto *s : esphome::App.get_text_sensors()) {
+    std::string n = sanitize_id(s->get_name());
+    for (size_t i = 0; i < NUAQI_TEXT_COUNT; i++)
+      if (NUAQI_TEXTS[i].s == nullptr && n == NUAQI_TEXTS[i].name) NUAQI_TEXTS[i].s = s;
+  }
   for (auto *s : esphome::App.get_binary_sensors())
-    if (sanitize_id(s->get_name()) == t) return s;
-  return nullptr;
-}
-
-static void append_sensor(std::string &out, const char *key, const char *oid) {
-  auto *s = find_sensor(oid);
-  out += "\""; out += key; out += "\":";
-  if (s == nullptr || !s->has_state() || isnan(s->state)) {
-    out += "null";
-  } else {
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%.3f", s->state);
-    out += buf;
+    if (sanitize_id(s->get_name()) == "nu_aqi_3_sensor_ready") nuaqi_ready_bs = s;
+  for (auto *s : esphome::App.get_switches()) {
+    std::string n = sanitize_id(s->get_name());
+    if (n == "aqi_auto_night_mode") nuaqi_sw_night = s;
+    else if (n == "adaptive_wifi_tx_power") nuaqi_sw_adapt = s;
   }
-  out += ",";
+  for (auto *s : esphome::App.get_numbers()) {
+    std::string n = sanitize_id(s->get_name());
+    if (n == "temp_offset_base") nuaqi_num_base = s;
+    else if (n == "temp_offset_heat_coefficient") nuaqi_num_coef = s;
+  }
+  for (auto *s : esphome::App.get_lights())
+    if (sanitize_id(s->get_name()) == "aqi_led") nuaqi_led = s;
+
+  for (size_t i = 0; i < NUAQI_NUM_COUNT; i++)
+    if (NUAQI_NUMS[i].s == nullptr) ESP_LOGW(NUAQI_TAG, "sensor '%s' not found", NUAQI_NUMS[i].name);
+  for (size_t i = 0; i < NUAQI_TEXT_COUNT; i++)
+    if (NUAQI_TEXTS[i].s == nullptr) ESP_LOGW(NUAQI_TAG, "text sensor '%s' not found", NUAQI_TEXTS[i].name);
 }
 
-static void append_text(std::string &out, const char *key, const char *oid) {
-  auto *s = find_text_sensor(oid);
-  out += "\""; out += key; out += "\":";
-  if (s == nullptr || !s->has_state()) {
-    out += "null";
-  } else {
-    out += "\"";
-    for (char c : s->state) {
-      if (c == '"' || c == '\\') out += '\\';
-      out += c;
+// Bounded JSON writer: never writes past the buffer, drops what does not fit.
+struct NuaqiBuf {
+  char *p; size_t cap; size_t n;
+  void raw(const char *s) { size_t l = strlen(s); if (n + l < cap) { memcpy(p + n, s, l); n += l; } }
+  void key(const char *k) { raw("\""); raw(k); raw("\":"); }
+  void num(const char *k, float v, int dec) {
+    key(k);
+    if (isnan(v) || isinf(v)) raw("null");
+    else { char b[24]; snprintf(b, sizeof(b), "%.*f", dec, (double) v); raw(b); }
+    raw(",");
+  }
+  void u32(const char *k, uint32_t v) { key(k); char b[16]; snprintf(b, sizeof(b), "%u", (unsigned) v); raw(b); raw(","); }
+  void boolean(const char *k, bool known, bool v) { key(k); raw(!known ? "null" : v ? "true" : "false"); raw(","); }
+  void str(const char *k, const char *s, size_t len) {
+    key(k);
+    if (s == nullptr) { raw("null,"); return; }
+    if (n + len * 2 + 4 >= cap) { raw("null,"); return; }
+    p[n++] = '"';
+    for (size_t i = 0; i < len; i++) {
+      unsigned char c = (unsigned char) s[i];
+      if (c < 0x20) continue;
+      if (c == '"' || c == '\\') p[n++] = '\\';
+      p[n++] = (char) c;
     }
-    out += "\"";
+    p[n++] = '"'; p[n++] = ',';
   }
-  out += ",";
+  void end() { if (n > 0 && p[n - 1] == ',') n--; if (n + 1 < cap) p[n++] = '}'; p[n] = 0; }
+};
+
+static float nuaqi_value(const NuaqiNum &e) {
+  return (e.s != nullptr && e.s->has_state()) ? e.s->state : NAN;
 }
 
-static void append_binary(std::string &out, const char *key, const char *oid) {
-  auto *s = find_binary_sensor(oid);
-  out += "\""; out += key; out += "\":";
-  if (s == nullptr || !s->has_state()) {
-    out += "null";
-  } else {
-    out += (s->state ? "true" : "false");
+// Builds /data.json. Runs in the main loop, so every state read is safe.
+static size_t nuaqi_build(char *out, size_t cap) {
+  NuaqiBuf b{out, cap, 0};
+  b.raw("{");
+  const auto &name = esphome::App.get_friendly_name();
+  b.str("name", name.c_str(), strlen(name.c_str()));
+  b.str("page", NUAQI_PAGE_VERSION, strlen(NUAQI_PAGE_VERSION));
+  b.str("ver", ESPHOME_VERSION, strlen(ESPHOME_VERSION));
+#ifdef ESPHOME_PROJECT_VERSION
+  b.str("proj", ESPHOME_PROJECT_VERSION, strlen(ESPHOME_PROJECT_VERSION));
+#endif
+  b.str("built", __DATE__ " " __TIME__, strlen(__DATE__ " " __TIME__));
+  b.u32("up", (uint32_t) (esp_timer_get_time() / 1000000LL));
+  b.u32("heap", (uint32_t) esp_get_free_heap_size());
+  if (esphome::wifi::global_wifi_component != nullptr && esphome::wifi::global_wifi_component->is_connected())
+    b.num("rssi", (float) esphome::wifi::global_wifi_component->wifi_rssi(), 0);
+
+  b.boolean("ready", nuaqi_ready_bs != nullptr && nuaqi_ready_bs->has_state(),
+            nuaqi_ready_bs != nullptr && nuaqi_ready_bs->state);
+  b.boolean("night", nuaqi_sw_night != nullptr, nuaqi_sw_night != nullptr && nuaqi_sw_night->state);
+  b.boolean("adapt", nuaqi_sw_adapt != nullptr, nuaqi_sw_adapt != nullptr && nuaqi_sw_adapt->state);
+  b.num("offB", (nuaqi_num_base != nullptr && nuaqi_num_base->has_state()) ? nuaqi_num_base->state : NAN, 2);
+  b.num("offK", (nuaqi_num_coef != nullptr && nuaqi_num_coef->has_state()) ? nuaqi_num_coef->state : NAN, 2);
+  if (nuaqi_led != nullptr) {
+    const auto &v = nuaqi_led->remote_values;
+    float br = v.get_brightness();
+    char c[8];
+    snprintf(c, sizeof(c), "#%02x%02x%02x", (int) (v.get_red() * 255.0f + 0.5f), (int) (v.get_green() * 255.0f + 0.5f),
+             (int) (v.get_blue() * 255.0f + 0.5f));
+    b.boolean("led", true, v.is_on());
+    b.num("ledB", br * 100.0f, 0);
+    b.str("ledC", c, 7);
   }
-  out += ",";
+
+  for (size_t i = 0; i < NUAQI_NUM_COUNT; i++) b.num(NUAQI_NUMS[i].key, nuaqi_value(NUAQI_NUMS[i]), NUAQI_NUMS[i].dec);
+  for (size_t i = 0; i < NUAQI_TEXT_COUNT; i++) {
+    auto *s = NUAQI_TEXTS[i].s;
+    if (s != nullptr && s->has_state()) b.str(NUAQI_TEXTS[i].key, s->state.c_str(), s->state.size());
+    else b.str(NUAQI_TEXTS[i].key, nullptr, 0);
+  }
+  b.end();
+  return b.n;
 }
 
 // ─────────────────────────────────────────────────────────────────
 // Dashboard HTML
 // ─────────────────────────────────────────────────────────────────
 static const char NUAQI_DASH_HTML[] = R"ESPH(<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
-<title>NU-AQI-3</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1216">
+<title>NU-AQI - air quality</title>
+<link rel="icon" href="data:,">
 <style>
-:root{
-  --bg:#0e1117;--surf:#161b25;--surf2:#1c2233;
-  --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.13);
-  --text:#dde2ee;--muted:#6b7585;
-  --green:#68d391;--yellow:#f0c060;--orange:#f0a050;--red:#e87c6e;
-  --purple:rgb(180,110,190);--blue:#74b9e8;--blue-raw:rgb(116,185,232);
-  --mono:'JetBrains Mono','Consolas',monospace;
-  --sans:'IBM Plex Sans',ui-sans-serif,system-ui,sans-serif
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html{font-size:14px}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;-webkit-font-smoothing:antialiased}
-
-/* ── Topbar ── */
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;background:var(--surf);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
-.tb-title{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:var(--text)}
-.tb-right{display:flex;align-items:center;gap:8px}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--muted);transition:background 0.4s,box-shadow 0.4s;flex-shrink:0}
-.dot.ok{background:var(--green);box-shadow:0 0 7px var(--green)}
-.dot.err{background:var(--red);box-shadow:0 0 7px var(--red)}
-.dot.spin{background:var(--yellow);animation:blink 1.1s infinite}
-.dot.warm{background:var(--blue);box-shadow:0 0 7px var(--blue);animation:blink 1.4s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:0.25}}
-.tb-age{font-family:var(--mono);font-size:10px;color:var(--muted)}
-.tb-badge{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:0.06em;padding:2px 9px;border-radius:20px;border-width:1px;border-style:solid;transition:all 0.5s}
-
-/* ── Layout ── */
-.page{max-width:860px;margin:0 auto;padding:16px;display:flex;flex-direction:column;gap:12px}
-.card{background:var(--surf);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.card-bar{height:4px;transition:background 0.6s}
-.card-body{padding:14px 16px}
-.two-col{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-
-/* ── Hero ── */
-.hero-row{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
-.hero-main{display:flex;align-items:flex-end;gap:7px}
-.hero-num{font-family:var(--mono);font-size:56px;font-weight:800;line-height:1;letter-spacing:-2px;transition:color 0.5s}
-.hero-unit{font-family:var(--mono);font-size:19px;color:var(--muted);padding-bottom:9px}
-.hero-sub{font-size:11px;color:var(--muted);margin-top:3px}
-.hero-aside{text-align:right;flex-shrink:0;padding-top:2px}
-.ha-label{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
-.ha-num{font-family:var(--mono);font-size:32px;font-weight:700;line-height:1.05;transition:color 0.5s}
-.ha-unit{font-size:11px;color:var(--muted);margin-top:2px}
-
-/* ── Tiles ── */
-.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
-.tile{padding:8px 9px;border-radius:8px;border-width:1px;border-style:solid;transition:background 0.5s,border-color 0.5s}
-.tile-lbl{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:3px}
-.tile-val{font-family:var(--mono);font-size:15px;font-weight:800}
-.tile-sub{font-size:9px;font-weight:600;margin-top:2px;opacity:0.85}
-
-/* ── Banner ── */
-.vbanner{display:flex;align-items:center;padding:7px 12px 7px 0;margin-bottom:8px;border-radius:8px;border-width:1px;border-style:solid;overflow:hidden;transition:background 0.5s,border-color 0.5s}
-.vb-bar{width:3px;align-self:stretch;border-radius:8px 0 0 8px;margin-right:12px;flex-shrink:0;transition:background 0.5s}
-.vb-icon{font-size:13px;flex-shrink:0;margin-right:8px}
-.vb-msg{font-size:12px;font-weight:600;color:var(--text);line-height:1.4}
-
-/* ── Sensor rows ── */
-.col-hdr{display:flex;padding:0 10px 5px 13px;border-bottom:1px solid var(--border);margin-bottom:4px}
-.ch{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:0.08em;text-transform:uppercase}
-.ch.f1{flex:1}
-.srow{display:flex;align-items:center;padding:7px 10px 7px 0;margin:2px 0;border-radius:8px;border-width:1px;border-style:solid;overflow:hidden;transition:background 0.4s,border-color 0.4s}
-.srow-bar{width:3px;align-self:stretch;border-radius:8px 0 0 8px;margin-right:10px;flex-shrink:0;transition:background 0.4s,opacity 0.4s}
-.srow-lbl{flex:1;font-size:12px}
-.srow-val{width:68px;text-align:right;font-family:var(--mono);font-size:13px;font-weight:600}
-.srow-delta{width:60px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted)}
-.srow-trend{width:100px;text-align:right;font-family:var(--mono);font-size:10px}
-.srow-age{width:36px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--muted)}
-
-/* ── Environment / Device cards ── */
-.sec-lbl{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
-.mgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
-.mcell{background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
-.mc-lbl{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.09em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
-.mc-val{font-family:var(--mono);font-size:22px;font-weight:800;color:var(--text)}
-.mc-unit{font-family:var(--mono);font-size:11px;color:var(--muted);margin-left:2px}
-.mc-sub{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.3}
-.drow{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)}
-.drow:last-child{border-bottom:none}
-.dr-lbl{font-size:12px;color:var(--muted)}
-.dr-val{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text)}
-
-/* ── Warmup / Error screens ── */
-.fullcard{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;gap:14px;text-align:center}
-.wu-ring{width:52px;height:52px;border-radius:50%;border:3px solid var(--border2);border-top-color:var(--blue);animation:spin 1s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.wu-title{font-family:var(--mono);font-size:13px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase}
-.wu-sub{font-size:12px;color:var(--muted);max-width:320px;line-height:1.5}
-.wu-bar{width:100%;max-width:240px;height:3px;border-radius:2px;background:var(--border2);overflow:hidden;margin-top:4px}
-.wu-bar-fill{height:100%;background:var(--blue);border-radius:2px;animation:warmfill 3s ease-in-out infinite}
-@keyframes warmfill{0%{width:0%}60%{width:80%}100%{width:100%}}
-
-/* ── Responsive ── */
-@media(max-width:600px){
-  .hero-num{font-size:44px}
-  .tiles{grid-template-columns:repeat(2,1fr)}
-  .two-col{grid-template-columns:1fr}
-}
-</style>
-</head>
-<body>
-<div class="topbar">
-  <div class="tb-title">NU-AQI-3</div>
-  <div class="tb-right">
-    <span class="tb-badge" id="tb-badge">—</span>
-    <div class="dot spin" id="dot"></div>
-    <div class="tb-age" id="tb-age">connecting…</div>
-  </div>
-</div>
-<div class="page" id="page">
-  <div class="card">
-    <div class="card-bar" style="background:var(--blue);"></div>
-    <div class="card-body">
-      <div class="fullcard">
-        <div class="wu-ring"></div>
-        <div class="wu-title" style="color:var(--blue);">Connecting…</div>
-        <div class="wu-sub">Polling device, please wait.</div>
-      </div>
-    </div>
-  </div>
-</div>
+:root{--bg:#0f1216;--panel:#171b21;--line:#242a33;--fg:#e6e9ef;--dim:#8b95a5;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif;-webkit-text-size-adjust:100%}
+header{padding:12px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;position:sticky;top:0;background:var(--bg);z-index:5}
+h1{font-size:17px;margin:0;letter-spacing:.5px;white-space:nowrap}
+h1 b{font-weight:inherit}h1 span{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
+.sp{flex:1}
+.dim{color:var(--dim)}
+.pill{display:inline-block;padding:1px 9px;border-radius:20px;font-size:11px;border:1px solid;white-space:nowrap;color:var(--c,var(--dim))}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite;flex:none}
+@keyframes pulse{50%{opacity:.35}}
+.off .dot{background:var(--bad);animation:none}
+.off .wrap{opacity:.55}
+#upd{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.wrap{padding:16px 20px calc(16px + env(safe-area-inset-bottom));display:grid;gap:14px;max-width:1320px;margin:0 auto}
+.t0{--c:var(--ok)}.t1{--c:#c8c24a}.t2{--c:var(--warn)}.t3{--c:var(--bad)}.t4{--c:#b48bf2}.tw{--c:var(--acc)}.tn{--c:var(--dim)}
+.tc{color:var(--c,var(--fg))}
+.note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--c,var(--dim));border-radius:9px;padding:10px 14px}
+.cards{display:grid;grid-template-columns:repeat(8,1fr);gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:12px 14px;min-width:0}
+.k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.7px}
+.v{font-size:23px;margin-top:5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.v small{font-size:12px;color:var(--dim);margin-left:4px}
+.s{color:var(--dim);font-size:12px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card svg{display:block;width:100%;height:26px;margin-top:8px;color:var(--c,var(--acc))}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px;align-items:start}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:9px;overflow:hidden;min-width:0}
+.panel h2{margin:0;padding:11px 14px;font-size:13px;border-bottom:1px solid var(--line);color:var(--dim);text-transform:uppercase;letter-spacing:.7px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-weight:500;padding:7px 14px;border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase;white-space:nowrap}
+td{padding:7px 14px;border-bottom:1px solid var(--line);vertical-align:top;font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:none}
+td small{display:block;color:var(--dim);font-size:11px}
+td b{font-weight:600}
+.r{text-align:right}
+.up{color:var(--warn)}.dn{color:var(--acc)}
+.foot{padding:8px 14px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
+.kv>div{display:flex;justify-content:space-between;gap:14px;padding:7px 14px;border-bottom:1px solid var(--line)}
+.kv>div:last-child{border-bottom:none}
+.kv span{color:var(--dim);white-space:nowrap}
+.kv b{font-weight:500;text-align:right;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.on{color:var(--ok)}
+.sw{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;border:1px solid var(--line);vertical-align:-1px}
+@media(hover:hover){tr:hover td{background:#1c2129}}
+@media(max-width:1100px){.cards{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:640px){.cards{grid-template-columns:repeat(2,1fr);gap:10px}header{padding:10px 14px}h1 span{display:none}.wrap{padding:12px 12px calc(12px + env(safe-area-inset-bottom));gap:12px}.card{padding:10px 12px}.v{font-size:21px}td,th{padding:7px 10px}.hm{display:none}}
+@media(prefers-reduced-motion:reduce){.dot{animation:none}}
+</style></head><body>
+<header><h1><b id="nm">NU-AQI</b><span>air quality</span></h1><div class="sp"></div><span class="pill tn" id="lvl">connecting</span><span class="dot"></span><span class="dim" id="upd"></span></header>
+<div class="wrap">
+<div class="note tn" id="note">Loading…</div>
+<div class="cards" id="cards"></div>
+<div class="panel"><h2>Air readings</h2><table><thead><tr><th>Reading</th><th class="r">Now</th><th>Level</th><th class="r">10 min</th><th class="r hm">2 h low</th><th class="r hm">2 h high</th></tr></thead><tbody id="air"></tbody></table>
+<div class="foot">CO₂: circulate from 1000 ppm, fresh air from 1400 ppm. Changes and lows/highs come from the unit's own 2 h history.</div></div>
+<div class="grid">
+<div class="panel"><h2>Comfort</h2><div class="kv" id="p0"></div></div>
+<div class="panel"><h2>Wi-Fi</h2><div class="kv" id="p1"></div></div>
+<div class="panel"><h2>Device</h2><div class="kv" id="p2"></div></div>
+<div class="panel"><h2>Settings</h2><div class="kv" id="p3"></div><div class="foot">Shown only. Change them in Home Assistant.</div></div>
+</div></div>
 <script>
-'use strict';
-const REFRESH_MS = 8000;
-let D = {}, firstRender = true, errCount = 0;
+(()=>{
+const $=i=>document.getElementById(i),TL=['Excellent','Good','Monitor','Circulate','Fresh air'];
+// label, unit, decimals, level steps, 10-minute change [noticeable, fast], unit's own text
+const M={
+co2:['CO₂','ppm',0,[600,800,1000,1400],[20,80],'co2T'],
+voc:['VOC','index',0,[150.01,250.01,350.01,450.01],[8,30],'vocT'],
+vocf:['VOC fast','index',0,[150.01,250.01,350.01,450.01],[8,30]],
+nox:['NOx','index',0,[5.01,10,20,50],[2,8],'noxT'],
+pm1:['PM1','µg/m³',1,[5,5,20,35],[2,10]],
+pm25:['PM2.5','µg/m³',1,[25,50,100,150],[2,10]],
+pm4:['PM4','µg/m³',1,[5,5,20,35],[2,10]],
+pm10:['PM10','µg/m³',1,[20,20,75,150],[2,10]],
+pma:['PM AQI','NowCast',0,[25,50,100,150],[3,12],'pmT'],
+t:['Temperature','°F',1,0,[.4,1.5]],
+rh:['Humidity','%',1,0,[1,4]]};
+const CARDS=['co2','voc','vocf','nox','pma','pm25','t','rh'],ROWS=['co2','voc','vocf','nox','pm1','pm25','pm4','pm10','pma'];
+const KV=[
+[['tF','Temperature'],['rh2','Humidity'],['fl','Feels like'],['ah','Absolute humidity'],['ahT','Humidity status'],['off','Temperature offset applied']],
+[['ssid','Network'],['ap','Access point'],['bssid','BSSID'],['ip','IP address'],['wq','Signal quality'],['rssi','Signal strength'],['tx','Transmit power'],['rc','Reconnects'],['dc','Disconnects']],
+[['ready','Sensor ready'],['lvlT','Combined level'],['up','Uptime'],['fw','Firmware'],['built','Built'],['page','Page'],['cpu','CPU speed'],['esp','Chip temperature'],['unitT','Chip temperature status'],['heap','Free memory']],
+[['night','Auto night mode'],['adapt','Adaptive transmit power'],['led','AQI light'],['offB','Temperature offset base'],['offK','Heat coefficient']]];
+let D={},H={},bad=0,tmr=0,hNext=0;
 
-// ── Data helpers ──────────────────────────────────────────────────
-const N = k => { const v = D[k]; return (v == null || isNaN(v)) ? NaN : Number(v); };
-const T = k => D[k] == null ? '—' : String(D[k]);
-const isReady = () => D.ready === true || !isNaN(N('co2'));
+// build the fixed parts once
+let h='';
+CARDS.forEach(k=>{h+='<div class="card"><div class="k">'+M[k][0]+'</div><div class="v"><span id="v-'+k+'">—</span><small>'+(k==='pma'?'AQI':M[k][1])+'</small></div><div class="s" id="s-'+k+'">&nbsp;</div><svg id="q-'+k+'" viewBox="0 0 120 26" preserveAspectRatio="none"><polyline id="g-'+k+'" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div>'});
+$('cards').innerHTML=h;h='';
+ROWS.forEach(k=>{h+='<tr><td>'+M[k][0]+'<small id="x-'+k+'"></small></td><td class="r"><b id="r-'+k+'">—</b> <span class="dim">'+(k==='pma'?'':M[k][1])+'</span></td><td id="l-'+k+'">—</td><td class="r" id="d-'+k+'">—</td><td class="r hm" id="lo-'+k+'">—</td><td class="r hm" id="hi-'+k+'">—</td></tr>'});
+$('air').innerHTML=h;
+KV.forEach((p,i)=>{h='';p.forEach(r=>{h+='<div><span>'+r[1]+'</span><b id="k-'+r[0]+'">—</b></div>'});$('p'+i).innerHTML=h});
 
-// ── Unified 5-tier palette — exact match to Room AQI HA card ─────
-// Tier: 0=Excellent  1=Good  2=Monitor  3=Circulate  4=Fresh air
-// Warming-up uses a separate blue scheme (not a tier).
-const RAW   = ['rgb(0,228,0)','rgb(255,255,0)','rgb(255,126,0)','rgb(255,0,0)','rgb(143,63,151)'];
-const TEXT  = ['#68d391','#f0c060','#f0a050','#e87c6e','rgb(180,110,190)'];
-const BBG   = ['rgba(39,174,96,0.18)','rgba(184,134,11,0.14)','rgba(184,134,11,0.18)','rgba(192,57,43,0.18)','rgba(143,63,151,0.18)'];
-const BBR   = ['rgba(39,174,96,0.35)','rgba(184,134,11,0.28)','rgba(184,134,11,0.35)','rgba(192,57,43,0.35)','rgba(143,63,151,0.35)'];
-const TLBL  = ['Excellent','Good','Monitor','Circulate','Fresh Air'];
+// write a node only when its text or class really changed
+function tx(id,s,c){const e=$(id);if(!e)return;if(e.textContent!==s)e.textContent=s;if(c!==undefined&&e.className!==c)e.className=c}
+const conv=(k,v)=>v==null?null:k==='t'?v*1.8+32:v;
+const val=k=>conv(k,D[k]);
+const fmt=(v,d)=>v==null?'—':d?v.toFixed(d):Math.round(v).toLocaleString();
+function tier(k,v){const s=M[k][3];if(!s||v==null)return -1;let t=0;while(t<4&&v>=s[t])t++;return t}
+const tcl=t=>t<0?'tn':'t'+t;
+// history plus the live value, oldest first
+function ser(k){const a=(H[k]||[]).map(v=>conv(k,v)),v=val(k);if(v!=null)a.push(v);return a}
+// change over about 10 minutes; null until there is enough history
+function delta(k){const a=ser(k),n=a.length;if(n<3||a[n-1]==null)return null;let i=Math.max(0,n-11);while(i<n-1&&a[i]==null)i++;return i<n-1?a[n-1]-a[i]:null}
+// -2 falling fast .. 0 steady .. 2 rising fast
+function trend(k,d){if(d==null)return 0;const s=M[k][4],m=Math.abs(d);return m<s[0]?0:(d>0?1:-1)*(m>=s[1]?2:1)}
+function dtx(k,d){if(d==null)return'—';const m=Math.abs(d),s=M[k][2]||m<10?m.toFixed(1):Math.round(m)+'';return(d>0?'+':d<0?'−':'')+s}
+function spark(k){const a=ser(k).filter(v=>v!=null),p=$('g-'+k),n=a.length;if(!p)return;if(n<2){p.setAttribute('points','');return}
+let lo=Math.min(...a),hi=Math.max(...a),r=Math.max(hi-lo,M[k][4][1]),m=(lo+hi)/2,s='';
+for(let i=0;i<n;i++)s+=(i*120/(n-1)).toFixed(1)+','+(13-(a[i]-m)/r*22).toFixed(1)+' ';
+if(p.getAttribute('points')!==s)p.setAttribute('points',s)}
+function upTxt(s){if(s==null)return'—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+' d '+h+' h':h?h+' h '+m+' min':m?m+' min':s+' s'}
+const onoff=(id,v)=>tx('k-'+id,v==null?'—':v?'On':'Off',v?'on':'');
+const txt=(id,v)=>tx('k-'+id,v==null||v===''?'—':String(v));
+const num=(id,v,d,u)=>tx('k-'+id,v==null?'—':fmt(v,d)+u);
 
-// Blue warming-up palette — matches Room AQI card's falling/unavailable blue
-const WARM_TEXT   = '#74b9e8';
-const WARM_RAW    = 'rgb(116,185,232)';
-const WARM_BG     = 'rgba(26,107,174,0.18)';
-const WARM_BR     = 'rgba(26,107,174,0.35)';
-const WARM_DIMMED = 'rgba(26,107,174,0.08)';
-const WARM_DIMBD  = 'rgba(26,107,174,0.20)';
+function note(lv,ready){
+if(!ready)return['tw','Sensor is warming up. Readings appear shortly.'];
+const why=['co2','voc','nox','pma'].filter(k=>tier(k,val(k))===lv&&lv>0).map(k=>M[k][0]+' '+fmt(val(k),0)+(k==='co2'?' ppm':'')).join(', ');
+const tr=trend('co2',delta('co2')),rise=tr>0?' CO₂ is rising'+(tr>1?' fast.':'.'):'';
+if(lv>=4)return['t4','Bring in fresh air now: '+why+'.'];
+if(lv>=3)return['t3','Recirculate air: '+why+'.'+rise];
+if(lv>=2)return['t2','Monitor: '+why+'.'+(rise||' No action needed yet.')];
+if(lv>=1)return['t1','Good: '+why+'.'+(rise||' Air quality is acceptable.')];
+return['t0','Air quality is excellent. No ventilation needed.'+rise]}
 
-const rawColor  = t => RAW[t]  ?? 'rgba(255,255,255,0.15)';
-const textColor = t => TEXT[t] ?? '#6b7585';
-const badgeBg   = t => BBG[t]  ?? 'rgba(158,158,158,0.14)';
-const badgeBr   = t => BBR[t]  ?? 'rgba(158,158,158,0.24)';
-const tierLabel = t => TLBL[t] ?? '—';
-const ra = (raw, a) => raw.replace(/^rgb\(/, 'rgba(').replace(')', `,${a})`);
-
-// ── Tier mapping ──────────────────────────────────────────────────
-// CO₂ aligned to standard ventilation guidelines:
-//   Tier 0 Excellent: < 600 ppm
-//   Tier 1 Good:      600–800 ppm
-//   Tier 2 Monitor:   800–1000 ppm  (ASHRAE upper bound, slight stuffiness)
-//   Tier 3 Circulate: 1000–1400 ppm (noticeable fatigue, recirculate air)
-//   Tier 4 Fresh air: ≥ 1400 ppm    (significant impairment, open window/ERV)
-const valTier = (type, v) => {
-  if (isNaN(v)) return -1;
-  if (type === 'co2')  return v >= 1400 ? 4 : v >= 1000 ? 3 : v >= 800 ? 2 : v >= 600 ? 1 : 0;
-  if (type === 'voc')  return v > 450   ? 4 : v > 350   ? 3 : v > 250  ? 2 : v > 150  ? 1 : 0;
-  if (type === 'nox')  return v >= 50   ? 4 : v >= 20   ? 3 : v >= 10  ? 2 : v > 5    ? 1 : 0;
-  if (type === 'pm25') return v >= 150  ? 4 : v >= 100  ? 3 : v >= 50  ? 2 : v >= 25  ? 1 : 0;
-  if (type === 'pm1')  return v >= 35   ? 4 : v >= 20   ? 3 : v >= 5   ? 2 : 0;
-  if (type === 'pm4')  return v >= 35   ? 4 : v >= 20   ? 3 : v >= 5   ? 2 : 0;
-  if (type === 'pm10') return v >= 150  ? 4 : v >= 75   ? 3 : v >= 20  ? 2 : 0;
-  return -1;
-};
-
-const tc     = (type, v) => textColor(valTier(type, v));
-const co2C   = v => tc('co2',  v);
-const vocC   = v => tc('voc',  v);
-const noxC   = v => tc('nox',  v);
-const pm25C  = v => tc('pm25', v);
-const pm1C   = v => tc('pm1',  v);
-const pm4C   = v => tc('pm4',  v);
-const pm10C  = v => tc('pm10', v);
-
-const aqiLvl = (co2, voc, nox, pm) => Math.max(
-  isNaN(co2) ? 0 : valTier('co2',  co2),
-  isNaN(voc) ? 0 : valTier('voc',  voc),
-  isNaN(nox) ? 0 : valTier('nox',  nox),
-  isNaN(pm)  ? 0 : valTier('pm25', pm)
-);
-
-// ── Formatting ────────────────────────────────────────────────────
-const fv = (v, d = null) => {
-  if (isNaN(v)) return '—';
-  return d != null ? v.toFixed(d) : Number.isInteger(v) ? v.toLocaleString() : v.toFixed(1);
-};
-const fmtDelta = d => {
-  if (isNaN(d)) return '—';
-  const n = Math.abs(d) < 10 ? d.toFixed(1) : Math.round(d).toString();
-  return (d > 0 ? '+' : '') + n;
-};
-
-// ── Sensor history (delta / trend / age) ─────────────────────────
-const HIST = {};
-function track(key, v) {
-  if (isNaN(v)) return;
-  if (!HIST[key]) HIST[key] = { prev: NaN, t: 0, samples: [] };
-  const h = HIST[key], now = Date.now();
-  if (isNaN(h.prev) || Math.abs(v - h.prev) >= 0.05) {
-    if (!isNaN(h.prev)) h.samples.push({ v: h.prev, t: h.t });
-    if (h.samples.length > 6) h.samples.shift();
-    h.prev = v; h.t = now;
-  }
-}
-const getDelta = (key, v) => {
-  const h = HIST[key];
-  if (!h || isNaN(h.prev) || !h.samples.length) return NaN;
-  return v - h.samples[0].v;
-};
-function getTrend(key, v) {
-  const h = HIST[key];
-  if (!h || h.samples.length < 2) return { label: 'Stable', color: '#6b7585', rising: false, falling: false };
-  const d = getDelta(key, v);
-  if (isNaN(d) || Math.abs(d) < 0.5) return { label: 'Stable', color: '#6b7585', rising: false, falling: false };
-  const fast = Math.abs(d) > 5;
-  if (d > 0) return fast
-    ? { label: '↑↑ Rising fast', color: 'rgb(180,110,190)', rising: true,  falling: false }
-    : { label: '↑ Rising',       color: '#e87c6e',          rising: true,  falling: false };
-  return fast
-    ? { label: '↓↓ Falling fast', color: '#74b9e8', rising: false, falling: true }
-    : { label: '↓ Falling',       color: '#a0c8e8', rising: false, falling: true };
-}
-function getAge(key) {
-  const h = HIST[key];
-  if (!h || !h.t) return '—';
-  const s = Math.floor((Date.now() - h.t) / 1000);
-  if (s < 60)   return s + 's';
-  if (s < 3600) return Math.floor(s / 60) + 'm';
-  return Math.floor(s / 3600) + 'h';
-}
-const ageSpan = key => {
-  const a = getAge(key);
-  return a === '—' ? '' : ` <span style="font-size:9px;color:var(--muted);margin-left:3px;">${a}</span>`;
-};
-
-// ── UI components ─────────────────────────────────────────────────
-
-// Tile: warm=true renders blue warming-up placeholder
-function tile(label, value, t, warm = false) {
-  const c  = warm ? WARM_TEXT  : textColor(t);
-  const bg = warm ? WARM_BG    : badgeBg(t);
-  const br = warm ? WARM_BR    : badgeBr(t);
-  const sub = warm ? 'Warming…' : tierLabel(t);
-  return `<div class="tile" style="background:${bg};border-color:${br};">
-<div class="tile-lbl" style="color:${c};">${label}</div>
-<div class="tile-val" style="color:${c};">${value}</div>
-<div class="tile-sub" style="color:${c};">${sub}</div>
-</div>`;
+function render(){
+const ready=D.ready===true||D.co2!=null;
+const lv=ready?Math.max(0,tier('co2',val('co2')),tier('voc',val('voc')),tier('nox',val('nox')),tier('pma',val('pma'))):-1;
+if(D.name){tx('nm',D.name);const t=D.name+' - air quality';if(document.title!==t)document.title=t}
+tx('lvl',ready?TL[lv]:'Warming up','pill '+(ready?tcl(lv):'tw'));
+const n=note(lv,ready);tx('note',n[1],'note '+n[0]);
+CARDS.forEach(k=>{const v=val(k),t=tier(k,v),d=delta(k),tr=trend(k,d),c=M[k][3]?(ready?tcl(t):'tw'):'';
+tx('v-'+k,fmt(v,M[k][2]),'tc '+c);
+const lb=t>=0&&ready?TL[t]:'';tx('s-'+k,d==null?(lb||'no history yet'):(lb?lb+' · ':'')+(tr?(tr>0?'▲ ':'▼ ')+dtx(k,d):'steady'));
+const q=$('q-'+k);if(q.getAttribute('class')!==c)q.setAttribute('class',c);spark(k)});
+ROWS.forEach(k=>{const v=val(k),t=tier(k,v),d=delta(k),tr=trend(k,d),a=ser(k).filter(x=>x!=null),dc=M[k][2];
+tx('r-'+k,fmt(v,dc),'tc '+tcl(t));tx('l-'+k,t<0?'—':TL[t],'tc '+tcl(t));
+tx('d-'+k,d==null?'—':(tr>0?'▲ ':tr<0?'▼ ':'')+dtx(k,d),'r '+(tr>0?'up':tr<0?'dn':'dim'));
+tx('lo-'+k,a.length?fmt(Math.min(...a),dc):'—');tx('hi-'+k,a.length?fmt(Math.max(...a),dc):'—');
+if(M[k][5])tx('x-'+k,D[M[k][5]]||'')});
+const tc=D.t;tx('k-tF',tc==null?'—':(tc*1.8+32).toFixed(1)+' °F · '+tc.toFixed(1)+' °C');
+num('rh2',D.rh,1,' %');num('fl',D.fl,1,' °F');num('ah',D.ah,2,' g/m³');txt('ahT',D.ahT);num('off',D.off,1,' °F');
+txt('ssid',D.ssid);txt('ap',D.ap);txt('bssid',D.bssid);txt('ip',D.ip);num('wq',D.wq,0,' %');num('rssi',D.rssi,0,' dBm');num('tx',D.tx,1,' dBm');num('rc',D.rc,0,'');num('dc',D.dc,0,'');
+tx('k-ready',D.ready==null?'—':D.ready?'Yes':'Warming up',D.ready?'on':'');txt('lvlT',D.lvlT);tx('k-up',upTxt(D.up));
+txt('fw',(D.proj?'v'+D.proj+' · ':'')+(D.ver?'ESPHome '+D.ver:''));txt('built',D.built);txt('page',D.page?'v'+D.page:null);
+num('cpu',D.cpu,0,' MHz');num('esp',D.esp,0,' °F');txt('unitT',D.unitT);num('heap',D.heap==null?null:D.heap/1024,0,' KB');
+onoff('night',D.night);onoff('adapt',D.adapt);
+const e=$('k-led'),ls=D.led==null?'—':D.led?'On · '+fmt(D.ledB,0)+' %':'Off';
+if(e.dataset.s!==ls+D.ledC){e.dataset.s=ls+D.ledC;e.textContent=ls;if(D.led&&D.ledC){const i=document.createElement('i');i.className='sw';i.style.background=D.ledC;e.prepend(i)}}
+num('offB',D.offB,2,' °C');num('offK',D.offK,2,'');
 }
 
-// Ventilation banner
-// lv is the precomputed worst tier so it matches the top bar exactly.
-// Banner messages distinguish recirculate (tier 3) from fresh air (tier 4),
-// and handle tier 1+rising so a trending-up good room isn't falsely green.
-function vbanner(lv, co2, voc, nox, pm25) {
-  const co2Trend = getTrend('co2', co2);
-  const co2Rising = co2Trend.rising;
-  const co2Fast   = co2Trend.label.includes('fast');
-  const co2Tier   = valTier('co2', co2);
-
-  // Threshold booleans — named to match standard action levels
-  const c2fresh  = !isNaN(co2) && co2 >= 1400;  // tier 4: bring in outdoor air
-  const c2circ   = !isNaN(co2) && co2 >= 1000;  // tier 3: recirculate
-  const c2mon    = !isNaN(co2) && co2 >= 800;   // tier 2: monitor
-  const c2good   = !isNaN(co2) && co2 >= 600;   // tier 1: good
-  const vocCrit  = !isNaN(voc)  && voc  > 450;
-  const vocHigh  = !isNaN(voc)  && voc  > 350;
-  const vocMod   = !isNaN(voc)  && voc  > 250;
-  const noxCrit  = !isNaN(nox)  && nox  >= 50;
-  const noxHigh  = !isNaN(nox)  && nox  >= 20;
-  const noxMod   = !isNaN(nox)  && nox  >= 10;
-  const pmCrit   = !isNaN(pm25) && pm25 >= 35;
-  const pmHigh   = !isNaN(pm25) && pm25 >= 12;
-
-  let ic, msg;
-  if (lv >= 4) {
-    ic = '⚡';
-    msg = 'Bring in fresh air now — ' +
-      [c2fresh&&'CO₂ ≥1400 ppm', vocCrit&&'VOC >450', noxCrit&&'NOx ≥50', pmCrit&&'PM2.5 ≥35']
-        .filter(Boolean).join(', ');
-  } else if (lv >= 3) {
-    ic = '↺';
-    msg = 'Recirculate air — ' +
-      [c2circ&&'CO₂ 1000–1400 ppm', vocHigh&&'VOC >350', noxHigh&&'NOx elevated', pmHigh&&'PM2.5 ≥12']
-        .filter(Boolean).join(', ');
-  } else if (lv >= 2 && co2Rising) {
-    ic = '⚠';
-    msg = co2Fast
-      ? 'CO₂ 800–1000 ppm and rising fast — prepare to circulate'
-      : 'CO₂ 800–1000 ppm and rising — monitor closely';
-  } else if (lv >= 2) {
-    ic = '~';
-    msg = 'CO₂ 800–1000 ppm — no action needed yet';
-  } else if (co2Tier >= 1 && co2Rising) {
-    // tier 1 (600–800) but trending upward — show yellow warning not false green
-    ic = '~';
-    msg = co2Fast
-      ? 'CO₂ good but rising fast — watch closely'
-      : 'CO₂ good but rising — trending up';
-  } else if (lv >= 1) {
-    ic = '~';
-    msg = 'CO₂ good — air quality acceptable';
-  } else {
-    ic = '✓';
-    msg = 'Air quality good — no ventilation needed';
-  }
-
-  // For tier 1+rising use tier 1 yellow styling even though lv may be 0
-  const styleTier = (co2Tier >= 1 && co2Rising && lv < 2) ? 1 : lv;
-  const bg = ra(rawColor(styleTier), styleTier >= 3 ? 0.14 : styleTier >= 2 ? 0.12 : 0.10);
-  const br = ra(rawColor(styleTier), styleTier >= 3 ? 0.35 : styleTier >= 2 ? 0.30 : 0.28);
-  const ac = rawColor(styleTier);
-
-  return `<div class="vbanner" style="background:${bg};border-color:${br};">
-<div class="vb-bar" style="background:${ac};"></div>
-<span class="vb-icon">${ic}</span>
-<span class="vb-msg">${msg}</span>
-</div>`;
-}
-
-// Blue warming-up banner
-const warmBanner = `<div class="vbanner" style="background:${WARM_DIMMED};border-color:${WARM_DIMBD};">
-<div class="vb-bar" style="background:${WARM_RAW};"></div>
-<span class="vb-icon">⏳</span>
-<span class="vb-msg">Sensor is warming up — please wait, readings will appear shortly</span>
-</div>`;
-
-// Sensor row
-function srow(key, label, v, type) {
-  track(key, v);
-  const t   = valTier(type, v);
-  const vc  = textColor(t);
-  const raw = rawColor(t);
-  const d   = getDelta(key, v);
-  const tr  = getTrend(key, v);
-  const age = getAge(key);
-  const dc  = isNaN(d) ? '#6b7585' : d > 0 ? '#e87c6e' : d < 0 ? '#74b9e8' : '#6b7585';
-  const rowBg = tr.rising  ? ra(rawColor(3), 0.06)
-    : tr.falling ? 'rgba(26,107,174,0.06)'
-    : t >= 4     ? ra(rawColor(4), 0.07)
-    : t >= 3     ? ra(rawColor(3), 0.06)
-    :              'rgba(255,255,255,0.02)';
-  const rowBd = tr.rising  ? ra(rawColor(3), 0.20)
-    : tr.falling ? 'rgba(26,107,174,0.20)'
-    : t >= 4     ? ra(rawColor(4), 0.20)
-    : t >= 3     ? ra(rawColor(3), 0.16)
-    :              'rgba(255,255,255,0.05)';
-  const accent = tr.rising || tr.falling ? tr.color : t >= 0 ? raw : 'transparent';
-  const acOp   = tr.rising || tr.falling ? '0.7' : t >= 0 ? '0.5' : '0.15';
-  const bold   = tr.rising || tr.falling;
-  return `<div class="srow" style="background:${rowBg};border-color:${rowBd};">
-<div class="srow-bar" style="background:${accent};opacity:${acOp};"></div>
-<div class="srow-lbl" style="color:${bold?'var(--text)':'#6b7585'};font-weight:${bold?600:400};">${label}</div>
-<div class="srow-delta" style="color:${dc};">${fmtDelta(d)}</div>
-<div class="srow-trend" style="color:${tr.color};">${tr.label}</div>
-<div class="srow-age">${age}</div>
-<div class="srow-val" style="color:${vc};font-weight:${bold?700:500};">${fv(v)}</div>
-</div>`;
-}
-
-const colHdr = `<div class="col-hdr">
-<div class="ch f1">Sensor</div>
-<div class="ch" style="width:60px;text-align:right;">Delta</div>
-<div class="ch" style="width:100px;text-align:right;">Trend</div>
-<div class="ch" style="width:36px;text-align:right;">Age</div>
-<div class="ch" style="width:68px;text-align:right;">Value</div>
-</div>`;
-
-const sw = str => (!str || str === '—' || str === 'Warming up') ? '' : str.split('(')[0].trim();
-
-// ── Poll ──────────────────────────────────────────────────────────
-function setDot(cls) { document.getElementById('dot').className = 'dot ' + cls; }
-
-async function poll() {
-  setDot('spin');
-  try {
-    const r = await fetch('/data.json', { signal: AbortSignal.timeout(4000), cache: 'no-store' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    D = await r.json();
-    errCount = 0;
-    document.getElementById('tb-age').textContent = new Date().toLocaleTimeString();
-    render();
-  } catch (e) {
-    errCount++;
-    setDot('err');
-    document.getElementById('tb-age').textContent = 'error · ' + errCount;
-    if (firstRender) showError(e.message);
-  }
-}
-
-// ── Render ────────────────────────────────────────────────────────
-function render() {
-  const co2   = N('co2'),   voc  = N('voc'),   nox  = N('nox');
-  const pm1   = N('pm1'),   pm25 = N('pm25'),  pm4  = N('pm4'),  pm10 = N('pm10');
-  const temp  = N('temp'),  humid = N('humid'), absH = N('absHumid'), fl = N('feelsLike');
-  const pmAqi = N('pmAqi'), wQ   = N('wifiQ'), espT = N('espTemp');
-
-  track('temp', temp); track('humid', humid); track('fl', fl);
-  track('absH', absH); track('wQ', wQ);       track('espT', espT);
-
-  const ready = isReady();
-  const lv    = Math.min(aqiLvl(co2, voc, nox, pmAqi), 4);
-
-  // Colors — warming state is blue throughout
-  const barC  = ready ? rawColor(lv)   : WARM_RAW;
-  const badC  = ready ? textColor(lv)  : WARM_TEXT;
-  const badBg = ready ? badgeBg(lv)    : WARM_BG;
-  const badBr = ready ? badgeBr(lv)    : WARM_BR;
-  const heroC = ready ? co2C(co2)      : WARM_TEXT;
-  const vocHC = ready ? vocC(voc)      : WARM_TEXT;
-  const ll    = ready ? tierLabel(lv)  : 'Warming Up';
-
-  // Badge
-  const badge = document.getElementById('tb-badge');
-  badge.textContent = ll;
-  badge.style.cssText = `background:${badBg};border-color:${badBr};color:${badC};font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:0.06em;padding:2px 9px;border-radius:20px;border-width:1px;border-style:solid;`;
-  setDot(ready ? 'ok' : 'warm');
-
-  // Display values
-  const co2d = !ready ? '—' : isNaN(co2)   ? '—' : Math.round(co2).toLocaleString();
-  const vocd = !ready ? '—' : isNaN(voc)   ? '—' : Math.round(voc).toLocaleString();
-  const noxd = isNaN(nox)   ? '—' : Math.round(nox).toString();
-  const pmd  = isNaN(pmAqi) ? '—' : Math.round(pmAqi).toString();
-  const ahw  = T('ahTxt').split('(')[0].trim();
-
-  // Tier values for tiles
-  const c2t = valTier('co2',  co2);
-  const vt  = valTier('voc',  voc);
-  const nt  = valTier('nox',  nox);
-  const pt  = valTier('pm25', pmAqi);
-
-  // Warming tile — blue placeholder
-  const wt = `<div class="tile" style="background:${WARM_BG};border-color:${WARM_BR};">
-<div class="tile-lbl" style="color:${WARM_TEXT};">—</div>
-<div class="tile-val" style="color:${WARM_TEXT};">—</div>
-<div class="tile-sub" style="color:${WARM_TEXT};">Warming…</div>
-</div>`;
-
-  document.getElementById('page').innerHTML = `
-<div class="card">
-<div class="card-bar" style="background:${barC};"></div>
-<div class="card-body">
-<div class="sec-lbl">CO₂</div>
-<div class="hero-row">
-  <div>
-    <div class="hero-main">
-      <div class="hero-num" style="color:${heroC};">${co2d}</div>
-      <div class="hero-unit">ppm</div>
-    </div>
-    <div class="hero-sub">${ready ? 'circ ≥1000 ppm · fresh air ≥1400 ppm' : 'Sensor warming up — readings will appear shortly'}</div>
-  </div>
-  <div class="hero-aside">
-    <div class="ha-label">VOC Index</div>
-    <div class="ha-num" style="color:${vocHC};">${vocd}</div>
-    <div class="ha-unit">index</div>
-  </div>
-</div>
-<div class="tiles">
-${ready
-  ? tile('CO₂',co2d,c2t)+tile('VOC',vocd,vt)+tile('NOx',noxd,nt)+tile('PM AQI',pmd,pt)
-  : wt+wt+wt+wt}
-</div>
-${ready ? vbanner(lv,co2,voc,nox,pm25) : warmBanner}
-${colHdr}
-${srow('co2',  'CO₂',      co2,   'co2')}
-${srow('voc',  'VOC Index', voc,   'voc')}
-${srow('nox',  'NOx Index', nox,   'nox')}
-${srow('pm25', 'PM 2.5',    pm25,  'pm25')}
-${srow('pm1',  'PM 1.0',    pm1,   'pm1')}
-${srow('pm4',  'PM 4.0',    pm4,   'pm4')}
-${srow('pm10', 'PM 10',     pm10,  'pm10')}
-${srow('pmAqi','PM AQI',    pmAqi, 'pm25')}
-</div></div>
-
-<div class="two-col">
-<div class="card">
-<div class="card-bar" style="background:#74b9e8;"></div>
-<div class="card-body">
-<div class="sec-lbl">Environment</div>
-<div class="mgrid">
-<div class="mcell"><div class="mc-lbl">Temperature</div><div><span class="mc-val">${fv(isNaN(temp)?NaN:(temp*9/5+32),1)}</span><span class="mc-unit">°F</span>${ageSpan('temp')}</div></div>
-<div class="mcell"><div class="mc-lbl">Humidity</div><div><span class="mc-val">${fv(humid,1)}</span><span class="mc-unit">%</span>${ageSpan('humid')}</div></div>
-<div class="mcell"><div class="mc-lbl">Feels Like</div><div><span class="mc-val">${fv(fl,1)}</span><span class="mc-unit">°F</span>${ageSpan('fl')}</div></div>
-<div class="mcell"><div class="mc-lbl">Absolute Humidity</div><div><span class="mc-val">${fv(absH,2)}</span><span class="mc-unit">g/m³</span>${ageSpan('absH')}</div>${ahw?`<div class="mc-sub">${ahw}</div>`:''}</div>
-</div>
-</div></div>
-
-<div class="card">
-<div class="card-bar" style="background:#6b7585;"></div>
-<div class="card-body">
-<div class="sec-lbl">Device</div>
-${[
-  ['Sensor Ready',  ready ? 'Yes' : 'Warming up…', ''],
-  ['Combined AQI',  sw(T('combinedTxt')) || ll,     ''],
-  ['WiFi Quality',  isNaN(wQ)   ? '—' : Math.round(wQ)   + '%',   ageSpan('wQ')],
-  ['ESP32 Temp',    isNaN(espT) ? '—' : espT.toFixed(1)   + '°F',  ageSpan('espT')],
-].map(([l,v,a]) => `<div class="drow"><div class="dr-lbl">${l}</div><div class="dr-val">${v}${a}</div></div>`).join('')}
-<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
-<div class="sec-lbl" style="margin-bottom:6px;">Text Sensors</div>
-${[['CO₂',T('co2Txt')],['VOC',T('vocTxt')],['NOx',T('noxTxt')],['PM',T('pmTxt')],['AH',T('ahTxt')]].map(([l,v])=>`<div class="drow"><div class="dr-lbl">${l}</div><div class="dr-val" style="font-size:10px;max-width:160px;text-align:right;line-height:1.3;">${v}</div></div>`).join('')}
-</div>
-</div></div>
-</div>`;
-
-  firstRender = false;
-}
-
-function showError(msg) {
-  if (!firstRender) return;
-  document.getElementById('page').innerHTML = `<div class="card">
-<div class="card-bar" style="background:var(--red);"></div>
-<div class="card-body"><div class="fullcard">
-<div style="font-size:36px;color:var(--red);">✕</div>
-<div class="wu-title" style="color:var(--red);">Connection Lost</div>
-<div class="wu-sub">${msg}<br><br>Check that the device is powered and on the network.</div>
-</div></div></div>`;
-}
-
-poll();
-setInterval(poll, REFRESH_MS);
-</script>
-</body>
-</html>
+async function get(u){const c=new AbortController(),t=setTimeout(()=>c.abort(),4000);
+try{const r=await fetch(u,{signal:c.signal,cache:'no-store'});if(!r.ok)throw new Error(r.status);return await r.json()}finally{clearTimeout(t)}}
+async function tick(){
+clearTimeout(tmr);if(document.hidden)return;
+if(Date.now()>=hNext){try{const j=await get('/hist.json'),o={};j.k.forEach((k,i)=>o[k]=j.d[i]);H=o;hNext=Date.now()+(62-Math.min(j.age,60))*1000}catch(e){hNext=Date.now()+15000}}
+try{D=await get('/data.json');bad=0;if(document.body.className)document.body.className='';render();tx('upd',new Date().toLocaleTimeString())}
+catch(e){if(++bad>1){document.body.className='off';tx('lvl','Offline','pill t3');tx('upd','no answer × '+bad)}}
+tmr=setTimeout(tick,4000)}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)tick()});
+tick();
+})();
+</script></body></html>
 )ESPH";
 
 // ─────────────────────────────────────────────────────────────────
 //  C++ HTTP server — port 8080
 // ─────────────────────────────────────────────────────────────────
 
+// Changes with every firmware build, so a browser re-fetches the page only then.
+static const char NUAQI_ETAG[] = "\"" NUAQI_PAGE_VERSION "-" __DATE__ "-" __TIME__ "\"";
+
 static esp_err_t nuaqi_html_handler(httpd_req_t *req) {
-  httpd_resp_set_type(req, "text/html; charset=utf-8");
-  const char  *p         = NUAQI_DASH_HTML;
-  size_t       remaining = sizeof(NUAQI_DASH_HTML) - 1;
-  const size_t CHUNK     = 4096;
-  while (remaining > 0) {
-    size_t to_send = remaining < CHUNK ? remaining : CHUNK;
-    if (httpd_resp_send_chunk(req, p, (ssize_t)to_send) != ESP_OK) {
-      httpd_resp_send_chunk(req, nullptr, 0);
-      return ESP_FAIL;
-    }
-    p += to_send; remaining -= to_send;
+  char seen[64];
+  httpd_resp_set_hdr(req, "ETag", NUAQI_ETAG);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  if (httpd_req_get_hdr_value_str(req, "If-None-Match", seen, sizeof(seen)) == ESP_OK && strcmp(seen, NUAQI_ETAG) == 0) {
+    httpd_resp_set_status(req, "304 Not Modified");
+    return httpd_resp_send(req, nullptr, 0);
   }
-  return httpd_resp_send_chunk(req, nullptr, 0);
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  return httpd_resp_send(req, NUAQI_DASH_HTML, sizeof(NUAQI_DASH_HTML) - 1);
 }
 
 static esp_err_t nuaqi_healthz_handler(httpd_req_t *req) {
@@ -670,75 +434,90 @@ static esp_err_t nuaqi_healthz_handler(httpd_req_t *req) {
   return httpd_resp_sendstr(req, "OK");
 }
 
+// Sends the snapshot the main loop built. One web task serves every request, so the static buffer is safe.
 static esp_err_t nuaqi_data_handler(httpd_req_t *req) {
-  std::string out;
-  out.reserve(1024);
-  out += "{";
-
-  append_sensor(out, "co2",       "co2");
-  append_sensor(out, "voc",       "voc");
-  append_sensor(out, "nox",       "nox");
-  append_sensor(out, "pm1",       "pm__1__m");
-  append_sensor(out, "pm25",      "pm__2_5__m");
-  append_sensor(out, "pm4",       "pm__4__m");
-  append_sensor(out, "pm10",      "pm__10__m");
-  append_sensor(out, "temp",      "temperature");
-  append_sensor(out, "humid",     "humidity");
-  append_sensor(out, "absHumid",  "absolute_humidity");
-  append_sensor(out, "feelsLike", "aqi_feels_like_temp");
-  append_sensor(out, "pmAqi",     "average_pm_aqi");
-  append_sensor(out, "wifiQ",     "wifi_signal_quality");
-  append_sensor(out, "espTemp",   "esp32_internal_temperature__f_");
-
-  append_text(out, "co2Txt",      "aqi_co2");
-  append_text(out, "vocTxt",      "aqi_tvoc");
-  append_text(out, "noxTxt",      "aqi_nox");
-  append_text(out, "pmTxt",       "pm_aqi");
-  append_text(out, "ahTxt",       "aqi_ah");
-  append_text(out, "combinedTxt", "aqi_combined_level");
-
-  append_binary(out, "ready", "nu_aqi_3_sensor_ready");
-
-  if (!out.empty() && out.back() == ',') out.pop_back();
-  out += "}";
-
+  static char out[NUAQI_SNAP_CAP];
+  size_t n = 0;
+  if (nuaqi_lock != nullptr && xSemaphoreTake(nuaqi_lock, pdMS_TO_TICKS(300)) == pdTRUE) {
+    n = nuaqi_snap_len;
+    memcpy(out, nuaqi_snap, n);
+    xSemaphoreGive(nuaqi_lock);
+  }
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  return httpd_resp_send(req, out.c_str(), out.size());
+  if (n == 0) return httpd_resp_sendstr(req, "{}");
+  return httpd_resp_send(req, out, n);
 }
 
+// 2 h of history: copied out under the lock, then written one series per chunk.
+static esp_err_t nuaqi_hist_handler(httpd_req_t *req) {
+  static float copy[NUAQI_HS][NUAQI_HN];
+  uint16_t count = 0, head = 0;
+  uint32_t age = 0;
+  if (nuaqi_lock != nullptr && xSemaphoreTake(nuaqi_lock, pdMS_TO_TICKS(300)) == pdTRUE) {
+    memcpy(copy, nuaqi_hist, sizeof(copy));
+    count = nuaqi_hist_count;
+    head = nuaqi_hist_head;
+    age = (esphome::millis() - nuaqi_hist_ms) / 1000;
+    xSemaphoreGive(nuaqi_lock);
+  }
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  char buf[1280];
+  int n = snprintf(buf, sizeof(buf), "{\"step\":%u,\"age\":%u,\"n\":%u,\"k\":[", (unsigned) (NUAQI_HIST_STEP_MS / 1000),
+                   (unsigned) age, (unsigned) count);
+  for (int s = 0; s < NUAQI_HS; s++)
+    n += snprintf(buf + n, sizeof(buf) - n, "%s\"%s\"", s ? "," : "", NUAQI_NUMS[s].key);
+  n += snprintf(buf + n, sizeof(buf) - n, "],\"d\":[");
+  if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) return ESP_FAIL;
+
+  for (int s = 0; s < NUAQI_HS; s++) {
+    n = 0;
+    buf[n++] = '[';
+    for (uint16_t i = 0; i < count; i++) {
+      // oldest first: when the ring is full the oldest sample sits at head
+      uint16_t idx = (uint16_t) ((head + NUAQI_HN - count + i) % NUAQI_HN);
+      float v = copy[s][idx];
+      if ((size_t) n + 16 >= sizeof(buf)) break;
+      if (i) buf[n++] = ',';
+      if (isnan(v) || isinf(v)) n += snprintf(buf + n, sizeof(buf) - n, "null");
+      else n += snprintf(buf + n, sizeof(buf) - n, "%.*f", NUAQI_NUMS[s].dec, (double) v);
+    }
+    buf[n++] = ']';
+    if (s < NUAQI_HS - 1) buf[n++] = ',';
+    if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) return ESP_FAIL;
+  }
+  if (httpd_resp_send_chunk(req, "]}", 2) != ESP_OK) return ESP_FAIL;
+  return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+// Starts the server. Safe to call repeatedly: returns at once when it is running,
+// and tries again on the next call when the start failed.
 void nuaqi_dash_register() {
   static bool registered = false;
   if (registered) return;
-
-  static bool dumped = false;
-  if (!dumped) {
-    dumped = true;
-    ESP_LOGI("nuaqi_dash", "--- Registered sensors ---");
-    for (auto *s : esphome::App.get_sensors())
-      ESP_LOGI("nuaqi_dash", "  sensor:        name='%s' sanitized='%s'",
-               s->get_name().c_str(), sanitize_id(s->get_name()).c_str());
-    for (auto *s : esphome::App.get_text_sensors())
-      ESP_LOGI("nuaqi_dash", "  text_sensor:   name='%s' sanitized='%s'",
-               s->get_name().c_str(), sanitize_id(s->get_name()).c_str());
-    for (auto *s : esphome::App.get_binary_sensors())
-      ESP_LOGI("nuaqi_dash", "  binary_sensor: name='%s' sanitized='%s'",
-               s->get_name().c_str(), sanitize_id(s->get_name()).c_str());
-    ESP_LOGI("nuaqi_dash", "--------------------------");
-  }
+  if (nuaqi_lock == nullptr) nuaqi_lock = xSemaphoreCreateMutex();
+  if (nuaqi_lock == nullptr) return;
 
   httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
   config.server_port      = 8080;
-  config.ctrl_port        = 0;
+  // ctrl_port must be a real port: 0 binds an ephemeral one, but httpd still sends its work queue to
+  // port 0, so the LRU purge never closes a socket and the server stops answering once they are all taken.
+  config.ctrl_port        = 32769;
   config.stack_size       = 10240;
-  config.max_uri_handlers = 4;
-  config.max_open_sockets = 3;
+  config.max_uri_handlers = 6;
+  config.max_open_sockets = 4;
   config.lru_purge_enable = true;
+  config.keep_alive_enable   = true;    // a browser that vanished frees its socket
+  config.keep_alive_idle     = 10;
+  config.keep_alive_interval = 5;
+  config.keep_alive_count    = 3;
 
   httpd_handle_t server = nullptr;
   esp_err_t err = httpd_start(&server, &config);
   if (err != ESP_OK) {
-    ESP_LOGE("nuaqi_dash", "httpd_start failed: 0x%x (%s) — will retry", err, esp_err_to_name(err));
+    ESP_LOGE(NUAQI_TAG, "httpd_start failed: 0x%x (%s) — will retry", err, esp_err_to_name(err));
     return;
   }
   registered = true;
@@ -747,9 +526,42 @@ void nuaqi_dash_register() {
     { "/",          HTTP_GET, nuaqi_html_handler,    nullptr },
     { "/dash",      HTTP_GET, nuaqi_html_handler,    nullptr },
     { "/data.json", HTTP_GET, nuaqi_data_handler,    nullptr },
+    { "/hist.json", HTTP_GET, nuaqi_hist_handler,    nullptr },
     { "/healthz",   HTTP_GET, nuaqi_healthz_handler, nullptr },
   };
   for (const auto &u : uris) httpd_register_uri_handler(server, &u);
 
-  ESP_LOGI("nuaqi_dash", "Dashboard v3.3 running at http://<device-ip>:8080/");
+  ESP_LOGI(NUAQI_TAG, "Dashboard v" NUAQI_PAGE_VERSION " running at http://<device-ip>:8080/ (page %u bytes)",
+           (unsigned) (sizeof(NUAQI_DASH_HTML) - 1));
+}
+
+// Call from the main loop every 2 s (interval: in the yaml). Builds the JSON the web task serves
+// and adds one history sample a minute. Never blocks: when the web task holds the lock, this
+// round is skipped and the next one catches up.
+void nuaqi_dash_tick() {
+  static bool resolved = false;
+  static uint32_t last_try = 0;
+  static char work[NUAQI_SNAP_CAP];
+  uint32_t now = esphome::millis();
+
+  if (nuaqi_lock == nullptr || now - last_try >= 10000 || last_try == 0) {
+    last_try = now ? now : 1;
+    nuaqi_dash_register();
+  }
+  if (nuaqi_lock == nullptr) return;
+  if (!resolved) { resolved = true; nuaqi_resolve(); }
+
+  size_t n = nuaqi_build(work, sizeof(work));
+  bool sample = nuaqi_hist_count == 0 || now - nuaqi_hist_ms >= NUAQI_HIST_STEP_MS;
+
+  if (xSemaphoreTake(nuaqi_lock, 0) != pdTRUE) return;
+  memcpy(nuaqi_snap, work, n + 1);
+  nuaqi_snap_len = n;
+  if (sample) {
+    for (int s = 0; s < NUAQI_HS; s++) nuaqi_hist[s][nuaqi_hist_head] = nuaqi_value(NUAQI_NUMS[s]);
+    nuaqi_hist_head = (uint16_t) ((nuaqi_hist_head + 1) % NUAQI_HN);
+    if (nuaqi_hist_count < NUAQI_HN) nuaqi_hist_count++;
+    nuaqi_hist_ms = now;
+  }
+  xSemaphoreGive(nuaqi_lock);
 }

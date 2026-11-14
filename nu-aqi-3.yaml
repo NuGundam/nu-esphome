@@ -1,5 +1,9 @@
 # =======================================================
-# NU-AQI-3  v5.4
+# NU-AQI-3  v5.5
+# Changes from v5.4:
+#   - Web dashboard v4.0 (custom_web.h): nuarr look, every entity, phone layout, 2 h history
+#     kept on the unit. The main loop now builds the page's data: nuaqi_dash_tick() every 2 s.
+#   - project version follows this header (was stuck at 4.8).
 # Changes from v5.3:
 #   - VOC index learning time 240 h (was Sensirion's default 12 h), the same as the SGP41
 #     units in nuaqi-common: a smell that comes back every day is no longer learned as normal.
@@ -53,7 +57,7 @@ esphome:
   friendly_name: NU-AQI-3
   project:
     name: "my.nu-aqi-3"
-    version: "4.8"
+    version: "5.5"
   includes:
     - custom_web.h          # embedded dashboard → http://<device-ip>:8080/
     - nuaqi_helpers.h       # WiFi TX power readback helper
@@ -837,6 +841,11 @@ interval:
           if (p > 20.0f) p = 20.0f;
           id(wifi_power_setpoint) = p;
           nuaqi_wifi_set_tx_power_dbm(p);  // re-asserted every pass
+  # v5.5: builds the dashboard's JSON snapshot and its one-a-minute history (custom_web.h v4.0).
+  # It also starts the web server and retries every 10 s until that works.
+  - interval: 2s
+    then:
+      - lambda: nuaqi_dash_tick();
   - interval: 10s
     then:
       - lambda: |-

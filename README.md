@@ -88,8 +88,13 @@ in one sensor.
 - The PM score is the real EPA NowCast: a 12-hour weighted average of PM2.5 and PM10 on the
   May 2024 breakpoints.
 - Humidity is recalculated after the temperature correction, so absolute humidity stays right.
-- Runs its own web dashboard on port 8080 ([`custom_web.h`](custom_web.h)), reading sensor state
-  directly in C++ instead of using the ESPHome `web_server`.
+- Runs its own web dashboard on port 8080 ([`custom_web.h`](custom_web.h)) instead of the ESPHome
+  `web_server`: every entity of the unit on one dark page that also fits a phone.
+- The main loop builds the page's JSON every 2 s and the web task only hands it out, so no state
+  is read across threads. The unit keeps 2 h of one-minute history, which gives the page
+  sparklines, a 10-minute change and a 2 h low/high as soon as it opens.
+- The page is 14 KB, is sent with an ETag (a reload costs a 304), polls every 4 s and stops while
+  the tab is hidden.
 - Tuned for heat: 80 MHz CPU and low Wi-Fi power, because a warm board reads the air wrong.
 - Two VOC sensors: "VOC" is smoothed for trends, "VOC Fast" is the same index before smoothing,
   so a short event such as a spray shows up within seconds.
