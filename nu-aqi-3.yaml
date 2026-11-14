@@ -1,5 +1,8 @@
 # =======================================================
-# NU-AQI-3  v5.3
+# NU-AQI-3  v5.4
+# Changes from v5.3:
+#   - VOC index learning time 240 h (was Sensirion's default 12 h), the same as the SGP41
+#     units in nuaqi-common: a smell that comes back every day is no longer learned as normal.
 # Changes from v5.2:
 #   - "VOC Fast": the SEN66 VOC index before the smoothing on "VOC", for short odor events
 #     (a spray, a door opening). "VOC" itself is unchanged.
@@ -411,6 +414,11 @@ sensor:
       name: "VOC"
       id: sen66_voc
       icon: "mdi:flask-outline"
+      # v5.4: the index compares the air with its own running average. 240 h (10 days)
+      # for both averages, as on the SGP41 units; the other values stay at the defaults.
+      algorithm_tuning:
+        learning_time_offset_hours: 240
+        learning_time_gain_hours: 240
       filters:
         - exponential_moving_average:
             alpha: 0.05
