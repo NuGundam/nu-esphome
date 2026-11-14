@@ -1,5 +1,5 @@
 # =======================================================
-# NUAQI-COMMON  v2.2 — shared package for NU-AQI-1/2/4/5/6
+# NUAQI-COMMON  v2.4 — shared package for NU-AQI-1/2/4/5/6
 # (SHT40 + SGP41 + SCD40 units; NU-AQI-3 SEN66 unit is standalone)
 #
 # Each device's yaml sets substitutions and includes this file:
@@ -15,6 +15,9 @@
 #   "WiFi Reconnects" counter from wifi.on_connect, to see which units
 #   re-associate and how often (2026-11-06 dropout hunt). Diagnostic only.
 # v2.2 (2026-11-07): "Access Point" = BSSID mapped to the router's AP name (nuaqi_helpers.h).
+# v2.4 (2026-11-14): "VOC Fast" = the SGP41 VOC index before the smoothing on "VOC Index",
+#   for short odor events and for seeing which room moved first. "VOC Index" is unchanged.
+#   (v2.3, the optional multiplexer, is a separate draft and is NOT in this file.)
 # =======================================================
 esphome:
   name: ${device_name}
@@ -379,6 +382,16 @@ sensor:
         - exponential_moving_average:
             alpha: 0.05
             send_every: 10
+      # v2.4: every unsmoothed value (one per 10 s) also goes to "VOC Fast" below
+      on_raw_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !isnan(x);'
+              then:
+                - sensor.template.publish:
+                    id: sgp41_voc_fast
+                    state: !lambda 'return x;'
     nox_index:
       name: "NOx Index"
       icon: "mdi:smog"
@@ -395,6 +408,20 @@ sensor:
     store_baseline: true
     update_interval: 10s
     address: 0x59
+  # v2.4: the VOC index without the smoothing. "VOC Index" above sends one smoothed value
+  # per 100 s; this one is fed every 10 s and sends any move of 5 points at once, plus one
+  # value every 5 minutes.
+  - platform: template
+    name: "VOC Fast"
+    id: sgp41_voc_fast
+    icon: "mdi:flask-outline"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 5.0
   # SHT40 — Temp/Humidity — on Multiplexer Channel 0
   - platform: sht4x
     i2c_id: multiplex0channel0

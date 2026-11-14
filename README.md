@@ -74,6 +74,9 @@ The room sensor. One shared package, [`common/nuaqi-common.yaml`](common/nuaqi-c
 all the logic, and each device file is a few lines of names and keys.
 
 - SHT40 temperature and humidity, SGP41 VOC and NOx, SCD40 CO2.
+- Two VOC sensors: "VOC Index" is smoothed for trends (one value per 100 s), "VOC Fast" is the
+  same index before smoothing (read every 10 s), so a short event shows up quickly and you can
+  see which room moved first.
 - A single combined air quality level drives a colour LED, so you can see the room at a glance.
 - The LED dims at night, based on sunset and sunrise.
 - Temperature is corrected for the heat the board itself gives off, and the correction follows
