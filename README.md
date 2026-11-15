@@ -4,7 +4,7 @@
 [![licence](https://img.shields.io/github/license/NuGundam/nu-esphome?label=licence&color=6fb0ff)](LICENSE)
 [![esphome](https://img.shields.io/badge/ESPHome-2026.10-6fb0ff)](https://esphome.io)
 
-**The ESPHome firmware behind one Home Assistant house: 21 devices for air quality, HVAC zoning, presence and more.**
+**The ESPHome firmware behind one Home Assistant house: 20 devices for air quality, HVAC zoning, presence and more.**
 
 Everything here is a real config from a working house, not an example. Most of these started
 from stock firmware or a sensor on a breadboard and grew whatever the house turned out to need:
@@ -23,12 +23,11 @@ and failsafes for when Home Assistant goes away.
 | [`nu-aqi-3`](#nu-aqi-3) | Room air quality with a web dashboard | Arduino Nano ESP32, SEN66 | Office 1 |
 | [`airgradient-loft`, `airgradient-kitchen`](#airgradient-loft-airgradient-kitchen) | AirGradient ONE on local firmware | AirGradient I-9PSL | Loft, Kitchen |
 | [`nu-presence-1`, `2`](#nu-presence-1-2) | 60 GHz presence, breathing and light, with a web page | Seeed MR60BHA2 kit | Loft, not installed yet |
-| [`nu-presence-24ghz-1`](#nu-presence-24ghz-1) | 24 GHz presence with a tuning page | Arduino Nano ESP32, LD2410C | Family Room |
+| [`nu-presence-24ghz-1`](#nu-presence-24ghz-1) | 24 GHz presence with its own screen and a tuning page | Waveshare ESP32-S3-LCD-1.47B, LD2410C | Family Room |
 | [`nu-presence-24ghz-2`](#nu-presence-24ghz-2) | 24 GHz multi-person tracking with a room map | Apollo MTR-1, LD2450 | Upper Hallway |
 | [`nu-garage-1`](#nu-garage-1) | Garage air quality and 24 GHz presence | ESP32-S3 Super Mini, SEN55, LD2410C | Garage |
 | [`nu-range-hood`](#nu-range-hood) | Three-speed kitchen hood | ESP32-S3, relays | Kitchen |
 | [`nu-esp32-2432s028r`](#nu-esp32-2432s028r) | Wall touch panel for a light | ESP32-2432S028R display | Office 1 |
-| [`nu-esp32-s3-lcd-1`](#nu-esp32-s3-lcd-1) | Small status screen | SpotPear ESP32-S3-LCD-1.47 | Office 1 |
 | [`nu-thread-1`](#nu-thread-1) | Soil moisture over Thread | ESP32-H2 | Dining Room |
 | [`nu-wt-1`](#nu-wt-1) | Water pump on a relay | ESP32-C6 | Dining Room |
 | [`nu-test-1`](#nu-test-1) | Bench test board | Arduino Nano ESP32, SHT4x | Closet |
@@ -150,8 +149,16 @@ in [`common/mr60-presence-common.yaml`](common/mr60-presence-common.yaml).
 
 ### nu-presence-24ghz-1
 
-An HLK-LD2410C on an Arduino Nano ESP32. This radar reports moving and still energy in 0.75 m
-distance gates, so it can see someone sitting on a couch.
+An HLK-LD2410C on a Waveshare ESP32-S3-LCD-1.47B (it started on an Arduino Nano ESP32). This
+radar reports moving and still energy in 0.75 m distance gates, so it can see someone sitting on
+a couch.
+
+- The 1.47" screen has three pages: Presence (MOVING / STILL / CLEAR banner, target distance,
+  zone chips, move and still energy bars), Gates (per-ring energies against their thresholds) and
+  Status. The BOOT button or the `Display page` select switches pages; the screen can turn off
+  when the room is clear.
+- The board's RGB LED is the presence light: blue while moving, green while still only, with a
+  brightness setting, an optional dim glow when clear, and an off switch.
 
 - Per-gate sensitivity, two distance zones and a `Moving target` tuned separately from `Occupied`.
 - Tuning page on port 8080 ([`radar_web.h`](radar_web.h)) with live gate energies and a room view.
@@ -215,11 +222,6 @@ A "Cheap Yellow Display" used as a wall touch panel for a light, built with LVGL
   panel noise, and "Last Touch Event" shows how long each press lasted.
 - The header comment explains how each guard came about.
 - Change the `light.` entity in the yaml to your own.
-
-### nu-esp32-s3-lcd-1
-
-A SpotPear ESP32-S3-LCD-1.47 showing temperature, Wi-Fi signal, SSID and IP, with an addressable
-status LED.
 
 ### nu-thread-1
 
