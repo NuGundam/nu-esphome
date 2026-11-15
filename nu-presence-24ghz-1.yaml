@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Presence-24GHz-1  v2.0 (2026-11-15) - HLK-LD2410C 24 GHz presence radar on a
+# NU-Presence-24GHz-1  v2.1 (2026-11-15) - HLK-LD2410C 24 GHz presence radar on a
 # Waveshare ESP32-S3-LCD-1.47B (ESP32-S3R8, 16 MB flash, 8 MB octal PSRAM, 172x320 ST7789 LCD).
 # Moved from the Arduino Nano ESP32 (v1.13); every entity name is kept so HA keeps its entity ids.
 # The board used to run "nu-esp32-s3-lcd-1" (clock / Wi-Fi screen + unused "AQI LED").
@@ -29,6 +29,9 @@
 #   * Presence LED: blue = moving, green = still only, off (or a dim white "Presence LED
 #     clear glow") when clear. "Presence LED" switch is the off switch (now on by default),
 #     "Presence LED brightness" scales it. The "LED" light entity is the raw LED.
+# v2.1 (2026-11-15): defaults after boot - Engineering mode turned on at 25 s (again at ~75 s if off) and
+#   Radar Bluetooth turned off at ~65 s when the settings query reports it on (that write restarts the radar,
+#   so it is skipped once BT is already off). The move to this board had left the module on factory settings.
 # =======================================================
 substitutions:
   device_name: nu-presence-24ghz-1
@@ -71,8 +74,27 @@ esphome:
         # on NU-Garage-1, so ask again at 60 s)
         - delay: 20s
         - button.press: btn_query
-        - delay: 40s
+        - delay: 5s
+        - switch.turn_on: sw_eng        # v2.1: Engineering mode on by default (the module forgets it on a restart)
+        - delay: 35s
         - button.press: btn_query
+        # v2.1: Radar Bluetooth off by default. It is saved in the module and turning it off restarts the
+        # radar, so only send it when the query says it is on (no flash write / restart on normal boots).
+        - delay: 5s
+        - if:
+            condition:
+              switch.is_on: sw_bt
+            then:
+              - switch.turn_off: sw_bt
+              - delay: 10s
+              - button.press: btn_query
+        # the radar restart above (or a lost command) clears Engineering mode: turn it on once more
+        - delay: 5s
+        - if:
+            condition:
+              switch.is_off: sw_eng
+            then:
+              - switch.turn_on: sw_eng
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -667,6 +689,7 @@ switch:
       name: "Engineering mode"
       entity_category: config
     bluetooth:
+      id: sw_bt
       name: "Radar Bluetooth"
       entity_category: config
   - platform: template
