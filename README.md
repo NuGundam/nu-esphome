@@ -119,6 +119,8 @@ AirGradient ONE units moved from stock firmware to ESPHome with no cloud posting
   "VOC index" and "NOx index" still send one value a minute.
 - The 11-LED bar works like the stock one: it starts with one LED at the far left and adds more
   as the air gets worse, moving through the AQI colours.
+- The OLED level text follows the bar, so the words and the colour always agree. Both wait until
+  the reading is clearly below a line before stepping down.
 - The OLED stays, a blue LED sweeps during warm-up, and a test button walks the bar through every level.
 - Pins and the EPA formula come from
   [MallocArray/airgradient_esphome](https://github.com/MallocArray/airgradient_esphome), copied in

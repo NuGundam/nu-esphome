@@ -1,5 +1,5 @@
 # =======================================================
-# AIRGRADIENT-ONE-COMMON v0.7 - shared package for AirGradient ONE (I-9PSL) units
+# AIRGRADIENT-ONE-COMMON v0.8 - shared package for AirGradient ONE (I-9PSL) units
 # ESP32-C3-MINI + SenseAir S8 (CO2) + PMS5003 (PM) + SHT40 (T/RH) + SGP41 (VOC/NOx)
 # + 1.3" SH1106 OLED + 11x WS2812 bar + button on GPIO9 + external watchdog on GPIO2.
 #
@@ -45,6 +45,10 @@
 # page); "LED bar brightness" 0 switches the bar off. The AQI text sensors report the
 # category only ("Excellent"), so their HA history is a few clean bands instead of a new
 # band per index change; the numbers are the plain sensors next to them.
+# v0.8 (2026-11-15): the level (OLED, "AQI Combined Level") now comes from the LED count, so the
+#     text and the bar colour always agree. Before, the bar held its LEDs until the reading was 0.1
+#     of a level below the edge but the text had no hold: CO2 583-600 showed 3 yellow LEDs with
+#     "Excellent". A reading exactly on an edge (CO2 600) now lights 2 LEDs, as Excellent says.
 # v0.7 (2026-11-14): "VOC Fast" = the SGP41 VOC index every 10 s, for short events (cooking, a
 #     spray); it sends any move of 5 points at once, plus one value every 5 minutes. The SGP41
 #     is now read out every 10 s for that, and "VOC index" / "NOx index" are throttled so they
@@ -1001,13 +1005,20 @@ interval:
           for (int i = 1; i < 4; i++) if (s[i] > s[worst]) worst = i;
           float top = s[worst];
           id(aqi_worst) = worst;
-          int level = (int) ceilf(top) - 1;
-          id(aqi_level_score) = level < 0 ? 0 : (level > 4 ? 4 : level);
-          // two LEDs per level; only drop an LED once clearly below its edge
-          auto leds = [](float t) -> int { int l = 1 + (int) floorf(t * 2.0f); return l > 11 ? 11 : l; };
+          // two LEDs per level (level = ceil(score) - 1, as the NU-AQI-3 ladders): the second one
+          // past the middle of the level; LED 11 only at the top of the scale.
+          auto leds = [](float t) -> int {
+            if (t <= 0.0f) return 1;
+            if (t >= 5.0f) return 11;
+            int lv = (int) ceilf(t) - 1;
+            return 2 * lv + 1 + (t - lv > 0.5f ? 1 : 0); };
+          // only drop an LED once clearly below its edge
           int target = leds(top), cur = id(led_lit);
           if (target < cur && leds(top + 0.1f) >= cur) target = cur;
           id(led_lit) = target;
+          // v0.8: the level follows the bar (LEDs 1-2 Excellent ... 9-11 Unhealthy), same hold
+          int level = (target - 1) / 2;
+          id(aqi_level_score) = level > 4 ? 4 : level;
 
 button:
   - platform: restart
