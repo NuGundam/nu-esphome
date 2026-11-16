@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Presence-24GHz-1  v2.1 (2026-11-15) - HLK-LD2410C 24 GHz presence radar on a
+# NU-Presence-24GHz-1  v2.2 (2026-11-15) - HLK-LD2410C 24 GHz presence radar on a
 # Waveshare ESP32-S3-LCD-1.47B (ESP32-S3R8, 16 MB flash, 8 MB octal PSRAM, 172x320 ST7789 LCD).
 # Moved from the Arduino Nano ESP32 (v1.13); every entity name is kept so HA keeps its entity ids.
 # The board used to run "nu-esp32-s3-lcd-1" (clock / Wi-Fi screen + unused "AQI LED").
@@ -32,6 +32,7 @@
 # v2.1 (2026-11-15): defaults after boot - Engineering mode turned on at 25 s (again at ~75 s if off) and
 #   Radar Bluetooth turned off at ~65 s when the settings query reports it on (that write restarts the radar,
 #   so it is skipped once BT is already off). The move to this board had left the module on factory settings.
+# v2.2 (2026-11-15): "24-hour clock" switch for the Presence and Status page clocks; off (default) = 12-hour AM/PM.
 # =======================================================
 substitutions:
   device_name: nu-presence-24ghz-1
@@ -710,6 +711,13 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
     entity_category: config
+  - platform: template
+    id: sw_24h
+    name: "24-hour clock"                 # v2.2: off = 12-hour with AM/PM
+    icon: mdi:clock-digital
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
 
 select:
   - platform: ld2410
@@ -865,7 +873,11 @@ display:
         const Color band = mv ? BLUE : (occ ? GREEN : DARK);
         it.filled_rectangle(0, 0, W, 46, band);
         it.print(10, 23, id(f_big), WHITE, TextAlign::CENTER_LEFT, mv ? "MOVING" : (occ ? "STILL" : "CLEAR"));
-        if (clock.is_valid()) it.strftime(W - 10, 23, id(f_mid), WHITE, TextAlign::CENTER_RIGHT, "%H:%M", clock);
+        if (clock.is_valid()) {
+          if (id(sw_24h).state) it.strftime(W - 10, 23, id(f_mid), WHITE, TextAlign::CENTER_RIGHT, "%H:%M", clock);
+          else it.printf(W - 10, 23, id(f_mid), WHITE, TextAlign::CENTER_RIGHT, "%d:%02d %s",
+                         clock.hour % 12 == 0 ? 12 : clock.hour % 12, clock.minute, clock.hour < 12 ? "AM" : "PM");
+        }
 
         // target distance + zones
         if (occ) it.printf(10, 54, id(f_mid), WHITE, TextAlign::TOP_LEFT, "Target %.2f m", id(raw_dist) / 100.0f);
@@ -931,7 +943,11 @@ display:
       // ---------- page 2: status ----------
       } else {
         it.print(8, 4, id(f_small), WHITE, TextAlign::TOP_LEFT, "Nu-Presence-24GHz-1");
-        if (clock.is_valid()) it.strftime(W - 8, 4, id(f_small), WHITE, TextAlign::TOP_RIGHT, "%H:%M:%S", clock);
+        if (clock.is_valid()) {
+          if (id(sw_24h).state) it.strftime(W - 8, 4, id(f_small), WHITE, TextAlign::TOP_RIGHT, "%H:%M:%S", clock);
+          else it.printf(W - 8, 4, id(f_small), WHITE, TextAlign::TOP_RIGHT, "%d:%02d:%02d %s",
+                         clock.hour % 12 == 0 ? 12 : clock.hour % 12, clock.minute, clock.second, clock.hour < 12 ? "AM" : "PM");
+        }
         char ipbuf[network::IP_ADDRESS_BUFFER_SIZE] = "-";
         if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected())
           wifi::global_wifi_component->get_ip_addresses()[0].str_to(ipbuf);
