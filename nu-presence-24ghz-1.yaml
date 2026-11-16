@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Presence-24GHz-1  v2.2 (2026-11-15) - HLK-LD2410C 24 GHz presence radar on a
+# NU-Presence-24GHz-1  v2.3 (2026-11-15) - HLK-LD2410C 24 GHz presence radar on a
 # Waveshare ESP32-S3-LCD-1.47B (ESP32-S3R8, 16 MB flash, 8 MB octal PSRAM, 172x320 ST7789 LCD).
 # Moved from the Arduino Nano ESP32 (v1.13); every entity name is kept so HA keeps its entity ids.
 # The board used to run "nu-esp32-s3-lcd-1" (clock / Wi-Fi screen + unused "AQI LED").
@@ -33,9 +33,12 @@
 #   Radar Bluetooth turned off at ~65 s when the settings query reports it on (that write restarts the radar,
 #   so it is skipped once BT is already off). The move to this board had left the module on factory settings.
 # v2.2 (2026-11-15): "24-hour clock" switch for the Presence and Status page clocks; off (default) = 12-hour AM/PM.
+# v2.3 (2026-11-15): "Screen orientation" select. Portrait (USB down) = the v2 case (board upright, radar on top):
+#   rotation 180 and portrait pages (172 x 320). Landscape (USB left) = the v1 case and the old pages (default).
 # =======================================================
 substitutions:
   device_name: nu-presence-24ghz-1
+  portrait_rotation: "180"     # v2.3: USB-C down; if the portrait picture is upside down use "0"
   friendly_name: Nu-Presence-24GHz-1
   api_key: !secret api_key
   ap_ssid: "Nu-Presence-24GHz-1 Hotspot"
@@ -66,6 +69,8 @@ esphome:
     - priority: -100
       then:
         - lambda: |-
+            id(my_display).set_rotation(id(sel_orient).active_index().value_or(0) == 1   // v2.3
+                ? display::DISPLAY_ROTATION_${portrait_rotation}_DEGREES : display::DISPLAY_ROTATION_90_DEGREES);
             esphome::number::Number *zs[] = {id(zone_a_near), id(zone_a_far), id(zone_b_near), id(zone_b_far), id(zone_edge)};
             for (auto *n : zs)
               if (n->has_state() && n->state > n->traits.get_max_value()) n->make_call().set_value(n->state / 100.0f).perform();
@@ -745,6 +750,19 @@ select:
           if (x == "Presence") id(cur_page) = 0;
           else if (x == "Gates") id(cur_page) = 1;
           else if (x == "Status") id(cur_page) = 2;
+  - platform: template
+    id: sel_orient
+    name: "Screen orientation"                # v2.3: Portrait = USB-C down (v2 case), Landscape = USB-C left (v1 case)
+    icon: mdi:screen-rotation
+    options: ["Landscape (USB left)", "Portrait (USB down)"]
+    initial_option: "Landscape (USB left)"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - lambda: |-
+          id(my_display).set_rotation(i == 1 ? display::DISPLAY_ROTATION_${portrait_rotation}_DEGREES
+                                             : display::DISPLAY_ROTATION_90_DEGREES);
 
 button:
   - platform: ld2410
@@ -819,7 +837,7 @@ script:
           }
 
 # -------------------------------------------------------
-# SCREEN - 1.47" ST7789 172x320, landscape (320 wide x 172 high)
+# SCREEN - 1.47" ST7789 172x320, landscape (320 x 172) or portrait (172 x 320) via "Screen orientation"
 # -------------------------------------------------------
 spi:
   id: bus_spi
@@ -863,9 +881,125 @@ display:
     lambda: |-
       const Color WHITE(255, 255, 255), GREY(130, 130, 130), DIM(55, 55, 55), BLACK(0, 0, 0);
       const Color BLUE(20, 110, 255), GREEN(0, 190, 80), AMBER(255, 170, 0), DARK(40, 40, 40);
-      const int W = 320;
+      const bool PORT = id(sel_orient).active_index().value_or(0) == 1;   // v2.3: portrait = USB-C down (v2 case)
+      const int W = PORT ? 172 : 320;
       it.fill(BLACK);
       auto clock = id(home_time).now();
+
+      // ================= PORTRAIT (172 x 320) =================
+      if (PORT) {
+        const Color LINE(25, 25, 25);
+        char tbuf[16] = "", tsec[16] = "";
+        if (clock.is_valid()) {
+          const int h12 = clock.hour % 12 == 0 ? 12 : clock.hour % 12;
+          const char *ap = clock.hour < 12 ? "AM" : "PM";
+          if (id(sw_24h).state) {
+            snprintf(tbuf, sizeof(tbuf), "%02d:%02d", clock.hour, clock.minute);
+            snprintf(tsec, sizeof(tsec), "%02d:%02d:%02d", clock.hour, clock.minute, clock.second);
+          } else {
+            snprintf(tbuf, sizeof(tbuf), "%d:%02d %s", h12, clock.minute, ap);
+            snprintf(tsec, sizeof(tsec), "%d:%02d:%02d %s", h12, clock.minute, clock.second, ap);
+          }
+        }
+        // ---------- page 0: presence ----------
+        if (id(cur_page) == 0) {
+          const bool occ = id(occupied).state, mv = id(bs_mv).state, st = id(bs_st).state;
+          it.filled_rectangle(0, 0, W, 66, mv ? BLUE : (occ ? GREEN : DARK));
+          it.print(W / 2, 24, id(f_big), WHITE, TextAlign::CENTER, mv ? "MOVING" : (occ ? "STILL" : "CLEAR"));
+          if (tbuf[0]) it.print(W / 2, 53, id(f_small), WHITE, TextAlign::CENTER, tbuf);
+          if (occ) {
+            it.print(W / 2, 78, id(f_tiny), GREY, TextAlign::CENTER, "TARGET");
+            it.printf(W / 2, 98, id(f_mid), WHITE, TextAlign::CENTER, "%.2f m", id(raw_dist) / 100.0f);
+          } else {
+            it.print(W / 2, 90, id(f_mid), GREY, TextAlign::CENTER, "No target");
+          }
+          const bool za = id(zone_a).state, zb = id(zone_b).state;
+          if (za) it.filled_rectangle(8, 116, 74, 26, AMBER); else it.rectangle(8, 116, 74, 26, DIM);
+          it.print(45, 129, id(f_small), za ? BLACK : GREY, TextAlign::CENTER, "Zone A");
+          if (zb) it.filled_rectangle(90, 116, 74, 26, AMBER); else it.rectangle(90, 116, 74, 26, DIM);
+          it.print(127, 129, id(f_small), zb ? BLACK : GREY, TextAlign::CENTER, "Zone B");
+          auto bar = [&](int y, const char *lab, Color col, bool on, float en, float dist_cm) {
+            it.printf(8, y, id(f_small), on ? col : GREY, TextAlign::CENTER_LEFT, "%s %.0f", lab, en);
+            if (on) it.printf(W - 8, y, id(f_small), WHITE, TextAlign::CENTER_RIGHT, "%.2fm", dist_cm / 100.0f);
+            it.rectangle(8, y + 11, W - 16, 16, DIM);
+            int w = (int) (fmaxf(0.0f, fminf(100.0f, en)) * (W - 18) / 100.0f);
+            if (w > 0) it.filled_rectangle(9, y + 12, w, 14, on ? col : DIM);
+          };
+          bar(160, "Move", BLUE, mv, mv ? id(raw_men) : 0.0f, id(raw_mdist));
+          bar(204, "Still", GREEN, st, st ? id(raw_sen) : 0.0f, id(raw_sdist));
+          it.line(0, 246, W, 246, DIM);
+          it.printf(8, 262, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "Clear delay %.0f s", id(n_timeout).state);
+          it.printf(8, 280, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "Max gate %.0f / %.0f", id(n_maxm).state, id(n_maxs).state);
+          it.printf(8, 298, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "%.0f B/s", id(radar_bps).state);
+          if (!id(presence_led).state) it.print(W - 8, 298, id(f_tiny), GREY, TextAlign::CENTER_RIGHT, "LED off");
+
+        // ---------- page 1: gates (one row per 0.75 m ring) ----------
+        } else if (id(cur_page) == 1) {
+          it.print(6, 4, id(f_small), WHITE, TextAlign::TOP_LEFT, "Gates");
+          it.print(W - 6, 4, id(f_tiny), BLUE, TextAlign::TOP_RIGHT, "move");
+          it.print(W - 6, 18, id(f_tiny), GREEN, TextAlign::TOP_RIGHT, "still");
+          if (!id(sw_eng).state) {
+            it.print(W / 2, 140, id(f_small), GREY, TextAlign::CENTER, "Engineering");
+            it.print(W / 2, 160, id(f_small), GREY, TextAlign::CENTER, "mode is off");
+            it.print(W / 2, 186, id(f_tiny), GREY, TextAlign::CENTER, "turn it on in HA to see");
+            it.print(W / 2, 202, id(f_tiny), GREY, TextAlign::CENTER, "per-gate energy");
+          } else {
+            esphome::sensor::Sensor *gm[9] = {id(gme0), id(gme1), id(gme2), id(gme3), id(gme4), id(gme5), id(gme6), id(gme7), id(gme8)};
+            esphome::sensor::Sensor *gs[9] = {id(gse0), id(gse1), id(gse2), id(gse3), id(gse4), id(gse5), id(gse6), id(gse7), id(gse8)};
+            esphome::number::Number *gmt[9] = {id(gmt0), id(gmt1), id(gmt2), id(gmt3), id(gmt4), id(gmt5), id(gmt6), id(gmt7), id(gmt8)};
+            esphome::number::Number *gst[9] = {id(gst0), id(gst1), id(gst2), id(gst3), id(gst4), id(gst5), id(gst6), id(gst7), id(gst8)};
+            const int x0 = 22, bwid = W - 28, top = 38, rowh = 30;
+            auto xv = [&](float v) { v = isnan(v) ? 0.0f : fmaxf(0.0f, fminf(100.0f, v)); return x0 + (int) (v * bwid / 100.0f); };
+            int tg = -1;
+            if (id(occupied).state) { tg = (int) (id(raw_dist) / 75.0f); if (tg > 8) tg = 8; }
+            for (int i = 0; i < 9; i++) {
+              const int y = top + i * rowh;
+              const bool in_m = i <= (int) id(n_maxm).state, in_s = i <= (int) id(n_maxs).state;
+              it.printf(10, y + 13, id(f_tiny), (in_m || in_s) ? WHITE : GREY, TextAlign::CENTER, "%d", i);
+              int w = xv(gm[i]->state) - x0;
+              if (w > 0) it.filled_rectangle(x0, y + 2, w, 11, in_m ? BLUE : DIM);
+              w = xv(gs[i]->state) - x0;
+              if (w > 0) it.filled_rectangle(x0, y + 14, w, 11, in_s ? GREEN : DIM);
+              it.filled_rectangle(xv(gmt[i]->state) - 1, y + 1, 3, 13, WHITE);
+              it.filled_rectangle(xv(gst[i]->state) - 1, y + 13, 3, 13, WHITE);
+              if (i == tg) it.rectangle(1, y - 1, W - 2, rowh, AMBER);
+            }
+            it.line(x0 - 1, top, x0 - 1, top + 9 * rowh - 4, DIM);
+            it.print(W / 2, 312, id(f_tiny), GREY, TextAlign::CENTER, "tick = threshold, 0.75 m each");
+          }
+
+        // ---------- page 2: status ----------
+        } else {
+          it.print(W / 2, 12, id(f_small), WHITE, TextAlign::CENTER, "Nu-Presence-24GHz-1");
+          if (tsec[0]) it.print(W / 2, 44, id(f_mid), WHITE, TextAlign::CENTER, tsec);
+          char ipbuf[network::IP_ADDRESS_BUFFER_SIZE] = "-";
+          if (wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected())
+            wifi::global_wifi_component->get_ip_addresses()[0].str_to(ipbuf);
+          const float up = id(s_uptime).state;
+          const int d = (int) (up / 86400), h = ((int) up % 86400) / 3600, m = ((int) up % 3600) / 60;
+          char v[40];
+          int y = 74;
+          auto row = [&](const char *lab, const char *val) {
+            it.print(6, y, id(f_tiny), GREY, TextAlign::CENTER_LEFT, lab);
+            it.print(W - 6, y, id(f_small), WHITE, TextAlign::CENTER_RIGHT, val);
+            it.line(6, y + 13, W - 6, y + 13, LINE);
+            y += 26;
+          };
+          snprintf(v, sizeof(v), "%.0f dBm", id(s_rssi).state); row("Wi-Fi", v);
+          row("AP", id(wd_access_point).has_state() ? id(wd_access_point).state.c_str() : "-");
+          row("IP", ipbuf);
+          snprintf(v, sizeof(v), "%dd %02d:%02d", d, h, m); row("Uptime", v);
+          snprintf(v, sizeof(v), "%.0f B/s", id(radar_bps).state); row("Radar", v);
+          row("Radar fw", id(ts_fw).has_state() ? id(ts_fw).state.c_str() : "?");
+          snprintf(v, sizeof(v), "%.0f F", id(s_mcu).state * 1.8f + 32.0f); row("MCU", v);
+          row("LED", id(presence_led).state ? "on" : "off");
+          row("Orientation", "Portrait");
+          it.print(W / 2, 310, id(f_tiny), DIM, TextAlign::CENTER, "BOOT = next page   :8080");
+        }
+        return;
+      }
+
+      // ================= LANDSCAPE (320 x 172, v1 case) =================
 
       // ---------- page 0: presence ----------
       if (id(cur_page) == 0) {
