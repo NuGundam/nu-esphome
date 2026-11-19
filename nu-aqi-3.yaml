@@ -53,6 +53,9 @@
 # =======================================================
 # Keeps _esphomelib in mDNS next to the _http service from the USE_WEBSERVER flags (2026-11-07):
 # without it the Device Builder never sees this device's version or config_hash.
+packages:
+  wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)
+
 external_components:
   - source:
       type: local

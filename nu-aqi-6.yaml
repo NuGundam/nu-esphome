@@ -9,6 +9,7 @@ substitutions:
   ap_password: !secret ap_password
 packages:
   nuaqi_common: !include common/nuaqi-common.yaml
+  wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)
 # NOTE: this unit previously ran output_power: 18dB (highest in the fleet —
 # probably the worst WiFi spot). The common package sets 8.5dB; if "WiFi
 # Signal Quality" drops below ~60% after flashing, override it here:

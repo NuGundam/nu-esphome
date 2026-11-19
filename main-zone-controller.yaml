@@ -21,6 +21,7 @@
 
 packages:
   wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+  wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)
 
 esphome:
   name: main-zone-controller
@@ -34,6 +35,7 @@ esp32:
 logger:
   baud_rate: 115200
   level: ERROR
+  boot_log_level: ERROR   # 2026.11: boot log level must not be more verbose than level
 
 api:
   encryption:

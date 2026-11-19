@@ -1,0 +1,103 @@
+# =======================================================
+# WIFI-STEER v1.0 (2026-11-19) - keep each ESP32 on the strongest mesh node.
+#
+# Add to any Wi-Fi device yaml:
+#   packages:
+#     wifi_steer: !include common/wifi-steer.yaml
+#
+# ESPHome's built-in post-connect roaming checks only 3 times (5/10/15 min after
+# a connect) and then stops for good, so a device that joined a far node (node
+# reboot, power cut, fast_connect after a boot) stays there for days. This
+# package replaces it with a check that never gives up:
+#   - 3 min after every connect, then
+#   - every 10 min while the signal is under -70 dBm,
+#   - every 30 min while it is under -60 dBm,
+#   - never while it is -60 dBm or better (nothing worth gaining).
+# A check is one scan; ESPHome moves only to a node with the same SSID that is
+# at least 10 dB stronger (built-in hysteresis, so no ping-pong). The new BSSID
+# is saved by fast_connect, so a reboot comes back to the better node.
+#
+# Entities: switch "WiFi Steering" (on by default, remembered), button
+# "Find Best WiFi Node" (check now), text "WiFi Steer" (last check:
+# signal + time since boot). Node moves show in the wifi-diag "Access Point" /
+# "WiFi Reconnects" sensors.
+# =======================================================
+wifi:
+  post_connect_roaming: false   # replaced by the interval below (built-in stops after 3 checks)
+  on_connect:
+    - lambda: |-
+        id(ws_connected_ms) = millis();
+        id(ws_last_check_ms) = 0;
+
+globals:
+  - id: ws_connected_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ws_last_check_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+script:
+  - id: ws_check
+    mode: single
+    then:
+      - lambda: |-
+          auto *w = wifi::global_wifi_component;
+          int rssi = w->wifi_rssi();
+          id(ws_last_check_ms) = millis();
+          uint32_t up = millis() / 60000;
+          char buf[48];
+          snprintf(buf, sizeof(buf), "check at %d dBm, up %uh%02um", rssi, (unsigned) (up / 60), (unsigned) (up % 60));
+          id(ws_status).publish_state(buf);
+          ESP_LOGI("wifi_steer", "Roam check at %d dBm", rssi);
+      - wifi.roam:
+
+interval:
+  - interval: 1min
+    then:
+      - lambda: |-
+          if (!id(ws_enabled).state) return;
+          auto *w = wifi::global_wifi_component;
+          if (!w->is_connected() || w->is_roaming()) return;
+          const uint32_t now = millis();
+          const int rssi = w->wifi_rssi();
+          const uint32_t since_conn = now - id(ws_connected_ms);
+          const uint32_t since_check = now - id(ws_last_check_ms);
+          bool due;
+          if (id(ws_last_check_ms) == 0)
+            due = since_conn >= 3 * 60000UL && rssi < -60;          // first check after a connect
+          else if (rssi < -70)
+            due = since_check >= 10 * 60000UL;
+          else if (rssi < -60)
+            due = since_check >= 30 * 60000UL;
+          else
+            due = false;
+          if (due) id(ws_check).execute();
+
+switch:
+  - platform: template
+    name: "WiFi Steering"
+    id: ws_enabled
+    icon: "mdi:access-point-network"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+button:
+  - platform: template
+    name: "Find Best WiFi Node"
+    id: ws_find_now
+    icon: "mdi:wifi-sync"
+    entity_category: "diagnostic"
+    on_press:
+      - script.execute: ws_check
+
+text_sensor:
+  - platform: template
+    name: "WiFi Steer"
+    id: ws_status
+    icon: "mdi:wifi-cog"
+    entity_category: "diagnostic"
+    update_interval: never

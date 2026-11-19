@@ -4,7 +4,7 @@
 [![licence](https://img.shields.io/github/license/NuGundam/nu-esphome?label=licence&color=6fb0ff)](LICENSE)
 [![esphome](https://img.shields.io/badge/ESPHome-2026.10-6fb0ff)](https://esphome.io)
 
-**The ESPHome firmware behind one Home Assistant house: 20 devices for air quality, HVAC zoning, presence and more.**
+**The ESPHome firmware behind one Home Assistant house: 21 devices for air quality, HVAC zoning, presence and more.**
 
 Everything here is a real config from a working house, not an example. Most of these started
 from stock firmware or a sensor on a breadboard and grew whatever the house turned out to need:
@@ -25,6 +25,7 @@ and failsafes for when Home Assistant goes away.
 | [`nu-presence-1`, `2`](#nu-presence-1-2) | 60 GHz presence, breathing and light, with a web page | Seeed MR60BHA2 kit | Loft, not installed yet |
 | [`nu-presence-24ghz-1`](#nu-presence-24ghz-1) | 24 GHz presence with its own screen and a tuning page | Waveshare ESP32-S3-LCD-1.47B, LD2410C | Family Room |
 | [`nu-presence-24ghz-2`](#nu-presence-24ghz-2) | 24 GHz multi-person tracking with a room map | Apollo MTR-1, LD2450 | Upper Hallway |
+| [`nu-trash-1`](#nu-trash-1) | Odor watch inside the kitchen trash cabinet | ESP32-S3 Super Mini, SGP41, BME688, AGS10 | Kitchen |
 | [`nu-garage-1`](#nu-garage-1) | Garage air quality and 24 GHz presence | ESP32-S3 Super Mini, SEN55, LD2410C | Garage |
 | [`nu-range-hood`](#nu-range-hood) | Three-speed kitchen hood | ESP32-S3, relays | Kitchen |
 | [`nu-esp32-2432s028r`](#nu-esp32-2432s028r) | Wall touch panel for a light | ESP32-2432S028R display | Office 1 |
@@ -124,6 +125,28 @@ AirGradient ONE units moved from stock firmware to ESPHome with no cloud posting
 - Pins and the EPA formula come from
   [MallocArray/airgradient_esphome](https://github.com/MallocArray/airgradient_esphome), copied in
   so a build never pulls remote code.
+
+### nu-trash-1
+
+A small unit inside the kitchen trash cabinet that watches for odor. Home Assistant compares it
+with the kitchen sensor and logs odor events; the yaml only measures.
+
+- SGP41 for VOC and NOx, with the same smoothed "VOC" and fast "VOC Fast" pair as the room units.
+- AGS10 metal-oxide TVOC sensor on a second I2C bus at 15 kHz (its limit). It reports absolute ppb,
+  so unlike the self-learning SGP41 index it shows how gas builds up over days.
+- The BME688 runs as a gas scanner through a local component,
+  [`components/bme688_scan`](components/bme688_scan), built on Bosch's open BME68x driver
+  instead of the closed BSEC library. Once a minute the heater steps through ten temperatures
+  (Bosch profile HP-354, 100 to 320 C), and "Scan" sends the ten resistances as one text value.
+  Different gases change different steps, so the scan is a fingerprint that Home Assistant can
+  learn odor types from. Package:
+  [`common/nu-trash-bme688-scan.yaml`](common/nu-trash-bme688-scan.yaml).
+- [`common/nu-trash-bme688.yaml`](common/nu-trash-bme688.yaml) is the BSEC alternative (IAQ
+  values, no scan). Bosch's BSEC licence lets you share the yaml but not a compiled binary that
+  contains it. [`common/nu-trash-bme680.yaml`](common/nu-trash-bme680.yaml) is for a plain BME680.
+- The heater warms the chip about 10 C, so temperature needs the "T-Offset" number and the
+  rescaled humidity is approximate.
+- AQI texts for each channel and an AQI LED on the board's WS2812, like the NU-AQI units.
 
 ---
 
@@ -255,11 +278,15 @@ esphome run nu-aqi-1.yaml
 Some things to know first:
 
 - **Secrets:** every key and password is a `!secret` reference, listed in
-  [`secrets.example.yaml`](secrets.example.yaml). All 21 configs validate on ESPHome 2026.10 with it filled in.
+  [`secrets.example.yaml`](secrets.example.yaml). All 22 configs validate on ESPHome 2026.11 with it filled in.
 - **Room names:** rooms here are generic (Office 1, Bedroom 2), so they differ slightly from what
   runs in the house. Any `light.` or `sensor.` entity a config reads needs to match your own.
 - **Home Assistant:** several devices depend on automations that live in Home Assistant and aren't
   in this repo. The damper controller, for example, only moves when told to.
+- **Wi-Fi roaming:** every Wi-Fi device includes
+  [`common/wifi-steer.yaml`](common/wifi-steer.yaml). ESPHome's own roaming checks three times
+  after a connect and then stops, so a device that joined a far mesh node stays there. This keeps
+  checking while the signal is under -60 dBm and moves only to a node at least 10 dB stronger.
 - **Mains and HVAC:** the hood and damper builds switch real loads. Wire them safely and at your own risk.
 
 ## Credits
@@ -268,6 +295,7 @@ Some things to know first:
 - [MallocArray/airgradient_esphome](https://github.com/MallocArray/airgradient_esphome): AirGradient pins and the EPA formula
 - [ApolloAutomation/MTR-1](https://github.com/ApolloAutomation/MTR-1): MTR-1 pin map
 - Seeed Studio: the MR60BHA2 kit firmware these started from
+- [boschsensortec/BME68x_SensorAPI](https://github.com/boschsensortec/BME68x_SensorAPI) (BSD-3, pulled at build time): the driver under `bme688_scan`
 
 ## Licence
 

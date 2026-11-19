@@ -9,3 +9,4 @@ substitutions:
   ap_password: !secret ap_password
 packages:
   nuaqi_common: !include common/nuaqi-common.yaml
+  wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)

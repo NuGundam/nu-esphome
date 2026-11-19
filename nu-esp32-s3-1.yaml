@@ -10,6 +10,7 @@ substitutions:
 
 packages:
   wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+  wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)
 
 esphome:
   name: fresh-air-aqi

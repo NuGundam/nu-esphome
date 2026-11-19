@@ -1,0 +1,104 @@
+# =======================================================
+# NU-TRASH-BME688 v0.1 (2026-11-14, DRAFT) - climate + gas package for
+# NU-Trash-1 with a Bosch BME688 (the default since v0.2).
+# The other choice is common/nu-trash-bme680.yaml; include ONE of the two.
+#
+# Uses Bosch's BSEC2 library (bme68x_bsec2_i2c). Notes:
+#   * The library's licence forbids handing out compiled firmware that
+#     contains it. Sharing this yaml is fine; never publish a .bin of it.
+#   * BSEC reads the chip every 3 s (LP mode), so the gas heater runs ten
+#     times as often as with the plain BME680 driver and the chip reads a
+#     little warmer: set "T-Offset" after comparing with a thermometer.
+#   * "IAQ Static" needs days to calibrate (see "IAQ Accuracy").
+#     "Gas Resistance" is the raw reading and is usable at once.
+#   * BSEC saves its calibration to flash every 6 h.
+#
+# Gives the ids the main file expects: bme_temp, bme_hum, bme_press,
+# bme_gas, and feeds bme_gas_fast.
+# =======================================================
+substitutions:
+  bme_name: BME688         # goes in front of every entity name of this chip
+
+bme68x_bsec2_i2c:
+  id: bme68x_main
+  i2c_id: bus_a
+  address: ${bme_address}
+  model: bme688
+  operating_age: 28d
+  sample_rate: LP
+  supply_voltage: 3.3V
+  state_save_interval: 6h
+
+sensor:
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bme68x_main
+    temperature:
+      name: "${bme_name} Temperature"
+      id: bme_temp
+      icon: "mdi:thermometer"
+      accuracy_decimals: 1
+      filters:
+        - lambda: |-
+            float o = id(t_offset).state;
+            return x + (isnan(o) ? 0.0f : o);
+        - throttle_average: 60s
+    humidity:
+      name: "${bme_name} Humidity"
+      id: bme_hum
+      icon: "mdi:water-percent"
+      accuracy_decimals: 1
+      filters:
+        # RH was measured at the sensor's own (warmer) temperature: rescale
+        # it to the corrected temperature (Magnus), as nuaqi-common does.
+        - lambda: |-
+            float o = id(t_offset).state;
+            float t = id(bme_temp).get_raw_state();
+            float rh = x;
+            if (!isnan(o) && !isnan(t) && o != 0.0f) {
+              auto ps = [](float c) { return expf(17.62f * c / (243.12f + c)); };
+              rh = rh * ps(t) / ps(t + o);
+            }
+            return rh > 100.0f ? 100.0f : (rh < 0.0f ? 0.0f : rh);
+        - throttle_average: 60s
+    pressure:
+      name: "${bme_name} Pressure"
+      id: bme_press
+      accuracy_decimals: 1
+      filters:
+        - throttle_average: 60s      # v0.5: was 300 s (5 min of "unknown" after a restart)
+    gas_resistance:
+      name: "${bme_name} Gas Resistance"
+      id: bme_gas
+      icon: "mdi:gas-cylinder"
+      unit_of_measurement: "kΩ"
+      state_class: "measurement"
+      accuracy_decimals: 1
+      filters:
+        - multiply: 0.001       # ohms -> kilo-ohms (v0.3)
+        - throttle_average: 60s
+      on_raw_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !isnan(x) && x > 0;'
+              then:
+                - sensor.template.publish:
+                    id: bme_gas_fast
+                    state: !lambda 'return x * 0.001f;'
+    # Bosch's air-quality index without the auto-rescaling of plain "IAQ":
+    # 50 = this sensor's clean air, higher = worse. Kept as an extra channel.
+    iaq_static:
+      name: "${bme_name} IAQ Static"
+      id: bme_iaq_static
+      icon: "mdi:gauge"
+      state_class: "measurement"
+      accuracy_decimals: 0
+      filters:
+        - throttle_average: 60s
+
+text_sensor:
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bme68x_main
+    iaq_accuracy:
+      name: "${bme_name} IAQ Accuracy"
+      entity_category: diagnostic

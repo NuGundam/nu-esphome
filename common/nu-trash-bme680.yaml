@@ -1,0 +1,83 @@
+# =======================================================
+# NU-TRASH-BME680 v0.1 (2026-11-14, DRAFT) - climate + gas package for
+# NU-Trash-1 with a Bosch BME680 (the fallback; the BME688 package
+# common/nu-trash-bme688.yaml is the default). Include ONE of the two.
+#
+# Plain ESPHome bme680 driver: raw gas resistance, no Bosch library.
+# Gives the ids the main file expects: bme_temp, bme_hum, bme_press,
+# bme_gas, and feeds bme_gas_fast.
+# =======================================================
+substitutions:
+  bme_name: BME680         # goes in front of every entity name of this chip
+
+sensor:
+  - platform: bme680
+    i2c_id: bus_a
+    address: ${bme_address}
+    update_interval: 30s
+    iir_filter: 3x
+    heater:
+      temperature: 320
+      duration: 150ms
+    temperature:
+      name: "${bme_name} Temperature"
+      id: bme_temp
+      icon: "mdi:thermometer"
+      oversampling: 8x
+      accuracy_decimals: 1
+      filters:
+        - lambda: |-
+            float o = id(t_offset).state;
+            return x + (isnan(o) ? 0.0f : o);
+        - sliding_window_moving_average:
+            window_size: 2
+            send_every: 2         # one value a minute
+    humidity:
+      name: "${bme_name} Humidity"
+      id: bme_hum
+      icon: "mdi:water-percent"
+      oversampling: 2x
+      accuracy_decimals: 1
+      filters:
+        # RH was measured at the sensor's own (warmer) temperature: rescale
+        # it to the corrected temperature (Magnus), as nuaqi-common does.
+        - lambda: |-
+            float o = id(t_offset).state;
+            float t = id(bme_temp).get_raw_state();
+            float rh = x;
+            if (!isnan(o) && !isnan(t) && o != 0.0f) {
+              auto ps = [](float c) { return expf(17.62f * c / (243.12f + c)); };
+              rh = rh * ps(t) / ps(t + o);
+            }
+            return rh > 100.0f ? 100.0f : (rh < 0.0f ? 0.0f : rh);
+        - sliding_window_moving_average:
+            window_size: 2
+            send_every: 2
+    pressure:
+      name: "${bme_name} Pressure"
+      id: bme_press
+      oversampling: 4x
+      accuracy_decimals: 1
+      filters:
+        - throttle_average: 60s      # v0.5: was 300 s (5 min of "unknown" after a restart)
+    gas_resistance:
+      name: "${bme_name} Gas Resistance"
+      id: bme_gas
+      icon: "mdi:gas-cylinder"
+      unit_of_measurement: "kΩ"
+      state_class: "measurement"
+      accuracy_decimals: 1
+      filters:
+        - multiply: 0.001       # ohms -> kilo-ohms (v0.3)
+        - sliding_window_moving_average:
+            window_size: 2
+            send_every: 2         # one value a minute
+      on_raw_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !isnan(x) && x > 0;'
+              then:
+                - sensor.template.publish:
+                    id: bme_gas_fast
+                    state: !lambda 'return x * 0.001f;'

@@ -10,3 +10,4 @@ substitutions:
   nox_learning_offset: '12'
 packages:
   ag_common: !include common/airgradient-one-common.yaml
+  wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)

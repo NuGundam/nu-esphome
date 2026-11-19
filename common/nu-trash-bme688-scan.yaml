@@ -1,0 +1,99 @@
+# =======================================================
+# NU-TRASH-BME688-SCAN v0.1 (2026-11-17) - climate + gas package for
+# NU-Trash-1 with the BME688 in gas-scan mode (our own, no BSEC).
+# Include ONE of: this file, common/nu-trash-bme688.yaml (BSEC, IAQ) or
+# common/nu-trash-bme680.yaml.
+#
+# What changes against the BSEC package:
+#   * The heater steps through ten temperatures all the time (Bosch
+#     profile HP-354: 320, 100, 100, 100, 200, 200, 200, 320, 320, 320 C,
+#     one cycle = 10.8 s, one cycle a minute, heater off in between).
+#     "Scan" = the ten step resistances in kilo-ohms, geometric mean
+#     of the cycles since the last send (one cycle at this setting). That
+#     fingerprint is what the odor-type model in Home Assistant learns
+#     from.
+#   * "Gas Resistance" = the last 320 C step. It is not the same number
+#     the BSEC package gave (different heater history), so its old
+#     history and the kOhm bands do not carry over one to one.
+#   * No "IAQ Static" and no "IAQ Accuracy" (those are BSEC outputs).
+#   * The heater runs about a fifth of the time (non-stop scanning warmed
+#     the chip by 13 C, every 30 s by 10 C), so the chip still reads warmer than under BSEC:
+#     set "T-Offset" again after the first hour.
+#   * Only Bosch's open sensor driver is used (BSD licence), so a build
+#     with this package may be shared.
+#
+# Gives the ids the main file expects: bme_temp, bme_hum, bme_press,
+# bme_gas, and feeds bme_gas_fast.
+# =======================================================
+substitutions:
+  bme_name: BME688         # goes in front of every entity name of this chip
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [bme688_scan]
+
+bme688_scan:
+  id: bme_scan
+  i2c_id: bus_a
+  address: ${bme_address}
+  scan_interval: 60s      # one 10.8 s scan cycle a minute; the heater rests in between (30 s ran the chip 10 C warm)
+  publish_interval: 15s   # the scan is sent within 15 s of each finished cycle
+  temperature:
+    name: "${bme_name} Temperature"
+    id: bme_temp
+    icon: "mdi:thermometer"
+    accuracy_decimals: 1
+    filters:
+      - lambda: |-
+          float o = id(t_offset).state;
+          return x + (isnan(o) ? 0.0f : o);
+      - throttle_average: 60s
+  humidity:
+    name: "${bme_name} Humidity"
+    id: bme_hum
+    icon: "mdi:water-percent"
+    accuracy_decimals: 1
+    filters:
+      # RH was measured at the sensor's own (warmer) temperature: rescale
+      # it to the corrected temperature (Magnus), as nuaqi-common does.
+      - lambda: |-
+          float o = id(t_offset).state;
+          float t = id(bme_temp).get_raw_state();
+          float rh = x;
+          if (!isnan(o) && !isnan(t) && o != 0.0f) {
+            auto ps = [](float c) { return expf(17.62f * c / (243.12f + c)); };
+            rh = rh * ps(t) / ps(t + o);
+          }
+          return rh > 100.0f ? 100.0f : (rh < 0.0f ? 0.0f : rh);
+      - throttle_average: 60s
+  pressure:
+    name: "${bme_name} Pressure"
+    id: bme_press
+    accuracy_decimals: 1
+    filters:
+      - throttle_average: 60s
+  gas_resistance:
+    name: "${bme_name} Gas Resistance"
+    id: bme_gas
+    icon: "mdi:gas-cylinder"
+    unit_of_measurement: "kΩ"
+    state_class: "measurement"
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.001       # ohms -> kilo-ohms
+      - throttle_average: 60s
+    on_raw_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !isnan(x) && x > 0;'
+            then:
+              - sensor.template.publish:
+                  id: bme_gas_fast
+                  state: !lambda 'return x * 0.001f;'
+  # Ten step resistances in kilo-ohms, comma separated, once a minute.
+  scan:
+    name: "${bme_name} Scan"
+    id: bme_scan_text

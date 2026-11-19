@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Presence-24GHz-2  v1.11 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# NU-Presence-24GHz-2  v1.12 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
 # ESP32-C3-MINI, LD2450 on UART 20/21, WS2812 on GPIO3, buzzer on GPIO10. Pins from
 # github.com/ApolloAutomation/MTR-1 (Integrations/ESPHome/Core.yaml).
 # v1.1: motion only, at the user's request. The LTR-390 / DPS310 I2C sensors are gone (they failed on this unit:
@@ -63,6 +63,7 @@ substitutions:
 
 packages:
   wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
+  wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)
 
 # Keeps _esphomelib in mDNS next to the _http service from the USE_WEBSERVER flags (2026-11-07):
 # without it the Device Builder never sees this device's version or config_hash.
@@ -178,6 +179,7 @@ uart:
 ld2450:
   id: radar
   uart_id: uart_bus
+  link_timeout: 5s   # v1.12 (ESPHome 2026.11): no valid frame for 5 s = Radar Link off
 
 output:
   - platform: ledc
@@ -247,6 +249,10 @@ binary_sensor:
     has_moving_target:
       id: bs_mv_raw
       internal: true
+    # v1.12: on while the LD2450 sends valid frames; off = radar module silent (not an empty room)
+    connected:
+      id: bs_link
+      name: "Radar Link"
 
   - platform: template
     id: occupied

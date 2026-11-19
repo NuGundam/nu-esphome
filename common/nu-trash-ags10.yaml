@@ -1,0 +1,88 @@
+# =======================================================
+# NU-TRASH-AGS10 v0.1 (2026-11-14, DRAFT) - optional AGS10 TVOC sensor
+# for NU-Trash-1, on its own slow I2C bus.
+#
+# Add to nu-trash-1.yaml:
+#   packages:
+#     ags10: !include common/nu-trash-ags10.yaml
+# Leave the line out and the unit runs on the SGP41 + BME680 alone.
+#
+# Facts from the ASAIR AGS10 datasheet (2022-06):
+#   * I2C no faster than 15 kHz, at least 1.5 s between reads, address 0x1A.
+#   * The bare sensor wants 3.0 V (+-0.1 V). A breakout sold as "3.3-5 V"
+#     has a regulator: feed its VCC pin from 3V3. A bare AGS10 must NOT go
+#     straight on 3V3.
+#   * 120 s warm-up after power-on; 12-96 h of powered ageing after storage
+#     before the readings settle.
+#   * About 28 mA (75 mW) all the time: it is the warmest part after the ESP32.
+#   * Silicone vapour damages it for good (no silicone sealant in the case).
+#
+# Wiring: SDA -> GPIO7, SCL -> GPIO6, VCC -> 3V3, GND -> GND.
+# =======================================================
+i2c:
+  - id: bus_b
+    sda: GPIO7
+    scl: GPIO6
+    frequency: 15kHz
+    scan: true
+
+sensor:
+  - platform: ags10
+    i2c_id: bus_b
+    id: ags10_main
+    address: 0x1A
+    update_interval: 10s
+    tvoc:
+      name: "AGS10 TVOC"
+      id: ags10_tvoc
+      icon: "mdi:molecule"
+      filters:
+        - sliding_window_moving_average:
+            window_size: 6
+            send_every: 6         # one value a minute
+      on_raw_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !isnan(x);'
+              then:
+                - sensor.template.publish:
+                    id: ags10_tvoc_fast
+                    state: !lambda 'return x;'
+    resistance:
+      name: "AGS10 Resistance"
+      id: ags10_res
+      entity_category: diagnostic
+      filters:
+        - throttle_average: 300s
+  # Unsmoothed TVOC: sent on a move of 50 ppb, plus one value every 5 minutes.
+  - platform: template
+    name: "AGS10 TVOC Fast"
+    id: ags10_tvoc_fast
+    icon: "mdi:molecule"
+    unit_of_measurement: "ppb"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: never
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 50.0
+
+text_sensor:
+  # TVOC level in words. Bands = the German UBA indoor TVOC scale in ppb.
+  - platform: template
+    name: "AQI TVOC (AGS10)"
+    icon: "mdi:molecule"
+    update_interval: 10s
+    lambda: |-
+      float v = id(ags10_tvoc).state;
+      if (isnan(v) || v < 0) return {"Warming up"};
+      char buf[64];
+      const char* label =
+        (v <= 65)   ? "Excellent" :
+        (v <= 220)  ? "Good" :
+        (v <= 660)  ? "Moderate" :
+        (v <= 2200) ? "Poor" : "Unhealthy";
+      snprintf(buf, sizeof(buf), "%s (%.0f ppb)", label, v);
+      return {buf};
