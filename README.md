@@ -122,6 +122,9 @@ AirGradient ONE units moved from stock firmware to ESPHome with no cloud posting
 - The OLED level text follows the bar, so the words and the colour always agree. Both wait until
   the reading is clearly below a line before stepping down.
 - The OLED stays, a blue LED sweeps during warm-up, and a test button walks the bar through every level.
+- An HVAC page on the OLED shows what the house HVAC is doing (from Home Assistant): a fan that spins
+  while the blower runs, the main run (heating, free cooling, cooling, duct purge, fresh air or fan) and
+  how long it has lasted. While the HVAC runs, the far-right LED breathes in that run's colour.
 - Pins and the EPA formula come from
   [MallocArray/airgradient_esphome](https://github.com/MallocArray/airgradient_esphome), copied in
   so a build never pulls remote code.
