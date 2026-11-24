@@ -1,0 +1,41 @@
+# =======================================================
+# WIFI-ADAPTIVE v1.0 (2026-11-20) - adaptive Wi-Fi transmit power, the same loop the NU-AQI family runs
+# (nuaqi-common "Adaptive WiFi TX Power"), as a package for the other ESP32 devices.
+#
+#   packages:
+#     wifi_adaptive: !include common/wifi-adaptive.yaml
+# Needs common/wifi-diag.yaml (wifi_diag.h brings esp_wifi.h; its "WiFi TX Power" sensor shows the result).
+#
+# Once a minute: signal quality under 55 % (about -72 dBm) -> +2 dBm, over 75 % (about -62 dBm) -> -0.5 dBm,
+# kept between 8.5 and 20 dBm. Up fast on a weak link, down slowly on a strong one. Less power = less heat.
+# The setpoint is remembered over restarts. Switch "Adaptive WiFi TX Power" off = the power stays where it is.
+# =======================================================
+globals:
+  - id: wa_setpoint
+    type: float
+    restore_value: yes
+    initial_value: '14.0'
+
+switch:
+  - platform: template
+    name: "Adaptive WiFi TX Power"
+    id: wa_enabled
+    icon: "mdi:wifi-arrow-up-down"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (!id(wa_enabled).state) return;
+          auto *w = wifi::global_wifi_component;
+          float q = w->is_connected() ? 2.0f * (w->wifi_rssi() + 100.0f) : 0.0f;   // same quality scale as the AQ units
+          float p = id(wa_setpoint);
+          if (q < 55.0f)      p += 2.0f;
+          else if (q > 75.0f) p -= 0.5f;
+          if (p < 8.5f)  p = 8.5f;
+          if (p > 20.0f) p = 20.0f;
+          id(wa_setpoint) = p;
+          esp_wifi_set_max_tx_power((int8_t) lroundf(p * 4.0f));

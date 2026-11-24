@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Presence-24GHz-1  v2.3 (2026-11-15) - HLK-LD2410C 24 GHz presence radar on a
+# NU-Presence-24GHz-1  v2.7 (2026-11-21, person filter v1.4 tied to Occupied, adaptive Wi-Fi TX power) - HLK-LD2410C 24 GHz presence radar on a
 # Waveshare ESP32-S3-LCD-1.47B (ESP32-S3R8, 16 MB flash, 8 MB octal PSRAM, 172x320 ST7789 LCD).
 # Moved from the Arduino Nano ESP32 (v1.13); every entity name is kept so HA keeps its entity ids.
 # The board used to run "nu-esp32-s3-lcd-1" (clock / Wi-Fi screen + unused "AQI LED").
@@ -38,6 +38,7 @@
 # =======================================================
 substitutions:
   device_name: nu-presence-24ghz-1
+  hf_learn_gate: "true"        # v2.7 person filter: no machines here - learn only while the radar's Occupied is off
   portrait_rotation: "180"     # v2.3: USB-C down; if the portrait picture is upside down use "0"
   friendly_name: Nu-Presence-24GHz-1
   api_key: !secret api_key
@@ -48,6 +49,8 @@ substitutions:
 packages:
   wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power (2026-11-07)
   wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)
+  wifi_adaptive: !include common/wifi-adaptive.yaml   # v2.6: adaptive Wi-Fi TX power like the AQ units (less heat)
+  human_filter: !include common/human-filter.yaml   # v2.4: Person present (learned background + travel)
 
 # Keeps _esphomelib in mDNS next to the _http service from the USE_WEBSERVER flags (2026-11-07).
 external_components:
@@ -62,10 +65,9 @@ esphome:
   friendly_name: ${friendly_name}
   includes:
     - radar_web.h               # tuning page on :8080
-  platformio_options:
-    build_flags:
-      - "-DUSE_WEBSERVER"
-      - "-DUSE_WEBSERVER_PORT=8080"
+  build_flags:                  # 2026-11-20: was platformio_options: build_flags (removed in ESPHome 2026.12)
+    - "-DUSE_WEBSERVER"
+    - "-DUSE_WEBSERVER_PORT=8080"
   on_boot:
     - priority: -100
       then:
@@ -237,6 +239,9 @@ interval:
           esphome::number::Number *gmt[9] = {id(gmt0), id(gmt1), id(gmt2), id(gmt3), id(gmt4), id(gmt5), id(gmt6), id(gmt7), id(gmt8)};
           esphome::number::Number *gst[9] = {id(gst0), id(gst1), id(gst2), id(gst3), id(gst4), id(gst5), id(gst6), id(gst7), id(gst8)};
           for (int i = 0; i < 9; i++) { c.gm[i] = gm[i]; c.gs[i] = gs[i]; c.gmt[i] = gmt[i]; c.gst[i] = gst[i]; }
+          c.hf_json = human_filter_json;   // v2.4: person filter on the :8080 page
+          c.hf_relearn = human_filter_relearn;   // Relearn room button on the :8080 page (radar_web.h v1.14)
+          c.room_default = R"({"w":457,"d":518,"place":"tr","unit":"ft"})";   // v2.8: Family Room 15 x 17 ft, unit in the top-right corner (radar_web.h v1.16)
           radar_web_register();
   # v2.0 screen: page cycling, screen-off policy, redraw (skipped while dark)
   - interval: 8s
@@ -886,6 +891,20 @@ display:
       const int W = PORT ? 172 : 320;
       it.fill(BLACK);
       auto clock = id(home_time).now();
+      // v2.5: person filter chip (human_filter.h): purple PERSON + distance, amber CHECKING, blue Learning N s
+      auto person_chip = [&](int x, int y, int w, int h) {
+        const Color PURPLE(150, 70, 220);
+        auto &hf = human_filter();
+        char t[24];
+        Color bg = BLACK, fg = GREY; bool fillit = true;
+        if (hf.state == 2)       { bg = PURPLE; fg = WHITE; snprintf(t, sizeof(t), "PERSON %.1f m", hf.hg * 0.75f + 0.375f); }
+        else if (hf.state == 1)  { bg = AMBER;  fg = BLACK; snprintf(t, sizeof(t), "CHECKING %.1f m", hf.hg * 0.75f + 0.375f); }
+        else if (hf.state == -1) { bg = BLUE;   fg = WHITE; snprintf(t, sizeof(t), "Learning %d s", hf.learn_left); }
+        else if (hf.state == -2) { fillit = false; snprintf(t, sizeof(t), "Filter: no data"); }
+        else                     { fillit = false; snprintf(t, sizeof(t), "No person"); }
+        if (fillit) it.filled_rectangle(x, y, w, h, bg); else it.rectangle(x, y, w, h, DIM);
+        it.print(x + w / 2, y + h / 2, id(f_small), fg, TextAlign::CENTER, t);
+      };
 
       // ================= PORTRAIT (172 x 320) =================
       if (PORT) {
@@ -929,10 +948,10 @@ display:
           bar(160, "Move", BLUE, mv, mv ? id(raw_men) : 0.0f, id(raw_mdist));
           bar(204, "Still", GREEN, st, st ? id(raw_sen) : 0.0f, id(raw_sdist));
           it.line(0, 246, W, 246, DIM);
-          it.printf(8, 262, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "Clear delay %.0f s", id(n_timeout).state);
-          it.printf(8, 280, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "Max gate %.0f / %.0f", id(n_maxm).state, id(n_maxs).state);
-          it.printf(8, 298, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "%.0f B/s", id(radar_bps).state);
-          if (!id(presence_led).state) it.print(W - 8, 298, id(f_tiny), GREY, TextAlign::CENTER_RIGHT, "LED off");
+          person_chip(8, 252, W - 16, 26);   // v2.5
+          it.printf(8, 291, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "Clear delay %.0f s", id(n_timeout).state);
+          if (!id(presence_led).state) it.print(W - 8, 291, id(f_tiny), GREY, TextAlign::CENTER_RIGHT, "LED off");
+          it.printf(8, 307, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "Max gate %.0f/%.0f   %.0f B/s", id(n_maxm).state, id(n_maxs).state, id(radar_bps).state);
 
         // ---------- page 1: gates (one row per 0.75 m ring) ----------
         } else if (id(cur_page) == 1) {
@@ -1037,9 +1056,9 @@ display:
 
         // footer
         it.line(0, 145, W, 145, DIM);
-        it.printf(10, 158, id(f_tiny), GREY, TextAlign::CENTER_LEFT, "Clear delay %.0f s   Max gate %.0f/%.0f   %.0f B/s",
-                  id(n_timeout).state, id(n_maxm).state, id(n_maxs).state, id(radar_bps).state);
-        if (!id(presence_led).state) it.print(W - 6, 158, id(f_tiny), GREY, TextAlign::CENTER_RIGHT, "LED off");
+        person_chip(6, 148, 150, 22);   // v2.5
+        it.printf(W - 6, 159, id(f_tiny), GREY, TextAlign::CENTER_RIGHT, "Clear %.0f s  Gate %.0f/%.0f%s",
+                  id(n_timeout).state, id(n_maxm).state, id(n_maxs).state, id(presence_led).state ? "" : "  LED off");
 
       // ---------- page 1: gates ----------
       } else if (id(cur_page) == 1) {

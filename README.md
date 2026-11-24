@@ -125,6 +125,8 @@ AirGradient ONE units moved from stock firmware to ESPHome with no cloud posting
 - An HVAC page on the OLED shows what the house HVAC is doing (from Home Assistant): a fan that spins
   while the blower runs, the main run (heating, free cooling, cooling, duct purge, fresh air or fan) and
   how long it has lasted. While the HVAC runs, the far-right LED breathes in that run's colour.
+  Each run has one colour (heating red, free cooling green, cooling blue, purge violet), and
+  humidifier misting shows as a mist white.
 - Pins and the EPA formula come from
   [MallocArray/airgradient_esphome](https://github.com/MallocArray/airgradient_esphome), copied in
   so a build never pulls remote code.
@@ -190,6 +192,12 @@ a couch.
 - Tuning page on port 8080 ([`radar_web.h`](radar_web.h)) with live gate energies and a room view.
   The page opens locked, so a stray tap or scroll on a phone can't drag a threshold; unlock it to
   edit, and it locks again two minutes after the last change.
+- `Person present` comes from [`common/human-filter.yaml`](common/human-filter.yaml) and
+  [`human_filter.h`](human_filter.h). It learns each ring's normal energy all the time, so anything that
+  stays in its ring (a fan, a curtain) fades into the background, and it only calls a person when
+  energy stands out from that and travels between rings. It runs next to the radar's own `Occupied`
+  and doesn't change its thresholds. Here it learns only while `Occupied` is off, as nothing in the room is a machine.
+- The tuning page saves the room layout on the device, so every browser sees the same plan.
 - Wiring is at the top of the yaml.
 
 ### nu-presence-24ghz-2
@@ -249,6 +257,11 @@ presence, on an ESP32-S3 Super Mini. The SEN55 part follows `nu-esp32-s3-1`, the
 - If the radar goes quiet for 10 seconds it gets an end-configuration command, and
   `Radar stall fixes` counts how often that happened. Keep the radar's Bluetooth off: with it on,
   this module stopped sending presence data.
+- `Person present` comes from [`common/human-filter.yaml`](common/human-filter.yaml) and
+  [`human_filter.h`](human_filter.h). It learns each ring's normal energy all the time, so anything that
+  stays in its ring (a 3D printer, a fan) fades into the background, and it only calls a person when
+  energy stands out from that and travels between rings. It runs next to the radar's own `Occupied`
+  and doesn't change its thresholds. Ring 1 is skipped because the unit sees its own SEN55 fan there. The tuning page shows it.
 
 ---
 
@@ -303,6 +316,9 @@ Some things to know first:
   [`common/wifi-steer.yaml`](common/wifi-steer.yaml). ESPHome's own roaming checks three times
   after a connect and then stops, so a device that joined a far mesh node stays there. This keeps
   checking while the signal is under -60 dBm and moves only to a node at least 10 dB stronger.
+- **Wi-Fi power:** [`common/wifi-adaptive.yaml`](common/wifi-adaptive.yaml) is the NU-AQI adaptive
+  transmit power as a package for other ESP32s (`nu-presence-24ghz-1` uses it): once a minute it adds
+  2 dBm on a weak link and takes off 0.5 dBm on a strong one, between 8.5 and 20 dBm. Less power, less heat.
 - **Mains and HVAC:** the hood and damper builds switch real loads. Wire them safely and at your own risk.
 
 ## Credits

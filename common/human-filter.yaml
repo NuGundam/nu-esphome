@@ -1,0 +1,132 @@
+# =======================================================
+# HUMAN-FILTER v1.3 (2026-11-21) - "person present" for an LD2410 radar that also sees machines.
+#
+# Add to an LD2410 device yaml that has the per-gate energy sensors gme0..gme8 / gse0..gse8 and the
+# Engineering mode switch sw_eng (NU-Garage-1, NU-Presence-24GHz-1):
+#   packages:
+#     human_filter: !include common/human-filter.yaml
+# and keep human_filter.h next to the yamls. How it decides: see human_filter.h.
+#
+# It reads the raw per-ring energies 10 times a second and does NOT use or change the radar's own gate
+# thresholds, so "Occupied" / "Moving target" / "Still target" keep working as before, next to it.
+#
+# Entities:
+#   Person present          binary_sensor (occupancy): the filter's answer
+#   Person filter           text: clear / learning, ready in N s / checking ring N / person ring N
+#   Person filter ready     binary_sensor (diagnostic): off while it relearns the room (60 s after a restart) or has no data
+#   Person filter levels    text (diagnostic): learned move/still threshold per ring, 100 = ring tuned out
+#   Person clear delay      number, seconds without any sign near the person before presence ends (default 30)
+#   Still person hold       number, minutes a person who stays in one ring is held before being tuned out
+#   Relearn room (when empty)  button: learn the background again for 60 s
+# substitutions: hf_skip_mask = rings never used (bit n = ring n; 2 = ring 1).
+#   hf_learn_gate = "true" in rooms WITHOUT machines: the filter learns only while the radar's own Occupied is
+#   off and reports a person only while it is on, so somebody sitting for hours is never learned as background.
+#   "false" (default) where machines must be tuned out (garage): it learns always and ignores Occupied.
+# The learned background is stored in flash (every 30 min, after 5 clear minutes), so a restart is ready in 10 s
+# and does not learn whoever is in the room.
+# =======================================================
+substitutions:
+  hf_skip_mask: '0'
+  hf_learn_gate: 'false'
+
+esphome:
+  includes:
+    - human_filter.h
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static esphome::sensor::Sensor *gm[9] = {id(gme0), id(gme1), id(gme2), id(gme3), id(gme4), id(gme5), id(gme6), id(gme7), id(gme8)};
+          static esphome::sensor::Sensor *gs[9] = {id(gse0), id(gse1), id(gse2), id(gse3), id(gse4), id(gse5), id(gse6), id(gse7), id(gse8)};
+          float m[9], s[9];
+          for (int i = 0; i < 9; i++) { m[i] = gm[i]->get_raw_state(); s[i] = gs[i]->get_raw_state(); }
+          auto &h = human_filter();
+          h.skip_mask = ${hf_skip_mask};
+          // v1.3: stored background
+          static ESPPreferenceObject pref = global_preferences->make_preference<HumanFilter::Saved>(0x48463101UL);
+          static bool tried = false;
+          if (!tried) { tried = true; HumanFilter::Saved sv; if (pref.load(&sv)) h.load(sv); }
+          const bool gate = ${hf_learn_gate}, occ = id(occupied).state;
+          float hold = id(hf_hold).state;
+          if (isnan(hold)) hold = 20.0f;
+          float clr = id(hf_clear).state;
+          if (isnan(clr)) clr = 30.0f;
+          h.step(m, s, id(sw_eng).state, !gate || !occ, gate && !occ, hold, clr, millis());
+          static uint32_t clear_since = 0, last_save = 0;
+          const uint32_t now = millis();
+          if (h.state != 0) clear_since = 0; else if (clear_since == 0) clear_since = now ? now : 1;
+          if (clear_since != 0 && now - clear_since > 300000UL && (last_save == 0 || now - last_save > 1800000UL)) {
+            HumanFilter::Saved sv; h.save(sv); pref.save(&sv); last_save = now ? now : 1;
+          }
+          if (!id(hf_person).has_state() || h.human() != id(hf_person).state) id(hf_person).publish_state(h.human());
+          if (!id(hf_ready).has_state() || h.ready() != id(hf_ready).state) id(hf_ready).publish_state(h.ready());
+  - interval: 2s
+    then:
+      - lambda: |-
+          std::string st = human_filter().status();
+          if (st != id(hf_status).state) id(hf_status).publish_state(st);
+  - interval: 60s
+    then:
+      - lambda: |-
+          std::string st = human_filter().thresholds();
+          if (st != id(hf_levels).state) id(hf_levels).publish_state(st);
+
+binary_sensor:
+  - platform: template
+    name: "Person present"
+    id: hf_person
+    device_class: occupancy
+  - platform: template
+    name: "Person filter ready"
+    id: hf_ready
+    icon: "mdi:school"
+    entity_category: "diagnostic"
+
+text_sensor:
+  - platform: template
+    name: "Person filter"
+    id: hf_status
+    icon: "mdi:account-search"
+    update_interval: never
+  - platform: template
+    name: "Person filter levels"
+    id: hf_levels
+    icon: "mdi:tune-vertical"
+    entity_category: "diagnostic"
+    update_interval: never
+
+button:
+  - platform: template
+    name: "Relearn room (when empty)"
+    id: hf_relearn
+    icon: "mdi:school"
+    entity_category: "config"
+    on_press:
+      - lambda: human_filter().relearn();
+
+number:
+  - platform: template
+    name: "Person clear delay"
+    id: hf_clear
+    icon: "mdi:timer-sand"
+    entity_category: "config"
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 600
+    step: 5
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+  - platform: template
+    name: "Still person hold"
+    id: hf_hold
+    icon: "mdi:account-clock"
+    entity_category: "config"
+    unit_of_measurement: "min"
+    min_value: 2
+    max_value: 120
+    step: 1
+    initial_value: 20
+    optimistic: true
+    restore_value: true

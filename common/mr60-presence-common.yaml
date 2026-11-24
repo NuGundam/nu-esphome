@@ -128,9 +128,9 @@ esphome:
   platformio_options:
     board_upload.maximum_size: 4194304
     # tells HA the page's port for the Visit link; only api and mdns read these, there is no web_server component
-    build_flags:
-      - "-DUSE_WEBSERVER"
-      - "-DUSE_WEBSERVER_PORT=8080"
+  build_flags:                  # 2026-11-20: was under platformio_options (removed in ESPHome 2026.12)
+    - "-DUSE_WEBSERVER"
+    - "-DUSE_WEBSERVER_PORT=8080"
   on_boot:
     # XIAO ESP32-C6: the antenna sits behind an RF switch that Seeed's Arduino
     # core drives at boot but ESP-IDF leaves floating. GPIO3 LOW powers the

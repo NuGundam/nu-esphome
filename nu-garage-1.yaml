@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Garage-1  v0.8 - garage air quality + motion
+# NU-Garage-1  v0.9 - garage air quality + motion
 # ESP32-S3 Super Mini + Sensirion SEN55 + HLK-LD2410C 24 GHz radar in the
 # garage_combo enclosure (SEN55 bay below, radar + ESP32 above).
 #
@@ -43,6 +43,7 @@
 # copy keeps placeholders. OTA reuses the API key (encryption: with no key).
 # =======================================================
 substitutions:
+  hf_skip_mask: "2"            # v0.9 person filter: ring 1 never used (the unit sees its own SEN55 fan there)
   device_name: nu-garage-1
   friendly_name: NU-Garage-1
   api_key: !secret api_key
@@ -52,6 +53,7 @@ substitutions:
 packages:
   wifi_diag: !include common/wifi-diag.yaml   # BSSID / Access Point / reconnects / TX power
   wifi_steer: !include common/wifi-steer.yaml   # keep on the strongest mesh node (2026-11-19)
+  human_filter: !include common/human-filter.yaml   # v0.9: Person present (learned background + travel)
 
 # Same as NU-Presence-24GHz-1: keeps _esphomelib in mDNS next to the _http
 # service from the USE_WEBSERVER flags, so the Device Builder sees the device.
@@ -68,10 +70,9 @@ esphome:
   includes:
     - radar_web.h               # tuning page on :8080 (shared with NU-Presence-24GHz-1)
   # HA's "Visit" link = http://<ip>:8080 (see esphome-visit-link note)
-  platformio_options:
-    build_flags:
-      - "-DUSE_WEBSERVER"
-      - "-DUSE_WEBSERVER_PORT=8080"
+  build_flags:                  # 2026-11-20: was platformio_options: build_flags (removed in ESPHome 2026.12)
+    - "-DUSE_WEBSERVER"
+    - "-DUSE_WEBSERVER_PORT=8080"
   on_boot:
     - priority: -100
       then:
@@ -225,6 +226,9 @@ interval:
           esphome::number::Number *gmt[9] = {id(gmt0), id(gmt1), id(gmt2), id(gmt3), id(gmt4), id(gmt5), id(gmt6), id(gmt7), id(gmt8)};
           esphome::number::Number *gst[9] = {id(gst0), id(gst1), id(gst2), id(gst3), id(gst4), id(gst5), id(gst6), id(gst7), id(gst8)};
           for (int i = 0; i < 9; i++) { c.gm[i] = gm[i]; c.gs[i] = gs[i]; c.gmt[i] = gmt[i]; c.gst[i] = gst[i]; }
+          c.hf_json = human_filter_json;   // v0.9: person filter on the :8080 page (radar_web.h v1.11)
+          c.hf_relearn = human_filter_relearn;   // Relearn room button on the :8080 page (radar_web.h v1.14)
+          c.room_default = R"({"w":579,"d":701,"place":"tm","unit":"ft"})";   // v0.10: garage 19 x 23 ft, unit on the back wall, middle (radar_web.h v1.17)
           radar_web_register();
 
 ld2410:
