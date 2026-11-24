@@ -1,5 +1,7 @@
 # =======================================================
-# NU-Presence-24GHz-2  v1.16 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# NU-Presence-24GHz-2  v1.17 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# v1.17 (2026-11-23): zone entities named like the page (Couch / Floor / Walkway, substitutions zone1..3_name);
+#   Track <zone> switches, Walkway off by default: only the Couch and Floor are tracked (presence_2450.h v1.7).
 # v1.16 (2026-11-23): lock-on from presence_2450.h v1.6 + page v1.14 (same as Nu-MasterBath-1 v0.12): a new track counts only after travelling 0.5 m; still-clutter spots.
 # ESP32-C3-MINI, LD2450 on UART 20/21, WS2812 on GPIO3, buzzer on GPIO10. Pins from
 # github.com/ApolloAutomation/MTR-1 (Integrations/ESPHome/Core.yaml).
@@ -58,6 +60,12 @@
 substitutions:
   device_name: nu-presence-24ghz-2
   friendly_name: Nu-Presence-24GHz-2
+  zone1_name: "Couch"             # v1.17: zone entities, Still Hold numbers, Track switches and the page share these
+  zone2_name: "Floor"
+  zone3_name: "Walkway"
+  zone1_track: RESTORE_DEFAULT_ON
+  zone2_track: RESTORE_DEFAULT_ON
+  zone3_track: RESTORE_DEFAULT_OFF  # stairs strip: walking past is not someone in the loft
   api_key: !secret api_key
   ap_ssid: "Nu-Presence-24GHz-2 Hotspot"
   ap_password: !secret ap_password
@@ -196,9 +204,10 @@ interval:
     then:
       - lambda: |-
           presence_zone_holds(id(zsh1).state, id(zsh2).state, id(zsh3).state);
+          presence_track_zones(id(trk1).state, id(trk2).state, id(trk3).state);
           auto &c = radar_web_cfg();
           c.zh[0] = id(zsh1); c.zh[1] = id(zsh2); c.zh[2] = id(zsh3);
-          c.zname[0] = "Couch"; c.zname[1] = "Floor"; c.zname[2] = "Walkway";
+          c.zname[0] = "${zone1_name}"; c.zname[1] = "${zone2_name}"; c.zname[2] = "${zone3_name}";
           c.actt = "TV Loft activities";
           c.acts = "Passing through:2|Playing on the floor:10|Reading:30|Gaming:30|TV / movie:60|Nap:120";
           c.actd = "3600,600,120,600";
@@ -308,21 +317,21 @@ binary_sensor:
 
   - platform: template
     id: zn1
-    name: "Zone 1"
+    name: "${zone1_name}"
     device_class: occupancy
     lambda: 'return presence_in_rect(0, id(z1x1).state, id(z1y1).state, id(z1x2).state, id(z1y2).state);'
     filters:
       - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
   - platform: template
     id: zn2
-    name: "Zone 2"
+    name: "${zone2_name}"
     device_class: occupancy
     lambda: 'return presence_in_rect(1, id(z2x1).state, id(z2y1).state, id(z2x2).state, id(z2y2).state);'
     filters:
       - delayed_off: !lambda return (uint32_t)(id(zone_hold).state * 1000.0f);
   - platform: template
     id: zn3
-    name: "Zone 3"
+    name: "${zone3_name}"
     device_class: occupancy
     lambda: 'return presence_in_rect(2, id(z3x1).state, id(z3y1).state, id(z3x2).state, id(z3y2).state);'
     filters:
@@ -728,7 +737,7 @@ number:
   # v1.15 TV Loft: Still hold per zone (s), presence_2450.h v1.4; 0 = the general Still hold. Page: TV Loft activities.
   - platform: template
     id: zsh1
-    name: "Still Hold Couch"
+    name: "Still Hold ${zone1_name}"
     icon: mdi:timer-sand
     unit_of_measurement: "s"
     min_value: 0
@@ -741,7 +750,7 @@ number:
     entity_category: config
   - platform: template
     id: zsh2
-    name: "Still Hold Floor"
+    name: "Still Hold ${zone2_name}"
     icon: mdi:timer-sand
     unit_of_measurement: "s"
     min_value: 0
@@ -754,7 +763,7 @@ number:
     entity_category: config
   - platform: template
     id: zsh3
-    name: "Still Hold Walkway"
+    name: "Still Hold ${zone3_name}"
     icon: mdi:timer-sand
     unit_of_measurement: "s"
     min_value: 0
@@ -767,6 +776,28 @@ number:
     entity_category: config
 
 switch:
+  # v1.17: Track <zone>. Off = people are not tracked there (presence_2450.h v1.7); all on = anywhere.
+  - platform: template
+    id: trk1
+    name: "Track ${zone1_name}"
+    icon: mdi:target-account
+    optimistic: true
+    restore_mode: ${zone1_track}
+    entity_category: config
+  - platform: template
+    id: trk2
+    name: "Track ${zone2_name}"
+    icon: mdi:target-account
+    optimistic: true
+    restore_mode: ${zone2_track}
+    entity_category: config
+  - platform: template
+    id: trk3
+    name: "Track ${zone3_name}"
+    icon: mdi:target-account
+    optimistic: true
+    restore_mode: ${zone3_track}
+    entity_category: config
   - platform: ld2450
     ld2450_id: radar
     bluetooth:

@@ -1,5 +1,5 @@
 # =======================================================
-# Nu-MasterBath-1  v0.12 - master bath air quality + motion, with a screen
+# Nu-MasterBath-1  v0.13 - master bath air quality + motion, with a screen
 # ESP32-2432S028R "Cheap Yellow Display" + Sensirion SEN54 + HLK-LD2450 24 GHz radar
 # in the masterbath_combo enclosure (SEN54 bay below, screen + radar above, USB-C down).
 #
@@ -55,6 +55,9 @@ substitutions:
   zone1_name: "Main"              # v0.10 zone names (Bathroom activities card, Still Hold numbers)
   zone2_name: "Shower and Toilet"
   zone3_name: "Closet"
+  zone1_track: RESTORE_DEFAULT_ON   # v0.13 Track <zone> switches: all on = tracked anywhere
+  zone2_track: RESTORE_DEFAULT_ON
+  zone3_track: RESTORE_DEFAULT_ON
   bath_light_entity: light.master_bathroom_lights   # v0.9: its brightness sets the screen and AQI LED brightness
   screen_rotation: "90"         # boot default before the select restores (Vertical)
 
@@ -203,6 +206,28 @@ sun:
                   value: '0.5'
 
 switch:
+  # v0.13: Track <zone>. Off = people are not tracked there (presence_2450.h v1.7); all on = anywhere.
+  - platform: template
+    id: trk1
+    name: "Track ${zone1_name}"
+    icon: mdi:target-account
+    optimistic: true
+    restore_mode: ${zone1_track}
+    entity_category: config
+  - platform: template
+    id: trk2
+    name: "Track ${zone2_name}"
+    icon: mdi:target-account
+    optimistic: true
+    restore_mode: ${zone2_track}
+    entity_category: config
+  - platform: template
+    id: trk3
+    name: "Track ${zone3_name}"
+    icon: mdi:target-account
+    optimistic: true
+    restore_mode: ${zone3_track}
+    entity_category: config
   # NU-AQI-3's "AQI Auto Night Mode", acting on the screen: half brightness after sunset.
   - platform: template
     name: "Screen Auto Night Mode"
@@ -665,6 +690,7 @@ interval:
     then:
       - lambda: |-
           presence_zone_holds(id(zsh1).state, id(zsh2).state, id(zsh3).state);
+          presence_track_zones(id(trk1).state, id(trk2).state, id(trk3).state);
           auto &c = radar_web_cfg();
           c.zh[0] = id(zsh1); c.zh[1] = id(zsh2); c.zh[2] = id(zsh3);
           c.zname[0] = "${zone1_name}"; c.zname[1] = "${zone2_name}"; c.zname[2] = "${zone3_name}";

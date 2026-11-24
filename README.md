@@ -220,6 +220,9 @@ they have to move.**
 - `Zone 1-3` rectangles or polygons (up to 8 corners), drawn on the page or typed into Home Assistant,
   each with its own `Still hold`. Here: Couch, Floor and Walkway, with a TV Loft activities card
   that sets the holds in one tap.
+- Zone entities take their names from the same list as the page. Each zone has a `Track <zone>`
+  switch: with one off, people are only tracked in the zones still on, and targets or motion
+  elsewhere are ignored. Here `Track Walkway` is off, so walking past the stairs doesn't count.
 - Tuning page on port 8080 ([`radar_web_2450.h`](radar_web_2450.h)) with a live top-down room map.
 - `Web page`, `Still preset` and `Moving preset` show the page's status and the current presets in Home Assistant.
 

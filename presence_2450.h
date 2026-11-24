@@ -1,6 +1,9 @@
 #pragma once
 // ─────────────────────────────────────────────────
-//  NU-Presence-24GHz-2  still presence for the LD2450  v1.6  (presence_2450.h)  2026-11-23
+//  NU-Presence-24GHz-2  still presence for the LD2450  v1.7  (presence_2450.h)  2026-11-23
+//  v1.7: tracked zones (presence_track_zones). With a zone switched off, only targets inside the zones still
+//        switched on (+0.3 m) can start, feed or keep a track or trip Moving target, and the edge of those zones
+//        is an exit. All on = anywhere in the room, as before. TV Loft: Couch + Floor only, not the Walkway.
 //  v1.6: lock-on. A new track only counts (Occupied, zones, holds) once it has TRAVELLED PR_LOCK_MM from where it
 //        started (smoothed position, so radar jitter does not count). Until then it is "checking". A checking track
 //        that is lost, or has not travelled within PR_LOCK_WIN_MS, is dropped. Made for Nu-MasterBath-1: a towel
@@ -95,6 +98,7 @@ static bool pr_clut_at(float x, float y) {   // a known still-clutter spot (seen
 // v1.3: what the tracker knows about the room and the zones (set every tick from the yaml)
 struct PrGeo { bool room = false, fence = true; float w = 0, d = 0, sx = 0, sy = 0, co = 1, si = 0, fl = 1, ymax = 6000; int zt = 0; float z[3][4] = {}; };
 static PrGeo pr_geo;
+static uint8_t pr_trk = 0;                 // v1.7: bit k = people are tracked in zone k; 0 = anywhere
 static uint32_t pr_zhold[3] = {0, 0, 0};   // v1.4: Still hold per zone in ms, 0 = use the general Still hold
 static void presence_zone_holds(float s1, float s2, float s3) {
   const float s[3] = {s1, s2, s3};
@@ -154,6 +158,17 @@ static bool pr_in_zone(int i, float x, float y, float tol) {
   if (pr_poly_ok(i, z)) return pr_poly_in(i, x, y, tol);   // v1.5
   return x >= fminf(z[0], z[2]) - tol && x <= fmaxf(z[0], z[2]) + tol && y >= fminf(z[1], z[3]) - tol && y <= fmaxf(z[1], z[3]) + tol;
 }
+// v1.7: zones people are tracked in. All on (or all off) = anywhere.
+static void presence_track_zones(bool a, bool b, bool c) {
+  const uint8_t m = (uint8_t) ((a ? 1 : 0) | (b ? 2 : 0) | (c ? 4 : 0));
+  pr_trk = (m == 7) ? 0 : m;
+}
+static bool pr_trk_ok(float x, float y, float tol) {
+  if (!pr_trk) return true;
+  bool any = false;
+  for (int i = 0; i < 3; i++) if ((pr_trk >> i) & 1 && pr_zone_on(i)) { any = true; if (pr_in_zone(i, x, y, tol)) return true; }
+  return !any;   // the tracked zones are not drawn: do not blind the radar
+}
 static bool pr_in_room(float x, float y, float tol) {
   if (!pr_geo.room) return true;
   const float rx = pr_geo.sx + pr_geo.fl * x * pr_geo.co + y * pr_geo.si, ry = pr_geo.sy + pr_geo.fl * x * pr_geo.si - y * pr_geo.co;
@@ -163,6 +178,7 @@ static bool pr_in_room(float x, float y, float tol) {
 static bool pr_visible(float x, float y) {
   if (y <= 0.0f || y > pr_geo.ymax || hypotf(x, y) > 6000.0f || fabsf(x) > y * 1.7320508f) return false;   // range, 120 deg view
   if (pr_geo.fence && !pr_in_room(x, y, 0.0f)) return false;
+  if (!pr_trk_ok(x, y, 0.0f)) return false;   // v1.7
   if (pr_geo.zt == 1) { bool any = false, in = false; for (int i = 0; i < 3; i++) if (pr_zone_on(i)) { any = true; if (pr_in_zone(i, x, y, 0)) in = true; } if (any && !in) return false; }
   if (pr_geo.zt == 2) for (int i = 0; i < 3; i++) if (pr_zone_on(i) && pr_in_zone(i, x, y, 0)) return false;
   return true;
@@ -240,6 +256,7 @@ static void presence_tick(const float *x, const float *y, const float *s, bool l
   for (int i = 0; i < 3; i++) {
     ok[i] = live && !std::isnan(x[i]) && !std::isnan(y[i]) && y[i] > 0.0f && y[i] <= ymax;
     if (ok[i] && pr_geo.fence && !pr_in_room(x[i], y[i], PR_FENCE_MM)) ok[i] = false;   // v1.3 room fence
+    if (ok[i] && !pr_trk_ok(x[i], y[i], PR_FENCE_MM)) ok[i] = false;   // v1.7 tracked zones only
     if (ok[i] && ign_hi > ign_lo) { float r = hypotf(x[i], y[i]); if (r >= ign_lo && r <= ign_hi) ok[i] = false; }   // v1.2
     moving[i] = !std::isnan(s[i]) && fabsf(s[i]) >= smin;
   }
@@ -302,6 +319,7 @@ static void presence_tick(const float *x, const float *y, const float *s, bool l
 // v1.6: may a moving target at x / y switch Moving target on? Not a flicker at a known still-clutter spot, unless a
 // locked track (a real person) is right there.
 static bool presence_move_ok(float x, float y) {
+  if (!std::isnan(x) && !pr_trk_ok(x, y, PR_FENCE_MM)) return false;   // v1.7: outside the tracked zones
   if (std::isnan(x) || !pr_clut_at(x, y)) return true;
   for (const auto &t : pr_t) if (t.used && t.lock && hypotf(t.x - x, t.y - y) < PR_RADIUS_MM) return true;
   return false;
