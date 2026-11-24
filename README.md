@@ -24,11 +24,11 @@ and failsafes for when Home Assistant goes away.
 | [`airgradient-loft`, `airgradient-kitchen`](#airgradient-loft-airgradient-kitchen) | AirGradient ONE on local firmware | AirGradient I-9PSL | Loft, Kitchen |
 | [`nu-presence-1`, `2`](#nu-presence-1-2) | 60 GHz presence, breathing and light, with a web page | Seeed MR60BHA2 kit | Loft, not installed yet |
 | [`nu-presence-24ghz-1`](#nu-presence-24ghz-1) | 24 GHz presence with its own screen and a tuning page | Waveshare ESP32-S3-LCD-1.47B, LD2410C | Family Room |
-| [`nu-presence-24ghz-2`](#nu-presence-24ghz-2) | 24 GHz multi-person tracking with a room map | Apollo MTR-1, LD2450 | Upper Hallway |
+| [`nu-presence-24ghz-2`](#nu-presence-24ghz-2) | 24 GHz multi-person tracking with a room map | Apollo MTR-1, LD2450 | TV Loft |
 | [`nu-trash-1`](#nu-trash-1) | Odor watch inside the kitchen trash cabinet | ESP32-S3 Super Mini, SGP41, BME688, AGS10 | Kitchen |
+| [`nu-masterbath-1`](#nu-masterbath-1) | Bathroom air quality and multi-person tracking with zones, on a touch screen | ESP32-2432S028R display, SEN54, LD2450 | Master Bathroom |
 | [`nu-garage-1`](#nu-garage-1) | Garage air quality and 24 GHz presence | ESP32-S3 Super Mini, SEN55, LD2410C | Garage |
 | [`nu-range-hood`](#nu-range-hood) | Three-speed kitchen hood | ESP32-S3, relays | Kitchen |
-| [`nu-esp32-2432s028r`](#nu-esp32-2432s028r) | Wall touch panel for a light | ESP32-2432S028R display | Office 1 |
 | [`nu-thread-1`](#nu-thread-1) | Soil moisture over Thread | ESP32-H2 | Dining Room |
 | [`nu-wt-1`](#nu-wt-1) | Water pump on a relay | ESP32-C6 | Dining Room |
 | [`nu-test-1`](#nu-test-1) | Bench test board | Arduino Nano ESP32, SHT4x | Closet |
@@ -200,14 +200,38 @@ breathing detection and no sensitivity setting, so a seated person simply fades 
 [`presence_2450.h`](presence_2450.h) deals with that using one rule: **people don't vanish, to leave
 they have to move.**
 
-- A track starts only from a target that moved, so static ghosts are ignored.
+- A new target only counts once it has travelled half a metre (lock-on). A towel swaying in a vent
+  draught or a curtain never gets that far, so it never holds the room. Each one that times out marks
+  a still-object spot, and from the second time that spot can't pick up a lost track or trip
+  `Moving target` unless a real track is close by. The map shows checking targets as dashed rings
+  and still objects as grey crosses.
 - A track lost while moving means the person walked out, so it clears after `Clear delay`.
 - A track lost while still means they faded out, so it's held for `Still hold`.
 - Each person has their own track, so someone leaving doesn't clear someone sitting down.
 - Tracks survive a restart or flash. A silent radar reads as an empty room instead of a stuck one.
-- `Zone 1-3` rectangles, drawn on the page or typed into Home Assistant.
-- Tuning page on port 8080 ([`radar_web_2450.h`](radar_web_2450.h)) with a live top-down map.
+- `Zone 1-3` rectangles or polygons (up to 8 corners), drawn on the page or typed into Home Assistant,
+  each with its own `Still hold`. Here: Couch, Floor and Walkway, with a TV Loft activities card
+  that sets the holds in one tap.
+- Tuning page on port 8080 ([`radar_web_2450.h`](radar_web_2450.h)) with a live top-down room map.
 - `Web page`, `Still preset` and `Moving preset` show the page's status and the current presets in Home Assistant.
+
+### nu-masterbath-1
+
+A cheap ESP32-2432S028R touch screen board with a Sensirion SEN54 and an HLK-LD2450 radar, made to
+replace a bathroom air quality sensor and add presence. The radar part is the `nu-presence-24ghz-2`
+logic, shared through [`common/ld2450-presence.yaml`](common/ld2450-presence.yaml).
+
+- PM, VOC, temperature and humidity with the same level colours as the other air quality units.
+  The SEN54 has no CO2 or NOx, so the level is VOC and PM only.
+- The board has nothing on the I2C bus but the ESP32's weak internal pull-ups, so the bus runs at
+  10 kHz. At 100 kHz the SEN54 didn't answer over a spliced cable.
+- Screen in four orientations (`Screen Orientation`), and the back RGB LED shows the air level.
+  Screen and LED brightness can follow a Home Assistant light (`Brightness Follows Bath Light`).
+- Three zones (main room, toilet corner, closet) with per-zone holds and a Bathroom activities
+  card: hands and teeth, shaving, dressing, toilet, nails, shower, tub soak.
+- The same lock-on as `nu-presence-24ghz-2`, added for a towel that moved in the vent draught.
+- Mount the LD2450 upright (long side vertical). Turned 90 degrees, its left and right read as up
+  and down.
 
 ### nu-garage-1
 
@@ -237,17 +261,6 @@ Replaces the controls on a three-speed kitchen hood.
 - Three relays with an interlock, so two speeds can never be on at once.
 - The physical speed switches keep working alongside the `Fan Speed` selector in Home Assistant.
 - Logs its last four relay moves to a sensor, which is how odd clicking gets diagnosed.
-
-### nu-esp32-2432s028r
-
-A "Cheap Yellow Display" used as a wall touch panel for a light, built with LVGL.
-
-- Resistive panels report phantom touches, so a touch on a sleeping screen only wakes it. The
-  controls arm a moment after release, and they disarm when the screen dims.
-- Presses shorter than "Min Touch Time" (default 100 ms, set from Home Assistant) are dropped as
-  panel noise, and "Last Touch Event" shows how long each press lasted.
-- The header comment explains how each guard came about.
-- Change the `light.` entity in the yaml to your own.
 
 ### nu-thread-1
 

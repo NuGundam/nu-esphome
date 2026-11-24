@@ -1,0 +1,1325 @@
+# =======================================================
+# Nu-MasterBath-1  v0.12 - master bath air quality + motion, with a screen
+# ESP32-2432S028R "Cheap Yellow Display" + Sensirion SEN54 + HLK-LD2450 24 GHz radar
+# in the masterbath_combo enclosure (SEN54 bay below, screen + radar above, USB-C down).
+#
+# Built from two live configs so the logic matches what HA already uses:
+#   * Motion: NU-Presence-24GHz-2 v1.11, unchanged, as the package common/ld2450-presence.yaml
+#     (generated from that file by make_package.py): presence tracks, Still hold, Moving target
+#     from speed / range / hold, three zones in metres, tuning page on http://<ip>:8080/.
+#   * Air: NU-AQI-3 v5.7 - temperature offset (base + coefficient x ESP heat) with the humidity
+#     re-corrected to match, EPA NowCast "Average PM AQI", VOC with 240 h learning, "VOC Fast",
+#     the AQI status texts and the combined level. The SEN54 has no CO2 and no NOx, so those
+#     entities are gone and the combined level is VOC + PM only.
+#   * The combined level, the readings and the presence state are shown on the screen instead of
+#     an LED. The screen lights while the room is occupied (or 60 s after a touch).
+#
+# Wiring (board connector names; all three are 4-pin 1.25 mm plugs on the back of the board).
+# Drawing: ../wiring.png. GND is the TOP pin of P3 and CN1 seen from the back (check with a meter).
+#   P1   VIN  -> LD2450 5V and SEN54 pin 1 VDD (splice)   (5 V from USB)
+#        TX   -> LD2450 RX                            (GPIO1; the USB serial chip only listens here)
+#        RX, GND -> not used
+#   P3   GND  -> LD2450 GND
+#        IO35 -> LD2450 TX                            (input-only pin, 3.3 V logic)
+#        IO22, IO21 -> not used (IO21 is the backlight)
+#   CN1  GND  -> SEN54 pin 2 GND and pin 5 SEL        (SEL low at power-up = I2C)
+#        IO22 -> SEN54 pin 3 SDA  + 10 kOhm to 3.3V
+#        IO27 -> SEN54 pin 4 SCL  + 10 kOhm to 3.3V
+#        3.3V -> the two 10 kOhm pull-ups
+#   SEN54 pin 6 is not connected.
+# Because GPIO1 carries the radar, the logger does not use the serial port (baud_rate: 0);
+# logs come over Wi-Fi. Flashing over USB still works: unplug nothing.
+# Power: SEN54 63 mA (100 the first minute) + radar 120 mA + board with backlight about 250 mA.
+# Use a 5 V / 1 A supply and a USB-A to USB-C cable (this board's USB-C has no CC resistors,
+# so a C-to-C charger may not power it).
+#
+# Screen: the yaml's display block is the one the office panel uses. If your board is the
+# two-USB revision and the picture is mirrored, inverted or upside down, see README "Screen".
+#
+# Keys: same layout as nu-garage-1.yaml. The live copy in /config/esphome holds the real API key
+# and hotspot password; this copy keeps placeholders. OTA reuses the API key.
+# =======================================================
+substitutions:
+  device_name: nu-masterbath-1
+  friendly_name: Nu-MasterBath-1
+  room_name: "Master Bath"
+  api_key: !secret api_key
+  ap_ssid: "Nu-MasterBath-1 Hotspot"
+  ap_password: !secret ap_password
+  radar_tx_pin: GPIO1           # P1 "TX" -> radar RX
+  radar_rx_pin: GPIO35          # P3 "IO35" <- radar TX
+  # v0.9 room plan for the radar map and tracker (cm, origin top-left of the plan, y down):
+  # master bath block 19 x 14 ft (bath 6 x 19 on top, closet / toilet / shower below), unit on
+  # the top wall 6.6 ft from the left wall, facing down into the room (aim 180).
+  radar_room_default: '{"w":579,"d":427,"unit":"ft","place":"custom","sx":201,"sy":0,"aim":180,"aimAuto":false,"flip":true,"trail":true}'
+  zone1_name: "Main"              # v0.10 zone names (Bathroom activities card, Still Hold numbers)
+  zone2_name: "Shower and Toilet"
+  zone3_name: "Closet"
+  bath_light_entity: light.master_bathroom_lights   # v0.9: its brightness sets the screen and AQI LED brightness
+  screen_rotation: "90"         # boot default before the select restores (Vertical)
+
+packages:
+  wifi_diag: !include common/wifi-diag.yaml         # BSSID / Access Point / reconnects / TX power
+  radar: !include common/ld2450-presence.yaml       # NU-Presence-24GHz-2 logic
+  wifi_steer: !include common/wifi-steer.yaml       # keep on the strongest mesh node
+
+# Keeps _esphomelib in mDNS next to the _http service from the USE_WEBSERVER flags,
+# so the Device Builder sees the device.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mdns_web_slot]
+mdns_web_slot:
+
+esphome:
+  name: ${device_name}
+  on_boot:
+    - priority: -200            # after the radar package sets boot_done (-100)
+      then:
+        - script.execute: apply_orientation
+  friendly_name: ${friendly_name}
+  project:
+    name: "my.nu-masterbath-1"
+    version: "0.12"
+  # HA's "Visit" link = http://<ip>:8080 (the radar map)
+  build_flags:
+    - "-DUSE_WEBSERVER"
+    - "-DUSE_WEBSERVER_PORT=8080"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      include_builtin_idf_components:   # radar_web_2450.h runs its own httpd
+        - esp_http_server
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "16"     # API + OTA + mDNS + 5 httpd sockets
+
+logger:
+  baud_rate: 0                    # GPIO1 (serial TX) belongs to the radar
+  level: INFO
+  logs:
+    ld2450: WARN
+    sen5x: INFO
+
+api:
+  encryption:
+    key: ${api_key}
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 15min
+  ap:
+    ssid: ${ap_ssid}
+    password: ${ap_password}
+
+# no captive_portal: it holds LWIP sockets the :8080 page needs
+
+debug:
+  update_interval: 60s
+
+# -------------------------------------------------------
+# GLOBALS (air side; the radar's are in the package)
+# -------------------------------------------------------
+globals:
+  - id: sensor_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: aqi_level_score          # -1 warming up, 0 Excellent .. 4 Unhealthy
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: aqi_brightness           # 1.0 by day, 0.5 at night (Screen Auto Night Mode)
+    type: float
+    restore_value: no
+    initial_value: '1.0'
+  - id: temp_offset_current      # deg C subtracted from the SEN54 temperature right now
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: nowcast_pm25
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: nowcast_pm10
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: last_touch_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# -------------------------------------------------------
+# SUN AND TIME
+# -------------------------------------------------------
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - lambda: |-
+          if (id(auto_night_mode).state)
+            id(aqi_brightness) = id(sun_component).is_above_horizon() ? 1.0f : 0.5f;
+      - script.execute: ui_update
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: ui_update
+
+sun:
+  id: sun_component
+  latitude: !secret home_latitude
+  longitude: !secret home_longitude
+  on_sunrise:
+    - elevation: 0°
+      then:
+        - if:
+            condition:
+              switch.is_on: auto_night_mode
+            then:
+              - globals.set:
+                  id: aqi_brightness
+                  value: '1.0'
+  on_sunset:
+    - elevation: 0°
+      then:
+        - if:
+            condition:
+              switch.is_on: auto_night_mode
+            then:
+              - globals.set:
+                  id: aqi_brightness
+                  value: '0.5'
+
+switch:
+  # NU-AQI-3's "AQI Auto Night Mode", acting on the screen: half brightness after sunset.
+  - platform: template
+    name: "Screen Auto Night Mode"
+    id: auto_night_mode
+    icon: "mdi:weather-night"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          id(aqi_brightness) = id(sun_component).is_above_horizon() ? 1.0f : 0.5f;
+    turn_off_action:
+      - globals.set:
+          id: aqi_brightness
+          value: '1.0'
+  # On: the screen is lit only while the room is occupied (and 60 s after a touch).
+  # Off: always lit.
+  - platform: template
+    name: "Screen Follows Presence"
+    id: screen_follow
+    icon: "mdi:monitor-eye"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  # v0.9  On: screen and AQI LED brightness follow the bathroom light (${bath_light_entity}):
+  # light on = its dim level, light off = "Brightness With Light Off". This replaces the
+  # sunset rule while it is on. Off: the sunset rule as before, LED at full.
+  - platform: template
+    name: "Brightness Follows Bath Light"
+    id: light_link
+    icon: "mdi:lightbulb-auto"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# -------------------------------------------------------
+# NUMBERS (temperature compensation as on NU-AQI-3, screen brightness)
+# -------------------------------------------------------
+number:
+  # Fixed part of the offset (deg C). Calibrate against a trusted thermometer after
+  # an hour of warm-up. Positive = sensor reads high, value is subtracted.
+  - platform: template
+    name: "Temp Offset Base"
+    id: temp_offset_base
+    icon: "mdi:thermometer-minus"
+    entity_category: "config"
+    unit_of_measurement: "°C"
+    min_value: -10.0
+    max_value: 10.0
+    step: 0.1
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+  # Dynamic part: fraction of (ESP internal deg C - raw SEN54 deg C) subtracted.
+  # 0 = off (the default here: the SEN54 sits in its own bay under the electronics, and the
+  # plain ESP32's internal sensor is coarse). Raise it only if the reading follows the screen.
+  - platform: template
+    name: "Temp Offset Heat Coefficient"
+    id: temp_offset_coeff
+    icon: "mdi:chip"
+    entity_category: "config"
+    unit_of_measurement: ""
+    min_value: 0.0
+    max_value: 0.5
+    step: 0.01
+    initial_value: 0.0
+    optimistic: true
+    restore_value: true
+  - platform: template
+    name: "Screen Brightness"
+    id: screen_brightness
+    icon: "mdi:brightness-6"
+    entity_category: "config"
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 5
+    initial_value: 70
+    optimistic: true
+    restore_value: true
+  # v0.9: share of the normal brightness used while the bathroom light is off (0 = dark)
+  - platform: template
+    name: "Brightness With Light Off"
+    id: light_off_level
+    icon: "mdi:lightbulb-off-outline"
+    entity_category: "config"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+  # v0.10 bathroom activities: Still hold per zone (s). Someone who goes still (or out of the radar's
+  # sight) inside the zone counts as there this long; 0 = the general Still hold. Page: Bathroom activities.
+  - platform: template
+    name: "Still Hold ${zone1_name}"
+    id: zsh1
+    icon: "mdi:timer-sand"
+    entity_category: "config"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 7200
+    step: 60
+    initial_value: 1800
+    optimistic: true
+    restore_value: true
+  - platform: template
+    name: "Still Hold ${zone2_name}"
+    id: zsh2
+    icon: "mdi:timer-sand"
+    entity_category: "config"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 7200
+    step: 60
+    initial_value: 1800
+    optimistic: true
+    restore_value: true
+  - platform: template
+    name: "Still Hold ${zone3_name}"
+    id: zsh3
+    icon: "mdi:timer-sand"
+    entity_category: "config"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 7200
+    step: 60
+    initial_value: 600
+    optimistic: true
+    restore_value: true
+
+# -------------------------------------------------------
+# SEN54 on I2C (100 kHz max, datasheet section 6) - CN1
+# -------------------------------------------------------
+i2c:
+  sda: GPIO22                    # CN1 IO22
+  scl: GPIO27                    # CN1 IO27
+  frequency: 10kHz               # v0.7 test: slow bus, the only pull-ups are the ESP32 internal ones (about 45 k)
+  scan: true
+  id: i2c0
+
+binary_sensor:
+  - platform: homeassistant      # v0.9: the bathroom light, for the brightness link
+    id: bath_light_on
+    entity_id: ${bath_light_entity}
+    internal: true
+  - platform: template
+    name: "Sensor Ready"
+    id: sensor_ready_bs
+    entity_category: "diagnostic"
+    lambda: |-
+      return id(sensor_ready);
+
+sensor:
+  - platform: homeassistant      # v0.9: dim level of the bathroom light, 0..255 (no value while it is off)
+    id: bath_light_bri
+    entity_id: ${bath_light_entity}
+    attribute: brightness
+    internal: true
+  - platform: sen5x
+    id: sen54
+    pm_1_0:
+      name: "PM <1µm"
+      id: pm_1_0
+      icon: "mdi:dots-circle"
+      filters:
+        - delta: 1.0
+    pm_2_5:
+      name: "PM <2.5µm"
+      id: pm_2_5
+      icon: "mdi:circle-medium"
+      filters:
+        - delta: 1.0
+      on_raw_value:
+        then:
+          - lambda: |-
+              if (!isnan(x)) id(sensor_ready) = true;
+    pm_4_0:
+      name: "PM <4µm"
+      id: pm_4_0
+      icon: "mdi:circle"
+      filters:
+        - delta: 1.0
+    pm_10_0:
+      name: "PM <10µm"
+      id: pm_10_0
+      icon: "mdi:circle-outline"
+      filters:
+        - delta: 1.0
+    temperature:
+      name: "Temperature"
+      id: sen54_temp
+      icon: "mdi:thermometer"
+      filters:
+        # temp_offset_current is recomputed every 30 s. get_raw_state() elsewhere reads
+        # the uncompensated value, so the offset never feeds back into itself.
+        - lambda: return x - id(temp_offset_current);
+        - delta: 0.1
+    humidity:
+      name: "Humidity"
+      id: sen54_humid
+      icon: "mdi:water-percent"
+      filters:
+        # RH measured at the (warmer) sensor temperature is too low for the true air.
+        # Rescale by the saturation-pressure ratio (Magnus) so RH matches "Temperature".
+        - lambda: |-
+            float off = id(temp_offset_current);
+            float t_meas = id(sen54_temp).get_raw_state();
+            if (isnan(t_meas) || off == 0.0f) return x;
+            float t_true = t_meas - off;
+            auto ps = [](float t) { return expf(17.62f * t / (243.12f + t)); };
+            float rh = x * ps(t_meas) / ps(t_true);
+            return rh > 100.0f ? 100.0f : (rh < 0.0f ? 0.0f : rh);
+        - delta: 0.5
+    voc_index:
+      name: "VOC"
+      id: sen54_voc
+      icon: "mdi:flask-outline"
+      # 240 h (10 days) for both averages, as on NU-AQI-3 and the SGP41 units; the rest default.
+      algorithm_tuning:
+        learning_time_offset_hours: 240
+        learning_time_gain_hours: 240
+      filters:
+        - exponential_moving_average:
+            alpha: 0.05
+            send_every: 10
+        - delta: 3.0
+    update_interval: 5s
+    store_baseline: true          # the sen5x driver keeps the VOC baseline over a restart
+    address: 0x69
+  # The VOC index before the smoothing on "VOC": any move of 5 points at once, plus one
+  # value every 5 minutes. For short events (detergent, a dryer sheet, the door opening).
+  - platform: template
+    name: "VOC Fast"
+    id: sen54_voc_fast
+    icon: "mdi:flask-outline"
+    state_class: "measurement"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      float v = id(sen54_voc).get_raw_state();
+      if (isnan(v)) return {};
+      return v;
+    filters:
+      - or:
+          - throttle: 300s
+          - delta: 5.0
+  - platform: absolute_humidity
+    name: "Absolute Humidity"
+    id: sen54_absolute_humidity
+    temperature: sen54_temp
+    humidity: sen54_humid
+    icon: "mdi:water-opacity"
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 2
+  - platform: template
+    name: "AQI Feels Like Temp"
+    id: aqi_feels_like_temperature
+    icon: "mdi:thermometer-lines"
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      if (!id(sensor_ready)) return NAN;
+      float Tc = id(sen54_temp).state;
+      float RH = id(sen54_humid).state;
+      if (isnan(Tc) || isnan(RH)) return NAN;
+      float T = (Tc * 9.0f / 5.0f) + 32.0f;
+      return T + (0.1f * (RH - 50.0f));
+  # EPA AQI from NowCast concentrations (NU-AQI-3 v4.8 math): 12 h weighted average of
+  # PM2.5 and PM10, May-2024 breakpoints, the higher sub-index. Instantaneous readings
+  # are the fallback until the first data is in.
+  - platform: template
+    name: "Average PM AQI"
+    id: avg_pm_aqi
+    icon: "mdi:chart-bar"
+    unit_of_measurement: "AQI"
+    accuracy_decimals: 0
+    update_interval: 60s
+    filters:
+      - delta: 1
+    lambda: |-
+      if (!id(sensor_ready)) return NAN;
+      float c25 = id(nowcast_pm25);
+      float c10 = id(nowcast_pm10);
+      if (isnan(c25)) c25 = id(pm_2_5).get_raw_state();   // pre-NowCast fallback
+      if (isnan(c10)) c10 = id(pm_10_0).get_raw_state();
+      if (isnan(c25) || isnan(c10)) return NAN;
+      // EPA truncation: PM2.5 to 0.1 ug/m3, PM10 to 1 ug/m3
+      c25 = floorf(c25 * 10.0f) / 10.0f;
+      c10 = floorf(c10);
+      static const struct { float lo, hi; int alo, ahi; } bp25[] = {
+        {0.0f,     9.0f,   0,  50},
+        {9.1f,    35.4f,  51, 100},
+        {35.5f,   55.4f, 101, 150},
+        {55.5f,  125.4f, 151, 200},
+        {125.5f, 225.4f, 201, 300},
+        {225.5f, 325.4f, 301, 500}
+      };
+      static const struct { float lo, hi; int alo, ahi; } bp10[] = {
+        {0.0f,    54.0f,   0,  50},
+        {55.0f,  154.0f,  51, 100},
+        {155.0f, 254.0f, 101, 150},
+        {255.0f, 354.0f, 151, 200},
+        {355.0f, 424.0f, 201, 300},
+        {425.0f, 604.0f, 301, 500}
+      };
+      auto calc = [](float c, const auto* t, int nb) -> int {
+        if (c <= 0.0f) return 0;
+        for (int i = 0; i < nb; i++)
+          if (c >= t[i].lo && c <= t[i].hi)
+            return (int)roundf((t[i].ahi - t[i].alo) * (c - t[i].lo)
+                               / (t[i].hi - t[i].lo)) + t[i].alo;
+        return 500;
+      };
+      return (float)std::max(calc(c25, bp25, 6), calc(c10, bp10, 6));
+  - platform: template
+    name: "WiFi Signal Quality"
+    id: wifi_quality
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:wifi"
+    update_interval: 60s
+    entity_category: "diagnostic"
+    filters:
+      - delta: 1
+    lambda: |-
+      if (isnan(id(s_rssi).state)) return {};
+      int q = 2 * (100 + (int)id(s_rssi).state);
+      return (float)std::clamp(q, 0, 100);
+  # deg C source for the dynamic offset
+  - platform: internal_temperature
+    id: esp_temp_c
+    internal: true
+    update_interval: 30s
+  - platform: copy
+    source_id: esp_temp_c
+    name: "ESP32 Internal Temperature (F)"
+    id: esp_temp
+    icon: "mdi:chip"
+    entity_category: "diagnostic"
+    unit_of_measurement: "°F"
+    filters:
+      - lambda: return (x * 1.8f) + 32.0f;
+      - delta: 1
+  - platform: template
+    name: "Temp Offset Applied"
+    id: temp_offset_applied
+    icon: "mdi:thermometer-minus"
+    unit_of_measurement: "°F"
+    accuracy_decimals: 1
+    entity_category: "diagnostic"
+    update_interval: 60s
+    filters:
+      - delta: 0.1
+    lambda: |-
+      return id(temp_offset_current) * 1.8f;
+
+# -------------------------------------------------------
+# TEXT SENSORS (NU-AQI-3 bands and wording)
+# -------------------------------------------------------
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP32 IP Address"
+      icon: "mdi:ip-network"
+    ssid:
+      name: "SSID"
+      icon: "mdi:router-wireless"
+  - platform: template
+    name: "Unit Temperature Status"
+    id: esp_temp_status
+    icon: "mdi:chip"
+    entity_category: "diagnostic"
+    update_interval: 60s
+    lambda: |-
+      float t = id(esp_temp).state;
+      if (isnan(t)) return {};
+      if (t >= 185) return {"Overheating"};
+      if (t >= 140) return {"Warm"};
+      return {"Normal"};
+  - platform: template
+    name: "AQI AH"
+    id: aqi_ah
+    icon: "mdi:water-opacity"
+    update_interval: 30s
+    lambda: |-
+      if (!id(sensor_ready)) return {"Warming up"};
+      float ah = id(sen54_absolute_humidity).state;
+      if (isnan(ah)) return {"Warming up"};
+      char buf[48];
+      const char* label =
+        (ah <= 6.0f)  ? "Very Dry" :
+        (ah <= 8.0f)  ? "Dry" :
+        (ah <= 10.5f) ? "Comfortable" :
+        (ah <= 12.0f) ? "Humid" :
+        (ah <= 15.0f) ? "Very Humid" : "Excessive";
+      snprintf(buf, sizeof(buf), "%s (%.1f g/m³)", label, ah);
+      return {buf};
+  - platform: template
+    name: "AQI TVOC"
+    id: aqi_tvoc_text
+    icon: "mdi:flask-outline"
+    update_interval: 10s
+    lambda: |-
+      if (!id(sensor_ready)) return {"Warming up"};
+      float v = id(sen54_voc).state;
+      if (isnan(v) || v <= 0) return {"Warming up"};
+      char buf[64];
+      const char* label =
+        (v <= 150) ? "Excellent" :
+        (v <= 250) ? "Good" :
+        (v <= 350) ? "Moderate" :
+        (v <= 450) ? "Unhealthy for Sensitive Groups" :
+        (v <= 500) ? "Unhealthy" : nullptr;
+      if (!label) return {"Warming up"};
+      snprintf(buf, sizeof(buf), "%s (%.0f index)", label, v);
+      return {buf};
+  - platform: template
+    name: "PM AQI"
+    id: pm_aqi_text
+    icon: "mdi:air-filter"
+    update_interval: 10s
+    lambda: |-
+      if (!id(sensor_ready)) return {"Warming up"};
+      float p = id(avg_pm_aqi).state;
+      if (isnan(p)) return {"Warming up"};
+      char buf[64];
+      const char* label =
+        (p <=  25) ? "Excellent" :
+        (p <=  50) ? "Good" :
+        (p <= 100) ? "Moderate" :
+        (p <= 150) ? "Unhealthy for Sensitive Groups" :
+        (p <= 200) ? "Unhealthy" :
+        (p <= 300) ? "Very Unhealthy" : "Hazardous";
+      snprintf(buf, sizeof(buf), "%s (%d index)", label, (int)p);
+      return {buf};
+  # VOC + PM (NU-AQI-3 scores four pollutants; the SEN54 measures these two)
+  - platform: template
+    name: "AQI Combined Level"
+    id: combined_aqi_level
+    icon: "mdi:air-filter"
+    update_interval: 10s
+    lambda: |-
+      int lvl = id(aqi_level_score);
+      if (lvl < 0) return std::string("Warming up");
+      static const char* labels[] = {
+        "Excellent", "Good", "Moderate",
+        "Unhealthy for Sensitive Groups", "Unhealthy"
+      };
+      return std::string(labels[lvl > 4 ? 4 : lvl]);
+
+# -------------------------------------------------------
+# INTERVAL
+# -------------------------------------------------------
+interval:
+  # v0.10: hand the zone holds to the tracker (presence_2450.h v1.4) and the page (radar_web_2450.h v1.10)
+  - interval: 1s
+    then:
+      - lambda: |-
+          presence_zone_holds(id(zsh1).state, id(zsh2).state, id(zsh3).state);
+          auto &c = radar_web_cfg();
+          c.zh[0] = id(zsh1); c.zh[1] = id(zsh2); c.zh[2] = id(zsh3);
+          c.zname[0] = "${zone1_name}"; c.zname[1] = "${zone2_name}"; c.zname[2] = "${zone3_name}";
+  # v0.5: the sen5x driver asks the SEN54 once, 1 s after boot, and gives up for good if it
+  # does not answer (seen on this unit: 4.6 V supply, Wi-Fi + fan starting at that moment).
+  # Try again every 15 s while it is failed.
+  - interval: 15s
+    then:
+      - lambda: |-
+          static int tries = 0;
+          if (!id(sen54).is_failed()) {
+            if (tries > 0) { ESP_LOGW("sen54", "answering after %d retr%s", tries, tries == 1 ? "y" : "ies"); tries = 0; }
+            return;
+          }
+          tries++;
+          ESP_LOGW("sen54", "no answer, retry %d", tries);
+          // v0.6 wire self-test: pull each I2C wire low in turn and read the other one.
+          // The pins stay owned by the I2C driver; only the output source is borrowed for
+          // a moment (ESP32 GPIO_FUNCn_OUT_SEL_CFG at 0x3FF44530 + 4 * pin) and put back.
+          {
+            const gpio_num_t SDA = GPIO_NUM_22, SCL = GPIO_NUM_27;
+            auto sel = [](gpio_num_t g) { return (volatile uint32_t *) (0x3FF44530 + 4 * (int) g); };
+            int idle_sda = gpio_get_level(SDA), idle_scl = gpio_get_level(SCL);
+            int res[2][3]; uint32_t rise[2];   // [0] SDA pulled low, [1] SCL pulled low: own level, other level, own level after release
+            for (int k = 0; k < 2; k++) {
+              gpio_num_t a = k ? SCL : SDA, b = k ? SDA : SCL;
+              uint32_t keep = *sel(a);
+              gpio_set_level(a, 0);
+              gpio_set_direction(a, GPIO_MODE_INPUT_OUTPUT_OD);
+              delayMicroseconds(300);
+              res[k][0] = gpio_get_level(a);
+              res[k][1] = gpio_get_level(b);
+              uint32_t t0 = micros();
+              gpio_set_level(a, 1);
+              while (!gpio_get_level(a) && micros() - t0 < 3000) { }
+              rise[k] = micros() - t0;     // time for the released wire to read high again
+              delayMicroseconds(300);
+              res[k][2] = gpio_get_level(a);
+              *sel(a) = keep;
+              delayMicroseconds(300);
+            }
+            const char *verdict = "wires look free (no short, not stuck)";
+            if (!idle_sda || !idle_scl) verdict = "a wire is STUCK LOW (shorted to GND, or held by the sensor)";
+            else if (res[0][0] || res[1][0]) verdict = "self-test could not pull a wire low (test not valid)";
+            else if (!res[0][1] || !res[1][1]) verdict = "SDA and SCL are SHORTED TOGETHER";
+            else if (!res[0][2] || !res[1][2]) verdict = "a wire is slow to rise (weak pull-up or extra load)";
+            ESP_LOGW("sen54", "wire test: idle SDA=%d SCL=%d | SDA low -> SDA=%d SCL=%d, released SDA=%d | SCL low -> SCL=%d SDA=%d, released SCL=%d | rise SDA %u us, SCL %u us | %s",
+                     idle_sda, idle_scl, res[0][0], res[0][1], res[0][2], res[1][0], res[1][1], res[1][2],
+                     (unsigned) rise[0], (unsigned) rise[1], verdict);
+          }
+          id(sen54).reset_to_construction_state();
+          id(sen54).call();
+  # Temperature offset: base + coeff * max(0, ESP internal - raw SEN54), from raw values.
+  - interval: 30s
+    then:
+      - lambda: |-
+          float esp_c  = id(esp_temp_c).state;
+          float t_raw  = id(sen54_temp).get_raw_state();
+          float base   = id(temp_offset_base).state;
+          float coeff  = id(temp_offset_coeff).state;
+          if (isnan(base)) base = 0.0f;
+          if (isnan(esp_c) || isnan(t_raw) || isnan(coeff)) {
+            id(temp_offset_current) = base;
+            return;
+          }
+          float d = esp_c - t_raw;
+          if (d < 0.0f) d = 0.0f;
+          id(temp_offset_current) = base + coeff * d;
+  # EPA NowCast accumulator: 12 hourly PM averages, weighted concentration every minute.
+  # Hour 0 = the running average of the current (partial) hour.
+  - interval: 60s
+    then:
+      - lambda: |-
+          static float sum25 = 0.0f, sum10 = 0.0f;
+          static int   cnt = 0;
+          static float h25[12], h10[12];
+          static int   hours = 0;
+          float p25 = id(pm_2_5).get_raw_state();    // raw: bypass delta filters
+          float p10 = id(pm_10_0).get_raw_state();
+          if (!id(sensor_ready) || isnan(p25) || isnan(p10)) return;
+          sum25 += p25; sum10 += p10; cnt++;
+          if (cnt >= 60) {                      // full hour complete
+            for (int i = 11; i > 0; i--) { h25[i] = h25[i-1]; h10[i] = h10[i-1]; }
+            h25[0] = sum25 / cnt; h10[0] = sum10 / cnt;
+            if (hours < 12) hours++;
+            sum25 = 0.0f; sum10 = 0.0f; cnt = 0;
+          }
+          float c25[13], c10a[13];
+          int n = 0;
+          if (cnt > 0) { c25[n] = sum25 / cnt; c10a[n] = sum10 / cnt; n++; }
+          for (int i = 0; i < hours && n < 12; i++) { c25[n] = h25[i]; c10a[n] = h10[i]; n++; }
+          auto nowcast = [](const float* c, int n) -> float {
+            if (n == 0) return NAN;
+            if (n == 1) return c[0];
+            float cmin = c[0], cmax = c[0];
+            for (int i = 1; i < n; i++) {
+              if (c[i] < cmin) cmin = c[i];
+              if (c[i] > cmax) cmax = c[i];
+            }
+            float w = (cmax > 0.0f) ? 1.0f - (cmax - cmin) / cmax : 1.0f;
+            if (w < 0.5f) w = 0.5f;               // EPA floor
+            float num = 0.0f, den = 0.0f, wi = 1.0f;
+            for (int i = 0; i < n; i++) { num += wi * c[i]; den += wi; wi *= w; }
+            return (den > 0.0f) ? num / den : NAN;
+          };
+          id(nowcast_pm25) = nowcast(c25, n);
+          id(nowcast_pm10) = nowcast(c10a, n);
+  # Combined level (0-4) from VOC and PM, NU-AQI-3 bands; then repaint the screen.
+  - interval: 10s
+    then:
+      - lambda: |-
+          float voc    = id(sen54_voc).state;
+          float pm_aqi = id(avg_pm_aqi).state;
+          if (!id(sensor_ready) || isnan(voc) || voc <= 0 || isnan(pm_aqi)) {
+            id(aqi_level_score) = -1;
+          } else {
+            int vs = (voc    <= 150) ? 0 : (voc    <= 250) ? 1 : (voc    <= 350) ? 2 : (voc    <= 450) ? 3 : 4;
+            int ps = (pm_aqi <=  50) ? 0 : (pm_aqi <= 100) ? 1 : (pm_aqi <= 150) ? 2 : (pm_aqi <= 200) ? 3 : 4;
+            id(aqi_level_score) = std::max(vs, ps);
+          }
+      - script.execute: ui_update
+  # Backlight: on while occupied (or always, with "Screen Follows Presence" off), 60 s after
+  # a touch, and for the first 2 minutes after boot. Only acts when something changed.
+  - interval: 1s
+    then:
+      - lambda: |-
+          static float last = -2.0f;
+          uint32_t now = millis();
+          bool touched = id(last_touch_ms) != 0 && now - id(last_touch_ms) < 60000;
+          bool on = !id(screen_follow).state || id(occupied).state || touched || now < 120000;
+          float sb = id(screen_brightness).state;
+          // v0.9 bathroom light link: lf = 0..1 from the light, -1 = not linked / state not known yet
+          float lf = -1.0f;
+          if (id(light_link).state && id(bath_light_on).has_state()) {
+            if (id(bath_light_on).state) {
+              float b = id(bath_light_bri).state;
+              lf = isnan(b) ? 1.0f : clamp(b / 255.0f, 0.10f, 1.0f);
+            } else {
+              float o = id(light_off_level).state;
+              lf = isnan(o) ? 0.10f : clamp(o / 100.0f, 0.0f, 1.0f);
+            }
+          }
+          float br = on ? (lf < 0.0f ? id(aqi_brightness) : lf) * (isnan(sb) ? 70.0f : sb) / 100.0f : 0.0f;
+          // AQI LED: on/off, brightness and colour stay with the light entity; the link scales the
+          // three outputs underneath (power 2.2 so it looks like the same dim step as the screen)
+          {
+            static float last_lp = -1.0f;
+            float lp = lf < 0.0f ? 1.0f : lf;
+            if (fabsf(lp - last_lp) >= 0.005f) {
+              last_lp = lp;
+              float pw = lp <= 0.0f ? 0.0f : powf(lp, 2.2f);
+              id(led_r).set_max_power(pw); id(led_g).set_max_power(pw); id(led_b).set_max_power(pw);
+              if (id(aqi_led).remote_values.is_on()) {
+                auto c = id(aqi_led).turn_on();
+                c.set_transition_length(0);
+                c.perform();
+              }
+              ESP_LOGI("led", "bath light link: factor %.2f", lp);
+            }
+          }
+          if (fabsf(br - last) < 0.005f) return;
+          last = br;
+          if (br <= 0.0f) {
+            auto call = id(backlight).turn_off();
+            call.set_transition_length(1500);
+            call.perform();
+          } else {
+            auto call = id(backlight).turn_on();
+            call.set_brightness(br);
+            call.perform();
+          }
+
+# -------------------------------------------------------
+# BUTTONS
+# -------------------------------------------------------
+button:
+  - platform: template
+    name: "SEN54 clean fan"
+    icon: mdi:fan-alert
+    entity_category: diagnostic
+    on_press:
+      - sen5x.start_fan_autoclean: sen54
+
+# -------------------------------------------------------
+# SCREEN (ILI9341 / ST7789 320 x 240 on SPI, XPT2046 touch, backlight GPIO21)
+# -------------------------------------------------------
+# -------------------------------------------------------
+# SCREEN ORIENTATION (v0.2): Vertical = portrait (USB-C down), Horizontal = landscape.
+# "flipped" turns the picture 180 degrees in case the case or the board sits the other way.
+# -------------------------------------------------------
+select:
+  - platform: template
+    id: screen_orient
+    name: "Screen Orientation"
+    icon: mdi:phone-rotate-landscape
+    entity_category: config
+    options:
+      - "Vertical"
+      - "Vertical (flipped)"
+      - "Horizontal"
+      - "Horizontal (flipped)"
+    initial_option: "Vertical"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - script.execute: apply_orientation
+
+spi:
+  - id: tft_bus
+    clk_pin: 14
+    mosi_pin: 13
+    miso_pin: 12
+  - id: touch_bus
+    clk_pin: 25
+    mosi_pin: 32
+    miso_pin: 39
+
+output:
+  - platform: ledc
+    pin: 21
+    id: backlight_pwm
+    frequency: 1000Hz
+  # v0.8: the RGB LED on the back of the board (red GPIO4, green GPIO16, blue GPIO17, lit when low)
+  - platform: ledc
+    pin: 4
+    id: led_r
+    max_power: 100%              # keeps the power scaling code in (set_max_power at run time)
+    inverted: true
+    frequency: 1000Hz
+  - platform: ledc
+    pin: 16
+    id: led_g
+    inverted: true
+    frequency: 1000Hz
+  - platform: ledc
+    pin: 17
+    id: led_b
+    inverted: true
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: "Screen Backlight"
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 400ms
+  # v0.8: back LED in the colour of the air quality tile. On/off and brightness are the
+  # user's (kept over a restart); the firmware only sets the colour, and only while it is on.
+  - platform: rgb
+    id: aqi_led
+    name: "AQI LED"
+    icon: mdi:led-on
+    red: led_r
+    green: led_g
+    blue: led_b
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 800ms
+    on_turn_on:
+      - script.execute: ui_update
+
+display:
+  - platform: mipi_spi
+    model: ESP32-2432S028-9342    # USB-C + micro-USB board = ILI9342, 320 x 240 native (v0.3; the plain model is the 240 x 320 ILI9341)
+    spi_id: tft_bus
+    cs_pin:
+      number: 15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: 2
+      ignore_strapping_warning: true
+    data_rate: 40MHz
+    color_order: BGR
+    invert_colors: false
+    dimensions:
+      width: 320
+      height: 240
+
+# The touch panel only wakes the screen; nothing on it is a control, so a phantom
+# touch (the office panel had them) costs 60 s of backlight and nothing else.
+touchscreen:
+  - platform: xpt2046
+    id: panel_touch
+    spi_id: touch_bus
+    cs_pin: 33
+    interrupt_pin: 36
+    update_interval: 50ms
+    threshold: 750
+    calibration:                  # the office panel's values; the position is not used here
+      x_min: 220
+      x_max: 3760
+      y_min: 270
+      y_max: 3760
+    on_touch:
+      - lambda: |-
+          id(last_touch_ms) = millis();
+
+script:
+  # called by the radar package whenever Occupied / Moving target changes
+  - id: presence_changed
+    mode: restart
+    then:
+      - script.execute: ui_presence
+  - id: ui_presence
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - lvgl.widget.update:
+                id: pres_tile
+                bg_color: !lambda |-
+                  if (id(occupied).state && id(bs_mv).state) return lv_color_hex(0x1F6FEB);
+                  if (id(occupied).state) return lv_color_hex(0x1E8E3E);
+                  return lv_color_hex(0x1B1F2A);
+            - lvgl.label.update:
+                id: pres_label
+                text: !lambda |-
+                  if (id(occupied).state && id(bs_mv).state) return "MOTION";
+                  if (id(occupied).state) return "OCCUPIED";
+                  return "CLEAR";
+            - lvgl.label.update:
+                id: pres_sub
+                text: !lambda |-
+                  static char buf[40];
+                  float n = id(t_count).state;
+                  int c = isnan(n) ? 0 : (int) n;
+                  if (!id(occupied).state) snprintf(buf, sizeof(buf), "nobody in the room");
+                  else if (c == 0) snprintf(buf, sizeof(buf), "held, no target in view");
+                  else snprintf(buf, sizeof(buf), "%d target%s in view", c, c == 1 ? "" : "s");
+                  return buf;
+  - id: apply_orientation
+    mode: restart
+    then:
+      - lambda: |-
+          auto idx = id(screen_orient).active_index();
+          int i = idx.has_value() ? (int) *idx : 0;
+          static const int ang[] = {${screen_rotation}, (${screen_rotation} + 180) % 360, 0, 180};
+          bool land = i >= 2;
+          id(lvgl_comp)->set_rotation(ang[i > 3 ? 0 : i]);
+          auto box = [](lv_obj_t *o, int x, int y, int w, int h) {
+            lv_obj_set_pos(o, x, y);
+            lv_obj_set_size(o, w, h);
+          };
+          lv_obj_t *tiles[] = {id(pm_tile), id(voc_tile), id(temp_tile), id(hum_tile)};
+          lv_obj_t *vals[] = {id(pm_val), id(voc_val), id(temp_val), id(hum_val)};
+          lv_obj_t *subs[] = {id(pm_sub), id(voc_sub), id(temp_sub), id(hum_sub)};
+          if (land) {
+            // 320 x 240: air quality + presence on the left, the four readings as rows on the right
+            box(id(aq_tile), 6, 30, 150, 98);
+            box(id(pres_tile), 6, 134, 150, 100);
+            for (int k = 0; k < 4; k++) {
+              box(tiles[k], 162, 30 + k * 52, 152, 48);
+              lv_obj_set_style_text_font(vals[k], &lv_font_montserrat_24, 0);
+              lv_obj_align(vals[k], LV_ALIGN_BOTTOM_LEFT, 8, -3);
+              lv_obj_align(subs[k], LV_ALIGN_TOP_RIGHT, -8, 5);
+            }
+            lv_label_set_text(id(temp_sub), "Temp F");
+            lv_obj_align(id(aq_cap), LV_ALIGN_TOP_MID, 0, 8);
+            // v0.4: the tile is 150 wide, "Warming up" at 28 px is wider: 24 px, wrapped, centred
+            lv_obj_set_style_text_font(id(aq_label), &lv_font_montserrat_24, 0);
+            lv_obj_set_style_text_align(id(aq_label), LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(id(aq_label), LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(id(aq_label), 142);
+            lv_obj_align(id(aq_label), LV_ALIGN_CENTER, 0, 10);
+            lv_obj_align(id(pres_label), LV_ALIGN_TOP_MID, 0, 22);
+            lv_obj_align(id(pres_sub), LV_ALIGN_BOTTOM_MID, 0, -20);
+          } else {
+            // 240 x 320: the v0.1 portrait layout
+            box(id(aq_tile), 6, 32, 228, 72);
+            box(id(pres_tile), 6, 250, 228, 64);
+            for (int k = 0; k < 4; k++) {
+              box(tiles[k], k % 2 ? 123 : 6, k < 2 ? 110 : 180, 111, 64);
+              lv_obj_set_style_text_font(vals[k], &lv_font_montserrat_28, 0);
+              lv_obj_align(vals[k], LV_ALIGN_TOP_MID, 0, 6);
+              lv_obj_align(subs[k], LV_ALIGN_BOTTOM_MID, 0, -6);
+            }
+            lv_label_set_text(id(temp_sub), "Temperature F");
+            lv_obj_align(id(aq_cap), LV_ALIGN_TOP_MID, 0, 8);
+            lv_obj_set_style_text_font(id(aq_label), &lv_font_montserrat_28, 0);
+            lv_obj_set_width(id(aq_label), LV_SIZE_CONTENT);
+            lv_obj_align(id(aq_label), LV_ALIGN_CENTER, 0, 10);
+            lv_obj_align(id(pres_label), LV_ALIGN_TOP_MID, 0, 8);
+            lv_obj_align(id(pres_sub), LV_ALIGN_BOTTOM_MID, 0, -8);
+          }
+          ESP_LOGI("screen", "orientation %s (%d deg)", id(screen_orient).current_option().c_str(), ang[i > 3 ? 0 : i]);
+      - script.execute: ui_update
+  - id: ui_update
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: clock_label
+          text: !lambda |-
+            static char buf[12];
+            buf[0] = 0;
+            auto t = id(ha_time).now();
+            if (t.is_valid()) {
+              int h = t.hour % 12;
+              if (h == 0) h = 12;
+              snprintf(buf, sizeof(buf), "%d:%02d %s", h, t.minute, t.hour < 12 ? "AM" : "PM");
+            }
+            return buf;
+      - lvgl.widget.update:
+          id: aq_tile
+          bg_color: !lambda |-
+            static const uint32_t col[] = {0x00B050, 0xE6C700, 0xF08C00, 0xD93025, 0x8E44AD};
+            int l = id(aqi_level_score);
+            return lv_color_hex(l < 0 ? 0x2A4D7A : col[l > 4 ? 4 : l]);
+      - lambda: |-
+          // back LED: same level colours as the tile, as pure LED colours
+          static const float rgb[][3] = {{0.0f, 1.0f, 0.0f}, {1.0f, 0.75f, 0.0f}, {1.0f, 0.35f, 0.0f},
+                                         {1.0f, 0.0f, 0.0f}, {0.6f, 0.0f, 1.0f}};
+          static int shown = -99;
+          if (!id(aqi_led).remote_values.is_on()) { shown = -99; return; }
+          int l = id(aqi_level_score);
+          if (l > 4) l = 4;
+          if (l == shown) return;
+          shown = l;
+          auto call = id(aqi_led).make_call();
+          if (l < 0) call.set_rgb(0.1f, 0.3f, 1.0f);          // warming up: blue
+          else call.set_rgb(rgb[l][0], rgb[l][1], rgb[l][2]);
+          call.perform();
+          ESP_LOGI("led", "AQI LED colour for level %d", l);
+      - lvgl.label.update:
+          id: aq_label
+          text: !lambda |-
+            static const char *nm[] = {"Excellent", "Good", "Moderate", "Sensitive", "Unhealthy"};
+            int l = id(aqi_level_score);
+            return l < 0 ? "Warming up" : nm[l > 4 ? 4 : l];
+      - lvgl.label.update:
+          id: pm_val
+          text: !lambda |-
+            static char buf[16];
+            float v = id(pm_2_5).get_raw_state();
+            if (isnan(v)) return "--";
+            snprintf(buf, sizeof(buf), "%.1f", v);
+            return buf;
+      - lvgl.label.update:
+          id: pm_sub
+          text: !lambda |-
+            static char buf[24];
+            float v = id(avg_pm_aqi).state;
+            if (isnan(v)) return "PM2.5 ug/m3";
+            snprintf(buf, sizeof(buf), "PM2.5  AQI %d", (int) v);
+            return buf;
+      - lvgl.label.update:
+          id: voc_val
+          text: !lambda |-
+            static char buf[16];
+            float v = id(sen54_voc).get_raw_state();
+            if (isnan(v) || v <= 0) return "--";
+            snprintf(buf, sizeof(buf), "%.0f", v);
+            return buf;
+      - lvgl.label.update:
+          id: temp_val
+          text: !lambda |-
+            static char buf[16];
+            float v = id(sen54_temp).state;
+            if (isnan(v)) return "--";
+            snprintf(buf, sizeof(buf), "%.1f°", v * 1.8f + 32.0f);
+            return buf;
+      - lvgl.label.update:
+          id: hum_val
+          text: !lambda |-
+            static char buf[16];
+            float v = id(sen54_humid).state;
+            if (isnan(v)) return "--";
+            snprintf(buf, sizeof(buf), "%.0f%%", v);
+            return buf;
+      - lvgl.label.update:
+          id: hum_sub
+          text: !lambda |-
+            static char buf[24];
+            float v = id(sen54_absolute_humidity).state;
+            if (isnan(v)) return "Humidity";
+            snprintf(buf, sizeof(buf), "RH  %.1f g/m3", v);
+            return buf;
+      - script.execute: ui_presence
+
+lvgl:
+  id: lvgl_comp
+  rotation: ${screen_rotation}       # boot default; "Screen Orientation" turns it at run time (the panel stays 320 x 240)
+  buffer_size: 25%
+  bg_color: 0x0B0D12
+  style_definitions:
+    - id: tile_style
+      bg_color: 0x1B1F2A
+      bg_opa: COVER
+      border_width: 0
+      radius: 12
+      pad_all: 0
+      shadow_width: 0
+    - id: val_style
+      text_font: montserrat_28
+      text_color: 0xE6E8EE
+    - id: sub_style
+      text_font: montserrat_12
+      text_color: 0x8A93A6
+  pages:
+    - id: main_page
+      bg_color: 0x0B0D12
+      bg_opa: COVER
+      scrollable: false
+      widgets:
+        # ---- top bar ----
+        - label:
+            text: "${room_name}"
+            x: 10
+            y: 6
+            text_font: montserrat_16
+            text_color: 0xE6E8EE
+        - label:
+            id: clock_label
+            text: ""
+            align: TOP_RIGHT
+            x: -10
+            y: 8
+            text_font: montserrat_14
+            text_color: 0x8A93A6
+        # ---- combined air quality level ----
+        - obj:
+            id: aq_tile
+            x: 6
+            y: 32
+            width: 228
+            height: 72
+            styles: tile_style
+            bg_color: 0x2A4D7A
+            scrollable: false
+            widgets:
+              - label:
+                  id: aq_cap
+                  text: "AIR QUALITY"
+                  align: TOP_MID
+                  y: 8
+                  text_font: montserrat_12
+                  text_color: 0xFFFFFF
+              - label:
+                  id: aq_label
+                  text: "Warming up"
+                  align: CENTER
+                  y: 10
+                  text_font: montserrat_28
+                  text_color: 0xFFFFFF
+        # ---- four readings ----
+        - obj:
+            id: pm_tile
+            x: 6
+            y: 110
+            width: 111
+            height: 64
+            styles: tile_style
+            scrollable: false
+            widgets:
+              - label:
+                  id: pm_val
+                  text: "--"
+                  align: TOP_MID
+                  y: 6
+                  styles: val_style
+              - label:
+                  id: pm_sub
+                  text: "PM2.5 ug/m3"
+                  align: BOTTOM_MID
+                  y: -6
+                  styles: sub_style
+        - obj:
+            id: voc_tile
+            x: 123
+            y: 110
+            width: 111
+            height: 64
+            styles: tile_style
+            scrollable: false
+            widgets:
+              - label:
+                  id: voc_val
+                  text: "--"
+                  align: TOP_MID
+                  y: 6
+                  styles: val_style
+              - label:
+                  id: voc_sub
+                  text: "VOC index"
+                  align: BOTTOM_MID
+                  y: -6
+                  styles: sub_style
+        - obj:
+            id: temp_tile
+            x: 6
+            y: 180
+            width: 111
+            height: 64
+            styles: tile_style
+            scrollable: false
+            widgets:
+              - label:
+                  id: temp_val
+                  text: "--"
+                  align: TOP_MID
+                  y: 6
+                  styles: val_style
+              - label:
+                  id: temp_sub
+                  text: "Temperature F"
+                  align: BOTTOM_MID
+                  y: -6
+                  styles: sub_style
+        - obj:
+            id: hum_tile
+            x: 123
+            y: 180
+            width: 111
+            height: 64
+            styles: tile_style
+            scrollable: false
+            widgets:
+              - label:
+                  id: hum_val
+                  text: "--"
+                  align: TOP_MID
+                  y: 6
+                  styles: val_style
+              - label:
+                  id: hum_sub
+                  text: "Humidity"
+                  align: BOTTOM_MID
+                  y: -6
+                  styles: sub_style
+        # ---- presence ----
+        - obj:
+            id: pres_tile
+            x: 6
+            y: 250
+            width: 228
+            height: 64
+            styles: tile_style
+            scrollable: false
+            widgets:
+              - label:
+                  id: pres_label
+                  text: "CLEAR"
+                  align: TOP_MID
+                  y: 8
+                  text_font: montserrat_24
+                  text_color: 0xFFFFFF
+              - label:
+                  id: pres_sub
+                  text: "starting"
+                  align: BOTTOM_MID
+                  y: -8
+                  text_font: montserrat_12
+                  text_color: 0xD0D6E0
