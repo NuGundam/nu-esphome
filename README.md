@@ -1,8 +1,8 @@
 # nu-esphome
 
-[![last commit](https://img.shields.io/github/last-commit/NuGundam/nu-esphome?label=last%20commit&color=6fb0ff)](https://github.com/NuGundam/nu-esphome/commits)
+[![last commit](https://img.shields.io/github/last-commit/NuGundam/nu-esphome/main?label=last%20commit&color=6fb0ff)](https://github.com/NuGundam/nu-esphome/commits)
 [![licence](https://img.shields.io/github/license/NuGundam/nu-esphome?label=licence&color=6fb0ff)](LICENSE)
-[![esphome](https://img.shields.io/badge/ESPHome-2026.10-6fb0ff)](https://esphome.io)
+[![esphome](https://img.shields.io/badge/ESPHome-2026.11-6fb0ff)](https://esphome.io)
 
 **The ESPHome firmware behind one Home Assistant house: 21 devices for air quality, HVAC zoning, presence and more.**
 
