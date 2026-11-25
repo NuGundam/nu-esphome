@@ -241,6 +241,13 @@ logic, shared through [`common/ld2450-presence.yaml`](common/ld2450-presence.yam
 - Three zones (main room, toilet corner, closet) with per-zone holds and a Bathroom activities
   card: hands and teeth, shaving, dressing, toilet, nails, shower, tub soak.
 - The same lock-on as `nu-presence-24ghz-2`, added for a towel that moved in the vent draught.
+- An HVAC tile shows what the heating and ventilation are doing for the room and why (heating, cooling,
+  venting for humidity, VOC or PM). It reads one Home Assistant sensor (substitution `hvac_entity`): the state
+  is the headline, and the attributes `kind` (heat, cool, free, vent, purge, fan, closed, idle), `sub` and
+  `detail` give the tile colour, the second line and the detail lines.
+- Tap any tile for a detail page with all of that reading's numbers. Tap again or wait 30 seconds to go
+  back. A tap on a dark screen only wakes it.
+- The tuning page on port 8080 has an Air quality and HVAC card with the same readings.
 - Mount the LD2450 upright (long side vertical). Turned 90 degrees, its left and right read as up
   and down.
 

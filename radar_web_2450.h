@@ -1,6 +1,9 @@
 #pragma once
 // ─────────────────────────────────────────────────
-//  NU-Presence-24GHz-2  LD2450 tuning page  v1.14  (radar_web_2450.h)  2026-11-23
+//  NU-Presence-24GHz-2  LD2450 tuning page  v1.15  (radar_web_2450.h)  2026-11-25
+//  v1.15: "Air quality and HVAC" card for units that also measure air (Nu-MasterBath-1). The device yaml builds a
+//         JSON object once a second in the main loop and hands it over with radar_web_aq(); data.json passes it on
+//         as aq. Not called = no card (NU-Presence-24GHz-2).
 //  v1.14: presence_2450.h v1.6 lock-on: trk state 3 = checking (not counted yet; grey dashed ring, "checking"), data.json
 //         cl = still-clutter spots [x, y, times]; spots seen twice or more drawn as a grey cross "still object".
 //  v1.13: activities card per device: radar_web_cfg().actt (title), .acts ("Label:min|Label:min|..."), .actd (defaults
@@ -75,6 +78,16 @@ struct RadarWebCfg {
 static RadarWebCfg &radar_web_cfg() { static RadarWebCfg c; return c; }
 static const char *rw_room_default = nullptr;   // v1.8: room map default JSON {"w":cm,"d":cm,"place":"bm","unit":"ft"} (set from yaml)
 
+// v1.15: air quality + HVAC block for the page, built by the device yaml in the main loop (two buffers, index swap)
+static char rw_aq[2][1100] = {"", ""};
+static volatile int rw_aq_i = 0;
+static void radar_web_aq(const char *js) { const int w = 1 - rw_aq_i; strlcpy(rw_aq[w], js, sizeof rw_aq[w]); rw_aq_i = w; }
+static void rw_kn(std::string &o, const char *k, float v) {   // "k":number|null,
+  char b[40]; if (std::isnan(v)) snprintf(b, sizeof b, "\"%s\":null,", k); else snprintf(b, sizeof b, "\"%s\":%g,", k, v); o += b; }
+static void rw_ks(std::string &o, const char *k, const std::string &v) {   // "k":"escaped text",
+  o += "\""; o += k; o += "\":\"";
+  for (const char ch : v) { if (ch == '"' || ch == '\\') { o += '\\'; o += ch; } else if (ch == '\n') o += "\\n"; else if ((unsigned char) ch >= 0x20) o += ch; }
+  o += "\","; }
 static char rw_fw[32] = "";
 static int rw_zt = -1;
 
@@ -148,6 +161,14 @@ table{border-collapse:collapse;width:100%;font-size:13px}th{color:var(--mut);fon
 </div>
 <table style="margin-top:8px"><thead><tr><th>Target</th><th>Left / right</th><th>Forward</th><th>Distance</th><th>Angle</th><th>Speed</th></tr></thead><tbody id="tt"></tbody></table>
 </div>
+
+<div id="aqWrap" style="display:none">
+<h2>Air quality and HVAC</h2><div class="card"><div class="row">
+<div><div class="big" id="aqLvl" style="font-size:26px">&mdash;</div><div class="sub">air quality</div></div>
+<div><span class="pill" id="hvHead">HVAC</span> <span class="sub" id="hvSub"></span></div></div>
+<div class="row" style="margin-top:10px;align-items:flex-start"><table style="flex:1 1 320px;width:auto"><tbody id="aqT"></tbody></table>
+<div style="flex:1 1 240px"><div class="sub">HVAC for this room</div><div id="hvDet" style="white-space:pre-line;font-size:13px;margin-top:4px"></div></div></div>
+</div></div>
 
 <h2>Room map</h2><div class="card">
 <svg id="map"></svg>
@@ -345,6 +366,16 @@ for(let i=0;i<3;i++){ $('zs'+i).addEventListener('click',()=>shapeStart(i)); $('
 const pdel=j=>{ clearTimeout(plong); plong=0; pdrag=-1; ptap={}; if(pts.length>3){ pts.splice(j,1); map.last=null; map(); } };
 $('map').addEventListener('contextmenu',e=>{ if(pe>=0) e.preventDefault(); });
 
+const AQC=['#00B050','#E6C700','#F08C00','#D93025','#8E44AD'],AQN=['Excellent','Good','Moderate','Sensitive','Unhealthy'],HVC={heat:'#c0392b',cool:'#1f6feb',free:'#1e8e3e',vent:'#00838f',purge:'#8e44ad',fan:'#3a4a66',closed:'#6b5a2a',idle:'#2a3645'};
+function aq(){ const a=D&&D.aq; if(!a) return; $('aqWrap').style.display='';   /* v1.15 */
+ const l=a.lvl, w=l==null||l<0, e=$('aqLvl'); e.textContent=w?'Warming up':AQN[Math.min(4,l)]; e.style.color=w?'#8b9bb0':AQC[Math.min(4,l)];
+ const f=(v,d,u)=>v==null?'—':v.toFixed(d)+(u||'');
+ const rows=[['PM2.5',f(a.pm25,1,' µg/m³'),'PM AQI',f(a.pmaqi,0)],['PM1 / PM4 / PM10',f(a.pm1,1)+' / '+f(a.pm4,1)+' / '+f(a.pm10,1),'PM status',a.pmt||''],
+  ['VOC index',f(a.voc,0),'VOC Fast',f(a.vocf,0)],['VOC status',a.voct||'','',''],['Temperature',f(a.tf,1,' °F'),'Feels like',f(a.fl,1,' °F')],
+  ['Humidity',f(a.rh,0,' %'),'Absolute',f(a.ah,1,' g/m³')],['Dew point',f(a.dew,1,' °F'),'','']];
+ const tb=$('aqT'); tb.textContent=''; for(const r of rows){ const tr=document.createElement('tr'); r.forEach((c,i)=>{ const td=document.createElement(i%2?'td':'th'); td.textContent=c; tr.appendChild(td); }); tb.appendChild(tr); }
+ const h=$('hvHead'); h.textContent=a.hv||'no data from Home Assistant'; h.style.background=HVC[a.hvk]||'#2a3645'; h.style.color='#fff';
+ $('hvSub').textContent=a.hvs||''; $('hvDet').textContent=a.hvd||''; }
 let ACT=[['Hands / teeth',5],['Shaving / makeup',10],['Dressing',10],['Toilet',20],['Nails',30],['Shower',30],['Tub soak',60]], ADEF=[1800,1800,600,600];let bathInit=false;
 function bath(){ if(!D||!D.zh) return;
  if(!bathInit){ bathInit=true; $('bathWrap').style.display=''; let h='';
@@ -453,7 +484,7 @@ function render(){$('ttl').textContent=D.name+' - radar map';document.title=D.na
  let tb='';D.t.forEach((t,i)=>{const on=t&&t[1]!=null;if(on){trails[i].push([t[0],t[1]]);if(trails[i].length>40)trails[i].shift();}else trails[i]=[];
   tb+=`<tr><td><span class="dot" style="background:${TC[i]}"></span>${i+1}</td><td>${on?m2(t[0]):'—'}</td><td>${on?m2(t[1]):'—'}</td><td>${on?m2(Math.hypot(t[0],t[1])):'—'}</td><td>${on?Math.round(Math.atan2(t[0],t[1])*180/Math.PI)+'&deg;':'—'}</td><td style="${mvQual(t)?'color:#4aa3ff;font-weight:700':''}">${on&&t[2]!=null?Math.abs(t[2])+' cm/s':'—'}</td></tr>`;});$('tt').innerHTML=tb;
  for(let i=0;i<3;i++)for(let j=0;j<4;j++)fill('z'+i+j,D.zc[i]?D.zc[i][j]:null,v=>+(v/1000).toFixed(2));
- fill('timeout',D.n.timeout);fill('hold',D.n.hold);fill('mvs',D.n.mvs);fill('mvr',D.n.mvr);fill('mvh',D.n.mvh);fill('sth',D.n.sth);fill('igf',D.n.igf);fill('igt',D.n.igt);fill('multi',D.multi);if(D.zt>=0)fill('ztype',D.zt);bath();capTick();for(let i=0;i<3;i++){const pp=zpoly(i);$('zk'+i).textContent=pp?'shape, '+pp.length+' corners':'';}if(!rub)map();}
+ fill('timeout',D.n.timeout);fill('hold',D.n.hold);fill('mvs',D.n.mvs);fill('mvr',D.n.mvr);fill('mvh',D.n.mvh);fill('sth',D.n.sth);fill('igf',D.n.igf);fill('igt',D.n.igt);fill('multi',D.multi);if(D.zt>=0)fill('ztype',D.zt);bath();aq();capTick();for(let i=0;i<3;i++){const pp=zpoly(i);$('zk'+i).textContent=pp?'shape, '+pp.length+' corners':'';}if(!rub)map();}
 async function poll(){try{const r=await fetch('/data.json',{cache:'no-store',signal:AbortSignal.timeout(3000)});D=await r.json();render();}catch(e){$('meta').textContent='no answer from the device';}}
 window.addEventListener('resize',()=>{if(D)map();});poll();setInterval(poll,500);
 </script></body></html>)ESPH";
@@ -532,11 +563,12 @@ static esp_err_t rw_poly_h(httpd_req_t *req) {   // /poly?z=1..3&v=x,y;x,y;... (
 }
 
 static esp_err_t rw_data(httpd_req_t *req) {
-  auto &c = radar_web_cfg(); std::string o; o.reserve(900); o += "{";
+  auto &c = radar_web_cfg(); std::string o; o.reserve(2000); o += "{";
   o += "\"name\":\""; o += esphome::App.get_friendly_name(); o += "\",";
   { const char *rj = rw_room[rw_room_i];   // v1.8: the saved layout wins over the yaml default
     if (rj[0] == '{') { o += "\"room\":"; o += rj; o += ",\"room_src\":\"device\","; }
     else if (rw_room_default) { o += "\"room\":"; o += rw_room_default; o += ",\"room_src\":\"default\","; } }
+  { const char *aj = rw_aq[rw_aq_i]; if (aj[0] == '{') { o += "\"aq\":"; o += aj; o += ","; } }   // v1.15
   rw_bool(o, "occ", c.occ); rw_bool(o, "mv", c.mv); rw_bool(o, "st", c.st); rw_bool(o, "mvraw", c.mvraw); rw_bool(o, "occraw", c.occraw);
   o += "\"z\":["; for (int i = 0; i < 3; i++) { o += (c.zn[i] && c.zn[i]->state) ? "1" : "0"; if (i < 2) o += ","; } o += "],";
   o += "\"t\":["; for (int i = 0; i < 3; i++) {

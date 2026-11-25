@@ -1,5 +1,5 @@
 # =======================================================
-# Nu-MasterBath-1  v0.13 - master bath air quality + motion, with a screen
+# Nu-MasterBath-1  v0.14 - master bath air quality + motion, with a screen
 # ESP32-2432S028R "Cheap Yellow Display" + Sensirion SEN54 + HLK-LD2450 24 GHz radar
 # in the masterbath_combo enclosure (SEN54 bay below, screen + radar above, USB-C down).
 #
@@ -36,6 +36,10 @@
 # Screen: the yaml's display block is the one the office panel uses. If your board is the
 # two-USB revision and the picture is mirrored, inverted or upside down, see README "Screen".
 #
+# v0.14 (2026-11-25): HVAC tile (sensor.master_bathroom_hvac_status from HA: heating / cooling / venting and why),
+#   tap any tile for a detail page (tap again or wait 30 s to go back; a tap that wakes a dark screen only wakes it),
+#   and the web page gets an "Air quality and HVAC" card (radar_web_2450.h v1.15).
+#
 # Keys: same layout as nu-garage-1.yaml. The live copy in /config/esphome holds the real API key
 # and hotspot password; this copy keeps placeholders. OTA reuses the API key.
 # =======================================================
@@ -58,6 +62,7 @@ substitutions:
   zone1_track: RESTORE_DEFAULT_ON   # v0.13 Track <zone> switches: all on = tracked anywhere
   zone2_track: RESTORE_DEFAULT_ON
   zone3_track: RESTORE_DEFAULT_ON
+  hvac_entity: sensor.master_bathroom_hvac_status   # v0.14: HA room status (room_hvac_status.yaml)
   bath_light_entity: light.master_bathroom_lights   # v0.9: its brightness sets the screen and AQI LED brightness
   screen_rotation: "90"         # boot default before the select restores (Vertical)
 
@@ -84,7 +89,7 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: "my.nu-masterbath-1"
-    version: "0.12"
+    version: "0.14"
   # HA's "Visit" link = http://<ip>:8080 (the radar map)
   build_flags:
     - "-DUSE_WEBSERVER"
@@ -159,6 +164,14 @@ globals:
     type: float
     restore_value: no
     initial_value: 'NAN'
+  - id: detail_idx               # v0.14: detail page shown (-1 = none, 0 air, 1 PM, 2 VOC, 3 temp, 4 humidity, 5 HVAC, 6 presence)
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: touch_dark               # v0.14: the touch began on a dark screen, so it only wakes it
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   - id: last_touch_ms
     type: uint32_t
     restore_value: no
@@ -591,6 +604,30 @@ sensor:
 # TEXT SENSORS (NU-AQI-3 bands and wording)
 # -------------------------------------------------------
 text_sensor:
+  # v0.14: room HVAC status from Home Assistant (headline, colour kind, second line, detail lines)
+  - platform: homeassistant
+    id: hv_head
+    entity_id: ${hvac_entity}
+    internal: true
+    on_value:
+      - script.execute: ui_update
+  - platform: homeassistant
+    id: hv_kind
+    entity_id: ${hvac_entity}
+    attribute: kind
+    internal: true
+    on_value:
+      - script.execute: ui_update
+  - platform: homeassistant
+    id: hv_sub_txt
+    entity_id: ${hvac_entity}
+    attribute: sub
+    internal: true
+  - platform: homeassistant
+    id: hv_detail
+    entity_id: ${hvac_entity}
+    attribute: detail
+    internal: true
   - platform: wifi_info
     ip_address:
       name: "ESP32 IP Address"
@@ -694,6 +731,20 @@ interval:
           auto &c = radar_web_cfg();
           c.zh[0] = id(zsh1); c.zh[1] = id(zsh2); c.zh[2] = id(zsh3);
           c.zname[0] = "${zone1_name}"; c.zname[1] = "${zone2_name}"; c.zname[2] = "${zone3_name}";
+          {   // v0.14: air quality + HVAC block for the web page (radar_web_2450.h v1.15)
+            std::string j = "{";
+            float tc = id(sen54_temp).state, rh = id(sen54_humid).state, dew = NAN;
+            if (!isnan(tc) && !isnan(rh) && rh > 0.0f) { float g = logf(rh / 100.0f) + 17.62f * tc / (243.12f + tc); dew = 243.12f * g / (17.62f - g) * 1.8f + 32.0f; }
+            rw_kn(j, "lvl", id(sensor_ready) ? (float) id(aqi_level_score) : -1.0f);
+            rw_kn(j, "pm1", id(pm_1_0).state); rw_kn(j, "pm25", id(pm_2_5).state); rw_kn(j, "pm4", id(pm_4_0).state); rw_kn(j, "pm10", id(pm_10_0).state);
+            rw_kn(j, "pmaqi", id(avg_pm_aqi).state); rw_kn(j, "voc", id(sen54_voc).state); rw_kn(j, "vocf", id(sen54_voc_fast).state);
+            rw_kn(j, "tf", isnan(tc) ? NAN : tc * 1.8f + 32.0f); rw_kn(j, "fl", id(aqi_feels_like_temperature).state);
+            rw_kn(j, "rh", rh); rw_kn(j, "ah", id(sen54_absolute_humidity).state); rw_kn(j, "dew", dew);
+            rw_ks(j, "pmt", id(pm_aqi_text).state); rw_ks(j, "voct", id(aqi_tvoc_text).state);
+            if (id(hv_head).has_state()) { rw_ks(j, "hv", id(hv_head).state); rw_ks(j, "hvk", id(hv_kind).state); rw_ks(j, "hvs", id(hv_sub_txt).state); rw_ks(j, "hvd", id(hv_detail).state); }
+            j += "\"ok\":1}";
+            radar_web_aq(j.c_str());
+          }
   # v0.5: the sen5x driver asks the SEN54 once, 1 s after boot, and gives up for good if it
   # does not answer (seen on this unit: 4.6 V supply, Wi-Fi + fan starting at that moment).
   # Try again every 15 s while it is failed.
@@ -973,8 +1024,8 @@ display:
       width: 320
       height: 240
 
-# The touch panel only wakes the screen; nothing on it is a control, so a phantom
-# touch (the office panel had them) costs 60 s of backlight and nothing else.
+# v0.14: a tap on a tile opens its detail page. A phantom touch (the office panel had them) costs 60 s of
+# backlight and at most a detail page that closes itself after 30 s.
 touchscreen:
   - platform: xpt2046
     id: panel_touch
@@ -983,16 +1034,118 @@ touchscreen:
     interrupt_pin: 36
     update_interval: 50ms
     threshold: 750
-    calibration:                  # the office panel's values; the position is not used here
+    calibration:                  # the office panel's values
       x_min: 220
       x_max: 3760
       y_min: 270
       y_max: 3760
+    transform:                    # v0.14: the office panel's, maps the panel to the 320 x 240 picture
+      mirror_x: true
+      mirror_y: true
+      swap_xy: true
     on_touch:
       - lambda: |-
+          id(touch_dark) = !id(backlight).remote_values.is_on();
           id(last_touch_ms) = millis();
+          ESP_LOGI("touch", "x %d y %d%s", (int) touch.x, (int) touch.y, id(touch_dark) ? " (wakes the screen)" : "");
 
 script:
+  # v0.14: tile tapped (detail_idx set by the tile). Shows the detail page for 30 s.
+  - id: show_detail
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(touch_dark);'
+          then:
+            - lambda: 'id(touch_dark) = false; id(detail_idx) = -1;'
+          else:
+            - lambda: 'ESP_LOGI("screen", "detail page %d", id(detail_idx));'
+            - script.execute: ui_detail
+            - lvgl.page.show: detail_page
+            - delay: 30s
+            - lambda: 'id(detail_idx) = -1;'
+            - lvgl.page.show: main_page
+  - id: close_detail
+    then:
+      - script.stop: show_detail
+      - lambda: 'id(detail_idx) = -1;'
+      - lvgl.page.show: main_page
+  - id: ui_detail
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: det_title
+          text: !lambda |-
+            static const char *t[] = {"Air quality", "Particles", "VOC", "Temperature", "Humidity", "HVAC", "Presence"};
+            int i = id(detail_idx);
+            return t[i < 0 || i > 6 ? 0 : i];
+      - lvgl.label.update:
+          id: det_body
+          text: !lambda |-
+            static std::string s;
+            auto N = [](float v, int d) -> std::string { if (isnan(v)) return "--"; char t[20]; snprintf(t, sizeof t, "%.*f", d, v); return t; };
+            // the screen font is ASCII + degree sign: micro -> u, superscript 3 -> 3
+            auto A = [](const std::string &in) -> std::string {
+              std::string o;
+              for (size_t k = 0; k < in.size(); k++) {
+                unsigned char ch = in[k];
+                if (ch < 0x80) { o += (char) ch; continue; }
+                if (ch == 0xC2 && k + 1 < in.size()) {
+                  unsigned char n = in[k + 1];
+                  if (n == 0xB5) o += 'u'; else if (n == 0xB3) o += '3'; else if (n == 0xB0) { o += (char) 0xC2; o += (char) 0xB0; }
+                  k++;
+                }
+              }
+              return o;
+            };
+            float tc = id(sen54_temp).state, rh = id(sen54_humid).state, dew = NAN;
+            if (!isnan(tc) && !isnan(rh) && rh > 0.0f) { float g = logf(rh / 100.0f) + 17.62f * tc / (243.12f + tc); dew = 243.12f * g / (17.62f - g) * 1.8f + 32.0f; }
+            s.clear();
+            switch (id(detail_idx)) {
+              case 1:
+                s = "PM1.0   " + N(id(pm_1_0).state, 1) + " ug/m3\nPM2.5   " + N(id(pm_2_5).state, 1) + " ug/m3\nPM4.0   " + N(id(pm_4_0).state, 1)
+                  + " ug/m3\nPM10    " + N(id(pm_10_0).state, 1) + " ug/m3\n12 h average PM2.5  " + N(id(nowcast_pm25), 1)
+                  + "\n12 h average PM10  " + N(id(nowcast_pm10), 1) + "\nPM AQI  " + N(id(avg_pm_aqi).state, 0) + "\n" + A(id(pm_aqi_text).state);
+                break;
+              case 2:
+                s = "VOC index  " + N(id(sen54_voc).state, 0) + "\nVOC Fast  " + N(id(sen54_voc_fast).state, 0) + "\n" + A(id(aqi_tvoc_text).state)
+                  + "\n\n100 is this room's normal. Higher means more VOC than usual.";
+                break;
+              case 3:
+                s = "Temperature  " + N(isnan(tc) ? NAN : tc * 1.8f + 32.0f, 1) + " F\nFeels like  " + N(id(aqi_feels_like_temperature).state, 1)
+                  + " F\nDew point  " + N(dew, 1) + " F\nSensor offset  -" + N(id(temp_offset_current) * 1.8f, 1) + " F\nBoard  " + N(id(esp_temp).state, 0) + " F";
+                break;
+              case 4:
+                s = "Relative humidity  " + N(rh, 0) + " %\nAbsolute humidity  " + N(id(sen54_absolute_humidity).state, 1) + " g/m3\nDew point  " + N(dew, 1)
+                  + " F\n" + A(id(aqi_ah).state);
+                break;
+              case 5:
+                if (!id(hv_head).has_state()) s = "No data from Home Assistant yet.";
+                else s = A(id(hv_head).state) + "\n\n" + A(id(hv_detail).state);
+                break;
+              case 6: {
+                float n = id(t_count).state;
+                s = std::string(id(occupied).state ? (id(bs_mv).state ? "Occupied, moving" : "Occupied, still") : "Nobody in the room");
+                s += "\nTargets in view  " + N(isnan(n) ? 0.0f : n, 0);
+                const bool z[] = {id(zn1).state, id(zn2).state, id(zn3).state};
+                const float h[] = {id(zsh1).state, id(zsh2).state, id(zsh3).state};
+                static const char *zn[] = {"${zone1_name}", "${zone2_name}", "${zone3_name}"};
+                for (int k = 0; k < 3; k++) {
+                  s += std::string("\n") + zn[k] + ": " + (z[k] ? "someone here" : "empty");
+                  if (!isnan(h[k]) && h[k] > 0) s += ", hold " + N(h[k] / 60.0f, 0) + " min";
+                }
+                break;
+              }
+              default: {
+                static const char *nm[] = {"Excellent", "Good", "Moderate", "Sensitive", "Unhealthy"};
+                int l = id(aqi_level_score);
+                s = std::string("Level: ") + (l < 0 ? "Warming up" : nm[l > 4 ? 4 : l]) + "\nVOC: " + A(id(aqi_tvoc_text).state) + "\nParticles: "
+                  + A(id(pm_aqi_text).state) + "\nPM AQI  " + N(id(avg_pm_aqi).state, 0) + "\n\nThe level is the worse of VOC and particles.";
+                break;
+              }
+            }
+            return s.c_str();
   # called by the radar package whenever Occupied / Moving target changes
   - id: presence_changed
     mode: restart
@@ -1043,10 +1196,18 @@ script:
           lv_obj_t *tiles[] = {id(pm_tile), id(voc_tile), id(temp_tile), id(hum_tile)};
           lv_obj_t *vals[] = {id(pm_val), id(voc_val), id(temp_val), id(hum_val)};
           lv_obj_t *subs[] = {id(pm_sub), id(voc_sub), id(temp_sub), id(hum_sub)};
+          lv_obj_set_width(id(det_body), land ? 300 : 220);
+          lv_obj_set_style_text_font(id(det_body), land ? &lv_font_montserrat_14 : &lv_font_montserrat_16, 0);
+          lv_obj_set_style_text_font(id(hv_label), land ? &lv_font_montserrat_14 : &lv_font_montserrat_16, 0);
+          lv_obj_set_width(id(hv_label), land ? 142 : 216);
+          lv_obj_set_width(id(hv_sub), land ? 142 : 216);
+          lv_obj_align(id(hv_label), LV_ALIGN_TOP_MID, 0, 6);
+          lv_obj_align(id(hv_sub), LV_ALIGN_BOTTOM_MID, 0, -5);
           if (land) {
             // 320 x 240: air quality + presence on the left, the four readings as rows on the right
-            box(id(aq_tile), 6, 30, 150, 98);
-            box(id(pres_tile), 6, 134, 150, 100);
+            box(id(aq_tile), 6, 30, 150, 64);
+            box(id(hvac_tile), 6, 100, 150, 64);
+            box(id(pres_tile), 6, 170, 150, 64);
             for (int k = 0; k < 4; k++) {
               box(tiles[k], 162, 30 + k * 52, 152, 48);
               lv_obj_set_style_text_font(vals[k], &lv_font_montserrat_24, 0);
@@ -1054,32 +1215,33 @@ script:
               lv_obj_align(subs[k], LV_ALIGN_TOP_RIGHT, -8, 5);
             }
             lv_label_set_text(id(temp_sub), "Temp F");
-            lv_obj_align(id(aq_cap), LV_ALIGN_TOP_MID, 0, 8);
-            // v0.4: the tile is 150 wide, "Warming up" at 28 px is wider: 24 px, wrapped, centred
-            lv_obj_set_style_text_font(id(aq_label), &lv_font_montserrat_24, 0);
+            lv_obj_align(id(aq_cap), LV_ALIGN_TOP_MID, 0, 6);
+            // v0.14: the tile is 150 x 64 now: 20 px fits "Warming up" on one line
+            lv_obj_set_style_text_font(id(aq_label), &lv_font_montserrat_20, 0);
             lv_obj_set_style_text_align(id(aq_label), LV_TEXT_ALIGN_CENTER, 0);
             lv_label_set_long_mode(id(aq_label), LV_LABEL_LONG_WRAP);
             lv_obj_set_width(id(aq_label), 142);
-            lv_obj_align(id(aq_label), LV_ALIGN_CENTER, 0, 10);
-            lv_obj_align(id(pres_label), LV_ALIGN_TOP_MID, 0, 22);
-            lv_obj_align(id(pres_sub), LV_ALIGN_BOTTOM_MID, 0, -20);
+            lv_obj_align(id(aq_label), LV_ALIGN_CENTER, 0, 8);
+            lv_obj_align(id(pres_label), LV_ALIGN_TOP_MID, 0, 6);
+            lv_obj_align(id(pres_sub), LV_ALIGN_BOTTOM_MID, 0, -6);
           } else {
-            // 240 x 320: the v0.1 portrait layout
-            box(id(aq_tile), 6, 32, 228, 72);
-            box(id(pres_tile), 6, 250, 228, 64);
+            // 240 x 320: air quality, four readings, HVAC, presence (v0.14)
+            box(id(aq_tile), 6, 30, 228, 56);
+            box(id(hvac_tile), 6, 206, 228, 52);
+            box(id(pres_tile), 6, 262, 228, 52);
             for (int k = 0; k < 4; k++) {
-              box(tiles[k], k % 2 ? 123 : 6, k < 2 ? 110 : 180, 111, 64);
+              box(tiles[k], k % 2 ? 123 : 6, k < 2 ? 90 : 148, 111, 54);
               lv_obj_set_style_text_font(vals[k], &lv_font_montserrat_28, 0);
-              lv_obj_align(vals[k], LV_ALIGN_TOP_MID, 0, 6);
-              lv_obj_align(subs[k], LV_ALIGN_BOTTOM_MID, 0, -6);
+              lv_obj_align(vals[k], LV_ALIGN_TOP_MID, 0, 2);
+              lv_obj_align(subs[k], LV_ALIGN_BOTTOM_MID, 0, -4);
             }
             lv_label_set_text(id(temp_sub), "Temperature F");
-            lv_obj_align(id(aq_cap), LV_ALIGN_TOP_MID, 0, 8);
+            lv_obj_align(id(aq_cap), LV_ALIGN_TOP_MID, 0, 5);
             lv_obj_set_style_text_font(id(aq_label), &lv_font_montserrat_28, 0);
             lv_obj_set_width(id(aq_label), LV_SIZE_CONTENT);
-            lv_obj_align(id(aq_label), LV_ALIGN_CENTER, 0, 10);
-            lv_obj_align(id(pres_label), LV_ALIGN_TOP_MID, 0, 8);
-            lv_obj_align(id(pres_sub), LV_ALIGN_BOTTOM_MID, 0, -8);
+            lv_obj_align(id(aq_label), LV_ALIGN_CENTER, 0, 8);
+            lv_obj_align(id(pres_label), LV_ALIGN_TOP_MID, 0, 3);
+            lv_obj_align(id(pres_sub), LV_ALIGN_BOTTOM_MID, 0, -4);
           }
           ESP_LOGI("screen", "orientation %s (%d deg)", id(screen_orient).current_option().c_str(), ang[i > 3 ? 0 : i]);
       - script.execute: ui_update
@@ -1173,6 +1335,37 @@ script:
             if (isnan(v)) return "Humidity";
             snprintf(buf, sizeof(buf), "RH  %.1f g/m3", v);
             return buf;
+      # v0.14: HVAC tile, coloured like the HVAC card's runs
+      - lvgl.widget.update:
+          id: hvac_tile
+          bg_color: !lambda |-
+            const std::string &k = id(hv_kind).state;
+            if (!id(hv_head).has_state()) return lv_color_hex(0x1B1F2A);
+            if (k == "heat") return lv_color_hex(0xC0392B);
+            if (k == "cool") return lv_color_hex(0x1F6FEB);
+            if (k == "free") return lv_color_hex(0x1E8E3E);
+            if (k == "vent") return lv_color_hex(0x00838F);
+            if (k == "purge") return lv_color_hex(0x8E44AD);
+            if (k == "fan") return lv_color_hex(0x3A4A66);
+            if (k == "closed") return lv_color_hex(0x6B5A2A);
+            return lv_color_hex(0x1B1F2A);
+      - lvgl.label.update:
+          id: hv_label
+          text: !lambda |-
+            static std::string t;
+            t = id(hv_head).has_state() ? id(hv_head).state : std::string("HVAC");
+            return t.c_str();
+      - lvgl.label.update:
+          id: hv_sub
+          text: !lambda |-
+            static std::string t;
+            t = id(hv_head).has_state() ? id(hv_sub_txt).state : std::string("no data from Home Assistant");
+            return t.c_str();
+      - if:
+          condition:
+            lambda: 'return id(detail_idx) >= 0;'
+          then:
+            - script.execute: ui_detail
       - script.execute: ui_presence
 
 lvgl:
@@ -1219,12 +1412,15 @@ lvgl:
         - obj:
             id: aq_tile
             x: 6
-            y: 32
+            y: 30
             width: 228
-            height: 72
+            height: 56
             styles: tile_style
             bg_color: 0x2A4D7A
             scrollable: false
+            on_click:
+              - lambda: 'id(detail_idx) = 0;'
+              - script.execute: show_detail
             widgets:
               - label:
                   id: aq_cap
@@ -1244,11 +1440,14 @@ lvgl:
         - obj:
             id: pm_tile
             x: 6
-            y: 110
+            y: 90
             width: 111
-            height: 64
+            height: 54
             styles: tile_style
             scrollable: false
+            on_click:
+              - lambda: 'id(detail_idx) = 1;'
+              - script.execute: show_detail
             widgets:
               - label:
                   id: pm_val
@@ -1265,11 +1464,14 @@ lvgl:
         - obj:
             id: voc_tile
             x: 123
-            y: 110
+            y: 90
             width: 111
-            height: 64
+            height: 54
             styles: tile_style
             scrollable: false
+            on_click:
+              - lambda: 'id(detail_idx) = 2;'
+              - script.execute: show_detail
             widgets:
               - label:
                   id: voc_val
@@ -1286,11 +1488,14 @@ lvgl:
         - obj:
             id: temp_tile
             x: 6
-            y: 180
+            y: 148
             width: 111
-            height: 64
+            height: 54
             styles: tile_style
             scrollable: false
+            on_click:
+              - lambda: 'id(detail_idx) = 3;'
+              - script.execute: show_detail
             widgets:
               - label:
                   id: temp_val
@@ -1307,11 +1512,14 @@ lvgl:
         - obj:
             id: hum_tile
             x: 123
-            y: 180
+            y: 148
             width: 111
-            height: 64
+            height: 54
             styles: tile_style
             scrollable: false
+            on_click:
+              - lambda: 'id(detail_idx) = 4;'
+              - script.execute: show_detail
             widgets:
               - label:
                   id: hum_val
@@ -1325,15 +1533,51 @@ lvgl:
                   align: BOTTOM_MID
                   y: -6
                   styles: sub_style
+        # ---- HVAC for this room (v0.14) ----
+        - obj:
+            id: hvac_tile
+            x: 6
+            y: 206
+            width: 228
+            height: 52
+            styles: tile_style
+            scrollable: false
+            on_click:
+              - lambda: 'id(detail_idx) = 5;'
+              - script.execute: show_detail
+            widgets:
+              - label:
+                  id: hv_label
+                  text: "HVAC"
+                  align: TOP_MID
+                  y: 6
+                  width: 216
+                  long_mode: WRAP
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  text_color: 0xFFFFFF
+              - label:
+                  id: hv_sub
+                  text: "starting"
+                  align: BOTTOM_MID
+                  y: -5
+                  width: 216
+                  long_mode: WRAP
+                  text_align: CENTER
+                  text_font: montserrat_12
+                  text_color: 0xD0D6E0
         # ---- presence ----
         - obj:
             id: pres_tile
             x: 6
-            y: 250
+            y: 262
             width: 228
-            height: 64
+            height: 52
             styles: tile_style
             scrollable: false
+            on_click:
+              - lambda: 'id(detail_idx) = 6;'
+              - script.execute: show_detail
             widgets:
               - label:
                   id: pres_label
@@ -1349,3 +1593,48 @@ lvgl:
                   y: -8
                   text_font: montserrat_12
                   text_color: 0xD0D6E0
+    # ---- v0.14 detail page: one tile's readings in full; tap anywhere to go back ----
+    - id: detail_page
+      bg_color: 0x0B0D12
+      bg_opa: COVER
+      scrollable: false
+      widgets:
+        - obj:
+            id: det_box
+            x: 0
+            y: 0
+            width: 100%
+            height: 100%
+            bg_color: 0x0B0D12
+            bg_opa: COVER
+            border_width: 0
+            radius: 0
+            pad_all: 0
+            shadow_width: 0
+            scrollable: false
+            on_click:
+              - script.execute: close_detail
+            widgets:
+              - label:
+                  id: det_title
+                  text: ""
+                  x: 10
+                  y: 8
+                  text_font: montserrat_20
+                  text_color: 0xFFFFFF
+              - label:
+                  id: det_body
+                  text: ""
+                  x: 10
+                  y: 42
+                  width: 220
+                  long_mode: WRAP
+                  text_line_space: 4
+                  text_font: montserrat_16
+                  text_color: 0xD0D6E0
+              - label:
+                  text: "tap to go back"
+                  align: BOTTOM_MID
+                  y: -5
+                  text_font: montserrat_12
+                  text_color: 0x8A93A6
