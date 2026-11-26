@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Garage-1  v0.9 - garage air quality + motion
+# NU-Garage-1  v0.11 - garage air quality + motion
 # ESP32-S3 Super Mini + Sensirion SEN55 + HLK-LD2410C 24 GHz radar in the
 # garage_combo enclosure (SEN55 bay below, radar + ESP32 above).
 #
@@ -37,6 +37,8 @@
 #   GPIO48 = the board's WS2812 LED (presence colours, off by default)
 # Power: the 5V pin is the USB rail. SEN55 + radar + ESP32 draw about 0.3 A;
 # use a 5 V / 1 A supply and check the 5V pin stays at 4.6 V or more.
+# v0.11 (2026-11-26): "Air quality" card on the :8080 page (radar_web.h v1.18): overall level (the worst of PM AQI,
+#   VOC and NOx, with which one set it), PM, VOC, NOx, temperature, humidity, dew point, absolute humidity.
 #
 # Keys: same layout as nu-presence-24ghz-1.yaml. The live copy in
 # /config/esphome holds the real API key and hotspot password; this local
@@ -211,6 +213,28 @@ interval:
   - interval: 100ms
     then:
       - lambda: 'radar_web_pump();'
+  # v0.11: air quality block for the :8080 page (radar_web.h v1.18). Level 0..4 = Excellent, Good, Moderate,
+  # Sensitive, Unhealthy, from the same limits as the AQI PM / TVOC / NOx status texts; -1 = no reading yet.
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto band = [](float v, float a, float b, float c, float e) {
+            return std::isnan(v) || v <= 0 ? -1 : v <= a ? 0 : v <= b ? 1 : v <= c ? 2 : v <= e ? 3 : 4;
+          };
+          float pa = id(avg_pm_aqi).state, vo = id(voc).state, no = id(nox).state, tc = id(sen55_temp).state;
+          int lp = std::isnan(pa) ? -1 : pa <= 10 ? 0 : pa <= 50 ? 1 : pa <= 100 ? 2 : pa <= 150 ? 3 : 4;
+          int lv = band(vo, 150, 250, 350, 450), ln = band(no, 50, 100, 200, 300);
+          int lvl = std::max(lp, std::max(lv, ln));
+          const char *why = lvl <= 0 ? "" : lvl == lp ? "PM" : lvl == lv ? "VOC" : "NOx";
+          std::string j = "{";
+          rw_kn(j, "lvl", (float) lvl); rw_ks(j, "why", why);
+          rw_kn(j, "pm1", id(pm_1_0).state); rw_kn(j, "pm25", id(pm_2_5).state); rw_kn(j, "pm4", id(pm_4_0).state); rw_kn(j, "pm10", id(pm_10_0).state);
+          rw_kn(j, "pmaqi", pa); rw_kn(j, "voc", vo); rw_kn(j, "nox", no);
+          rw_kn(j, "tf", std::isnan(tc) ? NAN : tc * 1.8f + 32.0f); rw_kn(j, "rh", id(sen55_humid).state);
+          rw_kn(j, "ah", id(a_h).state); rw_kn(j, "dew", id(dew_point).state);
+          rw_ks(j, "pmt", id(pm_aqi_text).state); rw_ks(j, "voct", id(aqi_tvoc_text).state); rw_ks(j, "noxt", id(aqi_nox_text).state);
+          j += "\"ok\":1}";
+          radar_web_aq(j.c_str());
   # v1.4: hand the entities to radar_web.h and start the httpd (returns at once when it is already running)
   - interval: 10s
     then:
@@ -857,6 +881,7 @@ text_sensor:
       return {buf};
   - platform: template
     name: "AQI TVOC"
+    id: aqi_tvoc_text
     icon: "mdi:flask-outline"
     update_interval: 5.4s
     lambda: |-
@@ -872,6 +897,7 @@ text_sensor:
       return {buf};
   - platform: template
     name: "AQI NOx"
+    id: aqi_nox_text
     icon: "mdi:smog"
     update_interval: 5.5s
     lambda: |-
@@ -888,6 +914,7 @@ text_sensor:
       return {buf};
   - platform: template
     name: "AQI PM"
+    id: pm_aqi_text
     icon: "mdi:air-filter"
     update_interval: 5.6s
     lambda: |-

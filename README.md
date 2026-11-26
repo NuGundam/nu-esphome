@@ -275,6 +275,9 @@ presence, on an ESP32-S3 Super Mini. The SEN55 part follows `nu-esp32-s3-1`, the
   stays in its ring (a 3D printer, a fan) fades into the background, and it only calls a person when
   energy stands out from that and travels between rings. It runs next to the radar's own `Occupied`
   and doesn't change its thresholds. Ring 1 is skipped because the unit sees its own SEN55 fan there. The tuning page shows it.
+- The tuning page on port 8080 has an Air quality card: the overall level (the worst of PM AQI, VOC and NOx,
+  and which one raised it) with all the SEN55 readings. `radar_web.h` shows it for any device that calls
+  `radar_web_aq()`.
 
 ---
 
