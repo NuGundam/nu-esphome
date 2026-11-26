@@ -247,6 +247,9 @@ logic, shared through [`common/ld2450-presence.yaml`](common/ld2450-presence.yam
   `detail` give the tile colour, the second line and the detail lines.
 - Tap any tile for a detail page with all of that reading's numbers. Tap again or wait 30 seconds to go
   back. A tap on a dark screen only wakes it.
+- Touch sets itself up: the first touch after flashing shows a dot, and one tap on it picks the right touch
+  mapping for the panel (kept in flash, right in every Screen Orientation). The "Touch setup" button shows
+  the dot again.
 - The tuning page on port 8080 has an Air quality and HVAC card with the same readings.
 - Mount the LD2450 upright (long side vertical). Turned 90 degrees, its left and right read as up
   and down.

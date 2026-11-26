@@ -1,5 +1,5 @@
 # =======================================================
-# Nu-MasterBath-1  v0.14 - master bath air quality + motion, with a screen
+# Nu-MasterBath-1  v0.15 - master bath air quality + motion, with a screen
 # ESP32-2432S028R "Cheap Yellow Display" + Sensirion SEN54 + HLK-LD2450 24 GHz radar
 # in the masterbath_combo enclosure (SEN54 bay below, screen + radar above, USB-C down).
 #
@@ -39,6 +39,10 @@
 # v0.14 (2026-11-25): HVAC tile (sensor.master_bathroom_hvac_status from HA: heating / cooling / venting and why),
 #   tap any tile for a detail page (tap again or wait 30 s to go back; a tap that wakes a dark screen only wakes it),
 #   and the web page gets an "Air quality and HVAC" card (radar_web_2450.h v1.15).
+#
+# v0.15 (2026-11-25): touch setup. v0.14 used the office panel's touch mapping and taps opened the wrong tile.
+#   The unit now learns the mapping itself: the first touch shows a dot, one tap on it picks the right one of
+#   the 8 mappings (kept in flash, right in every Screen Orientation). "Touch setup" button repeats it.
 #
 # Keys: same layout as nu-garage-1.yaml. The live copy in /config/esphome holds the real API key
 # and hotspot password; this copy keeps placeholders. OTA reuses the API key.
@@ -85,11 +89,12 @@ esphome:
   on_boot:
     - priority: -200            # after the radar package sets boot_done (-100)
       then:
+        - script.execute: touch_apply
         - script.execute: apply_orientation
   friendly_name: ${friendly_name}
   project:
     name: "my.nu-masterbath-1"
-    version: "0.14"
+    version: "0.15"
   # HA's "Visit" link = http://<ip>:8080 (the radar map)
   build_flags:
     - "-DUSE_WEBSERVER"
@@ -173,6 +178,18 @@ globals:
     restore_value: no
     initial_value: 'false'
   - id: last_touch_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: touch_map                # v0.15: learned touch mapping, -1 = not set up. bit 0 swap_xy, bit 1 mirror_x, bit 2 mirror_y
+    type: int
+    restore_value: yes
+    initial_value: '-1'
+  - id: cal_state                # v0.15: touch setup page: 0 off, 1 waiting for the tap on the dot, 2 done
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: cal_start_ms
     type: uint32_t
     restore_value: no
     initial_value: '0'
@@ -924,6 +941,12 @@ button:
     entity_category: diagnostic
     on_press:
       - sen5x.start_fan_autoclean: sen54
+  - platform: template
+    name: "Touch setup"            # v0.15: shows the dot again (tap it within 30 s)
+    icon: mdi:gesture-tap
+    entity_category: config
+    on_press:
+      - script.execute: touch_cal_start
 
 # -------------------------------------------------------
 # SCREEN (ILI9341 / ST7789 320 x 240 on SPI, XPT2046 touch, backlight GPIO21)
@@ -1039,15 +1062,47 @@ touchscreen:
       x_max: 3760
       y_min: 270
       y_max: 3760
-    transform:                    # v0.14: the office panel's, maps the panel to the 320 x 240 picture
-      mirror_x: true
-      mirror_y: true
+    transform:                    # boot value only: touch_apply sets the learned mapping (touch_map) at run time
+      mirror_x: false
+      mirror_y: false
       swap_xy: true
     on_touch:
       - lambda: |-
           id(touch_dark) = !id(backlight).remote_values.is_on();
           id(last_touch_ms) = millis();
-          ESP_LOGI("touch", "x %d y %d%s", (int) touch.x, (int) touch.y, id(touch_dark) ? " (wakes the screen)" : "");
+          ESP_LOGI("touch", "x %d y %d raw %d %d map %d%s", (int) touch.x, (int) touch.y, (int) touch.x_raw,
+                   (int) touch.y_raw, id(touch_map), id(touch_dark) ? " (wakes the screen)" : "");
+          if (id(touch_dark)) return;
+          if (id(cal_state) == 1) {
+            // v0.15: the dot sits at 20 % / 40 % of the native 320 x 240 picture. Of the 8 mappings only one puts
+            // this tap there (the others land 48 px or more away), so one tap settles it.
+            if (millis() - id(cal_start_ms) < 600) return;
+            auto norm = [](float r, float lo, float hi) {
+              float f = (r - lo) / (hi - lo);
+              return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+            };
+            float u = norm(touch.x_raw, 220, 3760), v = norm(touch.y_raw, 270, 3760);
+            int best = -1;
+            float bd = 1e9f, sd = 1e9f;
+            for (int m = 0; m < 8; m++) {
+              float a = (m & 1) ? v : u, b = (m & 1) ? u : v;
+              if (m & 2) a = 1.0f - a;
+              if (m & 4) b = 1.0f - b;
+              float d = hypotf((a - 0.2f) * 320.0f, (b - 0.4f) * 240.0f);
+              if (d < bd) { sd = bd; bd = d; best = m; }
+              else if (d < sd) sd = d;
+            }
+            ESP_LOGI("touch", "setup tap: best map %d at %.0f px, next %.0f px", best, bd, sd);
+            if (bd < 36.0f && sd - bd > 14.0f) {
+              id(touch_map) = best;
+              id(cal_state) = 2;
+              id(touch_cal_ok).execute();
+            } else {
+              lv_label_set_text(id(cal_label), "Tap the dot again");
+            }
+            return;
+          }
+          if (id(cal_state) == 0 && id(touch_map) < 0) id(touch_cal_start).execute();
 
 script:
   # v0.14: tile tapped (detail_idx set by the tile). Shows the detail page for 30 s.
@@ -1056,7 +1111,8 @@ script:
     then:
       - if:
           condition:
-            lambda: 'return id(touch_dark);'
+            # v0.15: also ignored while the touch setup page is up or the mapping is not learned yet
+            lambda: 'return id(touch_dark) || id(cal_state) != 0 || id(touch_map) < 0;'
           then:
             - lambda: 'id(touch_dark) = false; id(detail_idx) = -1;'
           else:
@@ -1068,8 +1124,56 @@ script:
             - lvgl.page.show: main_page
   - id: close_detail
     then:
+      - if:
+          condition:
+            lambda: 'return id(cal_state) == 0;'   # v0.15: not while the touch setup page is up
+          then:
+            - script.stop: show_detail
+            - lambda: 'id(detail_idx) = -1;'
+            - lvgl.page.show: main_page
+  # ---- v0.15 touch setup ----
+  # touch_apply: gives the touchscreen the learned mapping (swap_xy alone until one is learned).
+  - id: touch_apply
+    then:
+      - lambda: |-
+          int m = id(touch_map) < 0 ? 1 : id(touch_map);
+          id(panel_touch).set_swap_xy(m & 1);
+          id(panel_touch).set_mirror_x(m & 2);
+          id(panel_touch).set_mirror_y(m & 4);
+          ESP_LOGI("touch", "mapping %d%s: swap_xy %d mirror_x %d mirror_y %d", m,
+                   id(touch_map) < 0 ? " (not set up yet)" : "", m & 1, (m >> 1) & 1, (m >> 2) & 1);
+  # touch_cal_start: raw touch (no mapping), dot at 20 % / 40 % of the native picture, 30 s to tap it.
+  - id: touch_cal_start
+    mode: restart
+    then:
       - script.stop: show_detail
-      - lambda: 'id(detail_idx) = -1;'
+      - script.stop: touch_cal_ok
+      - lambda: |-
+          id(detail_idx) = -1;
+          id(cal_state) = 1;
+          id(cal_start_ms) = millis();
+          id(last_touch_ms) = millis();
+          id(panel_touch).set_swap_xy(false);
+          id(panel_touch).set_mirror_x(false);
+          id(panel_touch).set_mirror_y(false);
+          int32_t x = 64, y = 96;
+          id(lvgl_comp)->rotate_coordinates(x, y);
+          lv_obj_set_pos(id(cal_dot), x - 14, y - 14);
+          lv_label_set_text(id(cal_label), "Tap the dot");
+          ESP_LOGI("touch", "setup: dot at %d, %d", (int) x, (int) y);
+      - lvgl.page.show: cal_page
+      - delay: 30s
+      - script.execute: touch_cal_end
+  - id: touch_cal_ok
+    then:
+      - script.stop: touch_cal_start
+      - lambda: 'lv_label_set_text(id(cal_label), "Touch is set");'
+      - delay: 1500ms
+      - script.execute: touch_cal_end
+  - id: touch_cal_end
+    then:
+      - lambda: 'id(cal_state) = 0;'
+      - script.execute: touch_apply
       - lvgl.page.show: main_page
   - id: ui_detail
     mode: restart
@@ -1593,6 +1697,32 @@ lvgl:
                   y: -8
                   text_font: montserrat_12
                   text_color: 0xD0D6E0
+    # ---- v0.15 touch setup page: nothing here takes a click; the touchscreen's on_touch reads the tap ----
+    - id: cal_page
+      bg_color: 0x0B0D12
+      bg_opa: COVER
+      scrollable: false
+      widgets:
+        - label:
+            id: cal_label
+            text: "Tap the dot"
+            align: CENTER
+            text_font: montserrat_20
+            text_color: 0xFFFFFF
+        - obj:
+            id: cal_dot
+            x: 50
+            y: 82
+            width: 28
+            height: 28
+            radius: 14
+            bg_color: 0xFFD21F
+            bg_opa: COVER
+            border_width: 3
+            border_color: 0xFFFFFF
+            shadow_width: 0
+            pad_all: 0
+            scrollable: false
     # ---- v0.14 detail page: one tile's readings in full; tap anywhere to go back ----
     - id: detail_page
       bg_color: 0x0B0D12
