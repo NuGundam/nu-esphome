@@ -1,5 +1,5 @@
 # =======================================================
-# Nu-MasterBath-1  v0.15 - master bath air quality + motion, with a screen
+# Nu-MasterBath-1  v0.16 - master bath air quality + motion, with a screen
 # ESP32-2432S028R "Cheap Yellow Display" + Sensirion SEN54 + HLK-LD2450 24 GHz radar
 # in the masterbath_combo enclosure (SEN54 bay below, screen + radar above, USB-C down).
 #
@@ -43,6 +43,12 @@
 # v0.15 (2026-11-25): touch setup. v0.14 used the office panel's touch mapping and taps opened the wrong tile.
 #   The unit now learns the mapping itself: the first touch shows a dot, one tap on it picks the right one of
 #   the 8 mappings (kept in flash, right in every Screen Orientation). "Touch setup" button repeats it.
+#
+# v0.16 (2026-11-26): after a power cycle the radar did not answer the settings read (firmware unknown, zones
+#   empty, and a zone edit then wiped the other zones). The read is now repeated until it answers. Freeze
+#   recorder: 2026-11-26 the unit was starved for 4-7 min three times (HA could connect but got no answers,
+#   Wi-Fi stayed up). "Last stall" keeps what blocked it (the slow component, touch state); after 2 min of
+#   it the unit restarts itself.
 #
 # Keys: same layout as nu-garage-1.yaml. The live copy in /config/esphome holds the real API key
 # and hotspot password; this copy keeps placeholders. OTA reuses the API key.
@@ -94,7 +100,7 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: "my.nu-masterbath-1"
-    version: "0.15"
+    version: "0.16"
   # HA's "Visit" link = http://<ip>:8080 (the radar map)
   build_flags:
     - "-DUSE_WEBSERVER"
@@ -113,6 +119,20 @@ esp32:
 logger:
   baud_rate: 0                    # GPIO1 (serial TX) belongs to the radar
   level: INFO
+  on_message:                     # v0.16: keeps the worst "X took a long time for an operation (N ms)" for the freeze recorder
+    level: WARN
+    then:
+      - lambda: |-
+          const char *p = strstr(message, " took a long time for an operation (");
+          if (p == nullptr) return;
+          int ms = atoi(p + 36);
+          if (ms < 300) return;
+          uint32_t now = millis();
+          if (ms >= id(slow_ms) || now - id(slow_at) > 120000) {
+            id(slow_ms) = ms;
+            id(slow_at) = now;
+            id(slow_name) = std::string(message, std::min((int) (p - message), 28));
+          }
   logs:
     ld2450: WARN
     sen5x: INFO
@@ -124,6 +144,10 @@ api:
 
 ota:
   - platform: esphome
+    on_begin:
+      - lambda: 'id(ota_busy) = true;'      # v0.16: an upload blocks the loop on purpose
+    on_error:
+      - lambda: 'id(ota_busy) = false;'
     encryption:
 
 wifi:
@@ -193,6 +217,28 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  # ---- v0.16 freeze recorder ----
+  - id: stall_rec                # last freeze of 10 s or more, kept over a restart
+    type: std::string
+    restore_value: yes
+    max_restore_data_length: 200
+    initial_value: '""'
+  - id: slow_name
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: slow_ms
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: slow_at
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: ota_busy
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 # -------------------------------------------------------
 # SUN AND TIME
@@ -621,6 +667,12 @@ sensor:
 # TEXT SENSORS (NU-AQI-3 bands and wording)
 # -------------------------------------------------------
 text_sensor:
+  - platform: template
+    id: ts_stall                   # v0.16: see the freeze recorder interval
+    name: "Last stall"
+    icon: mdi:timer-alert-outline
+    entity_category: diagnostic
+    update_interval: never
   # v0.14: room HVAC status from Home Assistant (headline, colour kind, second line, detail lines)
   - platform: homeassistant
     id: hv_head
@@ -739,6 +791,58 @@ text_sensor:
 # INTERVAL
 # -------------------------------------------------------
 interval:
+  # v0.16: the radar's settings (firmware, zones, zone type, multi target) are read once at boot. After a power
+  # cycle it did not answer, so repeat the read while the firmware is unknown; every 4th try restarts the radar.
+  - interval: 30s
+    then:
+      - lambda: |-
+          static int tries = 0;
+          if (millis() < 20000 || id(ts_fw).has_state() || millis() - id(last_rx_ms) > 3000) return;
+          tries++;
+          ESP_LOGW("radar", "settings not read yet, try %d", tries);
+          if (tries % 4 == 0) id(radar).restart_and_read_all_info(); else id(radar).read_all_info();
+  # v0.16 freeze recorder. This runs every 100 ms; a gap over 1.5 s means the main loop was blocked or starved.
+  # An episode ends after 30 s without a gap. "Last stall" shows the latest one; episodes of 10 s or more are
+  # kept over a restart. More than half of 2 minutes blocked = restart (what a power cycle did by hand).
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static uint32_t last = 0, ep_start = 0, ep_last = 0, ep_block = 0, ep_worst = 0, last_write = 0;
+          static int ep_n = 0, ep_touch = -1, ep_cal = 0, ep_page = 0;
+          uint32_t now = millis();
+          if (!id(ts_stall).has_state()) id(ts_stall).publish_state(id(stall_rec).empty() ? "none" : id(stall_rec));
+          uint32_t gap = last ? now - last : 0;
+          last = now;
+          if (now < 60000 || id(ota_busy)) { ep_n = 0; return; }
+          if (gap > 1500) {
+            if (ep_n == 0) {
+              ep_start = now - gap; ep_block = 0; ep_worst = 0; last_write = 0;
+              ep_touch = id(last_touch_ms) ? (int) ((ep_start - id(last_touch_ms)) / 1000) : -1;
+              ep_cal = id(cal_state); ep_page = id(detail_idx);
+            }
+            ep_n++; ep_block += gap; ep_last = now;
+            if (gap > ep_worst) ep_worst = gap;
+          }
+          if (ep_n == 0) return;
+          bool over = now - ep_last > 30000;
+          bool kill = now - ep_start > 120000 && ep_block * 2 > now - ep_start;
+          if (over || kill || now - last_write > 30000) {
+            last_write = now;
+            char when[20] = "no clock";
+            auto t = id(ha_time).now();
+            if (t.is_valid()) snprintf(when, sizeof when, "%02d-%02d %02d:%02d", t.month, t.day_of_month, t.hour, t.minute);
+            bool slow = id(slow_ms) > 0 && now - id(slow_at) < 180000;
+            char b[200];
+            snprintf(b, sizeof b, "%s: %us blocked in %us, %d gaps, worst %.1fs; slow: %s %d ms; touch %d s before, setup %d, page %d; SEN54 %s%s",
+                     when, (unsigned) (ep_block / 1000), (unsigned) ((ep_last - ep_start) / 1000), ep_n, ep_worst / 1000.0f,
+                     slow ? id(slow_name).c_str() : "none seen", slow ? id(slow_ms) : 0, ep_touch, ep_cal, ep_page,
+                     id(sen54).is_failed() ? "failed" : "ok", kill ? "; restarted" : "");
+            id(ts_stall).publish_state(b);
+            if (ep_block >= 10000) id(stall_rec) = b;
+            ESP_LOGW("stall", "%s", b);
+          }
+          if (kill) { global_preferences->sync(); App.safe_reboot(); }
+          if (over) ep_n = 0;
   # v0.10: hand the zone holds to the tracker (presence_2450.h v1.4) and the page (radar_web_2450.h v1.10)
   - interval: 1s
     then:

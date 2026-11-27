@@ -250,6 +250,10 @@ logic, shared through [`common/ld2450-presence.yaml`](common/ld2450-presence.yam
 - Touch sets itself up: the first touch after flashing shows a dot, and one tap on it picks the right touch
   mapping for the panel (kept in flash, right in every Screen Orientation). The "Touch setup" button shows
   the dot again.
+- **Radar settings re-read** (v0.16): if the radar does not answer the settings read at power-up, the read is
+  repeated until it does, so the zones are never shown empty.
+- **Freeze recorder** (v0.16): a "Last stall" sensor keeps when the main loop was blocked, for how long and which
+  component was slow; after two minutes of it the unit restarts itself.
 - The tuning page on port 8080 has an Air quality and HVAC card with the same readings.
 - Mount the LD2450 upright (long side vertical). Turned 90 degrees, its left and right read as up
   and down.
