@@ -1,5 +1,5 @@
 # =======================================================
-# Nu-MasterBath-1  v0.17 - master bath air quality + motion, with a screen
+# Nu-MasterBath-1  v0.18 - master bath air quality + motion, with a screen
 # ESP32-2432S028R "Cheap Yellow Display" + Sensirion SEN54 + HLK-LD2450 24 GHz radar
 # in the masterbath_combo enclosure (SEN54 bay below, screen + radar above, USB-C down).
 #
@@ -52,6 +52,10 @@
 #
 # v0.17 (2026-11-27): page v1.16 - "Rotate view" buttons turn the room map a quarter turn (radar_web_2450.h).
 #
+# v0.18 (2026-11-27): red and blue were swapped on the screen (Heating showed blue, MOTION orange): color_order
+#   is RGB on this panel. HVAC tile uses the HVAC card's run hues (heating red, cooling blue, free cool green,
+#   fresh air teal, purge violet, fan yellow), a little darker so the white text reads.
+#
 # Keys: same layout as nu-garage-1.yaml. The live copy in /config/esphome holds the real API key
 # and hotspot password; this copy keeps placeholders. OTA reuses the API key.
 # =======================================================
@@ -102,7 +106,7 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: "my.nu-masterbath-1"
-    version: "0.17"
+    version: "0.18"
   # HA's "Visit" link = http://<ip>:8080 (the radar map)
   build_flags:
     - "-DUSE_WEBSERVER"
@@ -1147,7 +1151,7 @@ display:
       number: 2
       ignore_strapping_warning: true
     data_rate: 40MHz
-    color_order: BGR
+    color_order: RGB              # v0.18: BGR showed red as blue
     invert_colors: false
     dimensions:
       width: 320
@@ -1551,12 +1555,12 @@ script:
           bg_color: !lambda |-
             const std::string &k = id(hv_kind).state;
             if (!id(hv_head).has_state()) return lv_color_hex(0x1B1F2A);
-            if (k == "heat") return lv_color_hex(0xC0392B);
-            if (k == "cool") return lv_color_hex(0x1F6FEB);
-            if (k == "free") return lv_color_hex(0x1E8E3E);
-            if (k == "vent") return lv_color_hex(0x00838F);
-            if (k == "purge") return lv_color_hex(0x8E44AD);
-            if (k == "fan") return lv_color_hex(0x3A4A66);
+            if (k == "heat") return lv_color_hex(0xD93A2C);
+            if (k == "cool") return lv_color_hex(0x2F6FE0);
+            if (k == "free") return lv_color_hex(0x23A860);
+            if (k == "vent") return lv_color_hex(0x12A096);
+            if (k == "purge") return lv_color_hex(0x8E4FE6);
+            if (k == "fan") return lv_color_hex(0xB8930F);
             if (k == "closed") return lv_color_hex(0x6B5A2A);
             return lv_color_hex(0x1B1F2A);
       - lvgl.label.update:
