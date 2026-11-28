@@ -1,6 +1,9 @@
 #pragma once
 // ─────────────────────────────────────────────────
-//  NU-Presence-24GHz-2  LD2450 tuning page  v1.15  (radar_web_2450.h)  2026-11-25
+//  NU-Presence-24GHz-2  LD2450 tuning page  v1.16  (radar_web_2450.h)  2026-11-27
+//  v1.16: "Rotate view" buttons on the room map: turn the whole plan a quarter turn left or right, so the map can
+//         face the way you look at the room. Width / depth swap, the sensor spot and aim turn with it; zones are
+//         kept in the radar's own frame and the tracker's room fence is the same room, so nothing else changes.
 //  v1.15: "Air quality and HVAC" card for units that also measure air (Nu-MasterBath-1). The device yaml builds a
 //         JSON object once a second in the main loop and hands it over with radar_web_aq(); data.json passes it on
 //         as aq. Not called = no card (NU-Presence-24GHz-2).
@@ -187,10 +190,10 @@ table{border-collapse:collapse;width:100%;font-size:13px}th{color:var(--mut);fon
 <label>Units<select id="r_unit"><option value="ft">feet</option><option value="m">metres</option></select></label>
 <label>Sensor on<select id="r_place"><option value="tl">top-left corner</option><option value="tm">top wall, middle</option><option value="tr">top-right corner</option><option value="rm">right wall, middle</option><option value="br">bottom-right corner</option><option value="bm">bottom wall, middle</option><option value="bl">bottom-left corner</option><option value="lm">left wall, middle</option><option value="custom">where I dragged it</option></select></label>
 <label>Aim &deg;<input type="number" id="r_aim" min="0" max="359" step="1" style="width:70px"></label>
-<button id="r_center" type="button">Aim at room centre</button> <button id="r_reset" type="button">Reset layout</button>
+<button id="r_center" type="button">Aim at room centre</button> <button id="r_ccw" type="button" title="Turn the map a quarter turn to the left">&#x21BA; Rotate view</button> <button id="r_cw" type="button" title="Turn the map a quarter turn to the right">Rotate view &#x21BB;</button> <button id="r_reset" type="button">Reset layout</button>
 <span id="roomTxt" class="sub" style="flex-basis:100%"></span>
 </div>
-<div class="help">Top-down plan of the room, drawn to scale. <b>Drag the white sensor dot</b> along the walls to where the unit hangs and <b>drag the small knob</b> to aim it (or pick a spot and type the aim: 0&deg; = up, clockwise). The fan is the radar's ~120&deg; / 6 m view: full strength inside the room, faint past the walls; targets, trails and zones are turned to match. To draw a zone pick Zone 1-3 and drag on the map: the LD2450 keeps zones as rectangles square to its own view, so the zone you get is the box square to the sensor around your two corners. For any other shape use <b>Shape</b> or <b>Fit targets</b> in Zones below. If someone walking to their right moves left on the map, tick mirror. <b>Track only inside the room</b>: targets more than 0.3 m outside the plan (hallway, stairs, through a wall) are ignored, and a person counts as gone only when they were last seen heading out at the edge of what the radar can see; lost in the open floor they are held as still. Saved on the device, so every browser and phone sees the same plan; <b>Reset layout</b> goes back to the layout built into this device.</div>
+<div class="help">Top-down plan of the room, drawn to scale. <b>Drag the white sensor dot</b> along the walls to where the unit hangs and <b>drag the small knob</b> to aim it (or pick a spot and type the aim: 0&deg; = up, clockwise). The fan is the radar's ~120&deg; / 6 m view: full strength inside the room, faint past the walls; targets, trails and zones are turned to match. To draw a zone pick Zone 1-3 and drag on the map: the LD2450 keeps zones as rectangles square to its own view, so the zone you get is the box square to the sensor around your two corners. For any other shape use <b>Shape</b> or <b>Fit targets</b> in Zones below. <b>Rotate view</b> turns the whole plan a quarter turn, so the map faces the way you look at the room (the wall you stand at goes to the bottom); zones and tracking do not change. If someone walking to their right moves left on the map, tick mirror. <b>Track only inside the room</b>: targets more than 0.3 m outside the plan (hallway, stairs, through a wall) are ignored, and a person counts as gone only when they were last seen heading out at the edge of what the radar can see; lost in the open floor they are held as still. Saved on the device, so every browser and phone sees the same plan; <b>Reset layout</b> goes back to the layout built into this device.</div>
 </div>
 
 <h2>Zones</h2><div class="card">
@@ -303,6 +306,11 @@ $('room_d').addEventListener('change',()=>{ const v=+$('room_d').value; if(v>0){
 $('r_unit').addEventListener('change',()=>{ room.unit=$('r_unit').value; saveRoom(); });
 $('r_place').addEventListener('change',()=>{ placeAt($('r_place').value); saveRoom(); });
 $('r_aim').addEventListener('change',()=>{ room.aim=((+$('r_aim').value%360)+360)%360; room.aimAuto=false; saveRoom(); });
+/* v1.16: turn the plan a quarter turn (cw: the top wall becomes the right wall). A rigid turn of room + sensor, so zones (sensor frame) and the fence stay the same. */
+function rotRoom(cw){ const w=room.w, d=room.d, x=room.sx, y=room.sy, ring=['tl','tm','tr','rm','br','bm','bl','lm'], i=ring.indexOf(room.place);
+  room.w=d; room.d=w; if(cw){ room.sx=Math.round(d-y); room.sy=Math.round(x); } else { room.sx=Math.round(y); room.sy=Math.round(w-x); }
+  room.aim=Math.round(room.aim+(cw?90:270))%360; if(i>=0) room.place=ring[(i+(cw?2:6))%8]; saveRoom(); }
+$('r_cw').onclick=()=>rotRoom(true); $('r_ccw').onclick=()=>rotRoom(false);
 $('r_center').onclick=()=>{ room.aimAuto=true; aimCentre(); saveRoom(); };
 $('r_reset').onclick=()=>{ if(!confirm('Reset the room plan to the layout built into this device?')) return; clearTimeout(pushT); pushT=0; lastSent=null; lastDev=null; fetch('/room?reset=1').catch(()=>{}); };
 $('flip').addEventListener('change',()=>{ room.flip=$('flip').checked; saveRoom(); });

@@ -1,5 +1,6 @@
 # =======================================================
-# NU-Presence-24GHz-2  v1.17 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# NU-Presence-24GHz-2  v1.18 - HLK-LD2450 24 GHz multi-target radar on an Apollo MTR-1 (no CO2 add-on)
+# v1.18 (2026-11-27): page v1.16 - "Rotate view" buttons turn the room map a quarter turn (radar_web_2450.h).
 # v1.17 (2026-11-23): zone entities named like the page (Couch / Floor / Walkway, substitutions zone1..3_name);
 #   Track <zone> switches, Walkway off by default: only the Couch and Floor are tracked (presence_2450.h v1.7).
 # v1.16 (2026-11-23): lock-on from presence_2450.h v1.6 + page v1.14 (same as Nu-MasterBath-1 v0.12): a new track counts only after travelling 0.5 m; still-clutter spots.
