@@ -1,5 +1,5 @@
 # =======================================================
-# NU-Garage-1  v0.11 - garage air quality + motion
+# NU-Garage-1  v0.12 - garage air quality + motion
 # ESP32-S3 Super Mini + Sensirion SEN55 + HLK-LD2410C 24 GHz radar in the
 # garage_combo enclosure (SEN55 bay below, radar + ESP32 above).
 #
@@ -39,6 +39,7 @@
 # use a 5 V / 1 A supply and check the 5V pin stays at 4.6 V or more.
 # v0.11 (2026-11-26): "Air quality" card on the :8080 page (radar_web.h v1.18): overall level (the worst of PM AQI,
 #   VOC and NOx, with which one set it), PM, VOC, NOx, temperature, humidity, dew point, absolute humidity.
+# v0.12 (2026-11-27): page v1.19 - "Rotate view" buttons turn the room map a quarter turn (radar_web.h).
 #
 # Keys: same layout as nu-presence-24ghz-1.yaml. The live copy in
 # /config/esphome holds the real API key and hotspot password; this local

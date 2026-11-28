@@ -1,5 +1,5 @@
 # =======================================================
-# Nu-MasterBath-1  v0.16 - master bath air quality + motion, with a screen
+# Nu-MasterBath-1  v0.17 - master bath air quality + motion, with a screen
 # ESP32-2432S028R "Cheap Yellow Display" + Sensirion SEN54 + HLK-LD2450 24 GHz radar
 # in the masterbath_combo enclosure (SEN54 bay below, screen + radar above, USB-C down).
 #
@@ -49,6 +49,8 @@
 #   recorder: 2026-11-26 the unit was starved for 4-7 min three times (HA could connect but got no answers,
 #   Wi-Fi stayed up). "Last stall" keeps what blocked it (the slow component, touch state); after 2 min of
 #   it the unit restarts itself.
+#
+# v0.17 (2026-11-27): page v1.16 - "Rotate view" buttons turn the room map a quarter turn (radar_web_2450.h).
 #
 # Keys: same layout as nu-garage-1.yaml. The live copy in /config/esphome holds the real API key
 # and hotspot password; this copy keeps placeholders. OTA reuses the API key.
@@ -100,7 +102,7 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: "my.nu-masterbath-1"
-    version: "0.16"
+    version: "0.17"
   # HA's "Visit" link = http://<ip>:8080 (the radar map)
   build_flags:
     - "-DUSE_WEBSERVER"

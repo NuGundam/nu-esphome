@@ -1,6 +1,8 @@
 #pragma once
 // ──────────────────────────────────────────────────────────────────
-//  NU-Presence-24GHz  radar tuning page  v1.18  (radar_web.h)  2026-11-26
+//  NU-Presence-24GHz  radar tuning page  v1.19  (radar_web.h)  2026-11-27
+//  v1.19: "Rotate view" buttons (as radar_web_2450.h v1.16): turn the whole room plan a quarter turn left or right,
+//        so the map faces the way you look at the room. Width / depth swap, the sensor spot and aim turn with it.
 //  v1.18: "Air quality" card for devices with an air sensor (NU-Garage-1). The yaml builds one JSON object a second
 //        on the main loop and hands it over with radar_web_aq(); data.json passes it on as "aq". Devices that never
 //        call it show the page as before.
@@ -166,7 +168,7 @@ input:disabled,select:disabled,button:disabled{opacity:.45;cursor:not-allowed}
 <label class="sel">Units<select id="r_unit"><option value="ft">feet</option><option value="m">metres</option></select></label>
 <label class="sel">Sensor on<select id="r_place"><option value="tl">top-left corner</option><option value="tm">top wall, middle</option><option value="tr">top-right corner</option><option value="rm">right wall, middle</option><option value="br">bottom-right corner</option><option value="bm">bottom wall, middle</option><option value="bl">bottom-left corner</option><option value="lm">left wall, middle</option><option value="custom">where I dragged it</option></select></label>
 <label>Aim &deg;<input type="number" id="r_aim" min="0" max="359" step="1" style="width:70px"></label>
-<button id="r_center" type="button">Aim at room centre</button> <button id="r_reset" type="button">Reset layout</button>
+<button id="r_center" type="button">Aim at room centre</button> <button id="r_ccw" type="button" title="Turn the map a quarter turn to the left, so it faces the way you look at the room">&#x21BA; Rotate view</button> <button id="r_cw" type="button" title="Turn the map a quarter turn to the right, so it faces the way you look at the room">Rotate view &#x21BB;</button> <button id="r_reset" type="button">Reset layout</button>
 <span id="roomTxt" class="sub"></span>
 <button id="applyMax">Apply suggested max gates</button>
 </div>
@@ -231,6 +233,11 @@ $('room_d').addEventListener('change',()=>{ const v=+$('room_d').value; if(v>0){
 $('r_unit').addEventListener('change',()=>{ room.unit=$('r_unit').value; saveRoom(); });
 $('r_place').addEventListener('change',()=>{ placeAt($('r_place').value); saveRoom(); });
 $('r_aim').addEventListener('change',()=>{ room.aim=((+$('r_aim').value%360)+360)%360; room.aimAuto=false; saveRoom(); });
+/* v1.19: turn the plan a quarter turn (cw: the top wall becomes the right wall); room + sensor turn together */
+function rotRoom(cw){ const w=room.w, d=room.d, x=room.sx, y=room.sy, ring=['tl','tm','tr','rm','br','bm','bl','lm'], i=ring.indexOf(room.place);
+  room.w=d; room.d=w; if(cw){ room.sx=Math.round(d-y); room.sy=Math.round(x); } else { room.sx=Math.round(y); room.sy=Math.round(w-x); }
+  room.aim=Math.round(room.aim+(cw?90:270))%360; if(i>=0) room.place=ring[(i+(cw?2:6))%8]; saveRoom(); }
+$('r_cw').onclick=()=>rotRoom(true); $('r_ccw').onclick=()=>rotRoom(false);
 $('r_center').onclick=()=>{ room.aimAuto=true; aimCentre(); saveRoom(); };
 $('r_reset').onclick=()=>{ if(!confirm('Reset the room plan to the layout built into this device?')) return; clearTimeout(pushT); pushT=0; lastSent=null; lastDev=null; fetch('/room?reset=1').catch(()=>{}); };
 /* drag: the sensor dot slides along the walls, the knob turns the aim */
